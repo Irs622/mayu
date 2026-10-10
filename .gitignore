@@ -1,0 +1,8 @@
+/target
+/.venv
+__pycache__/
+*.so
+*.pyd
+.pytest_cache/
+dist/
+.superpowers/
