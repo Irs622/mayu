@@ -1,0 +1,14 @@
+[package]
+name = "mayu-redis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mayu-core = { workspace = true }
+redis = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+ulid = { workspace = true }
