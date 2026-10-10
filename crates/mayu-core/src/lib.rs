@@ -1,7 +1,11 @@
 pub mod envelope;
 pub mod error;
+pub mod policy;
+pub mod result;
 
 pub use envelope::{
     Header, decode_delayed_member, decode_header, encode_delayed_member, encode_header, now_ms,
 };
 pub use error::{Error, Result};
+pub use policy::{Action, Outcome, RetryPolicy, backoff_ms, decide, full_jitter};
+pub use result::ResultRecord;
