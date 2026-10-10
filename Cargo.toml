@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mayu-core", "crates/mayu-redis"]
+members = ["crates/mayu-core", "crates/mayu-redis", "crates/mayu-py"]
 
 [workspace.package]
 version = "0.1.0"

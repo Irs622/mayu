@@ -1,0 +1,18 @@
+[package]
+name = "mayu-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "mayu_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+mayu-core = { workspace = true }
+mayu-redis = { workspace = true }
+pyo3 = { workspace = true }
+tokio = { workspace = true }
+ulid = { workspace = true }
