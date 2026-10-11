@@ -64,6 +64,16 @@ def test_crash_loop_backs_off():
     assert 3 <= sup.restarts <= 10, f"{sup.restarts} restarts: backoff not applied"
 
 
+def test_spawn_failure_is_retried_not_fatal():
+    sup = ProcessSupervisor(["/nonexistent/mayu-test-binary"], 1, min_backoff=0.1, max_backoff=0.2)
+    th, out = _start(sup)
+    time.sleep(1.0)
+    sup.stop()
+    th.join(10)
+    assert out == [0]
+    assert sup.spawn_failures > 1
+
+
 def test_restart_code_respawns_immediately():
     recycler = [sys.executable, "-c", f"import sys, time; time.sleep(0.2); sys.exit({RESTART_EXIT_CODE})"]
     sup = ProcessSupervisor(recycler, 1, min_backoff=10)

@@ -36,6 +36,7 @@ class ProcessSupervisor:
         self.min_backoff = min_backoff
         self.max_backoff = max_backoff
         self.restarts = 0
+        self.spawn_failures = 0
         self._env = {**(os.environ if env is None else env), "MAYU_PARENT_PID": str(os.getpid())}
         self._children = [_Child() for _ in range(processes)]
         self._stop = threading.Event()
@@ -50,34 +51,44 @@ class ProcessSupervisor:
         if threading.current_thread() is threading.main_thread():
             for sig in (signal.SIGTERM, signal.SIGINT):
                 signal.signal(sig, lambda *_: self.stop())
-        for c in self._children:
-            self._spawn(c)
-        while not self._stop.wait(_POLL):
-            now = time.monotonic()
+        try:
             for c in self._children:
-                if c.proc is None:
-                    if now >= c.next_start:
-                        self._spawn(c)
-                    continue
-                code = c.proc.poll()
-                if code is None:
-                    continue
-                pid, lived = c.proc.pid, now - c.started
-                c.proc = None
-                if code == RESTART_EXIT_CODE or lived >= _STABLE_AFTER:
-                    c.backoff = 0.0
-                else:
-                    c.backoff = min(self.max_backoff, max(self.min_backoff, c.backoff * 2))
-                c.next_start = now + c.backoff
-                self.restarts += 1
-                delay = f" in {c.backoff:.1f}s" if c.backoff else ""
-                print(f"mayu: worker process {pid} exited with {_describe(code)}; restarting{delay}",
-                      file=sys.stderr, flush=True)
-        self._shutdown()
+                self._spawn(c)
+            while not self._stop.wait(_POLL):
+                now = time.monotonic()
+                for c in self._children:
+                    if c.proc is None:
+                        if now >= c.next_start:
+                            self._spawn(c)
+                        continue
+                    code = c.proc.poll()
+                    if code is None:
+                        continue
+                    pid, lived = c.proc.pid, now - c.started
+                    c.proc = None
+                    if code == RESTART_EXIT_CODE or lived >= _STABLE_AFTER:
+                        c.backoff = 0.0
+                    else:
+                        c.backoff = min(self.max_backoff, max(self.min_backoff, c.backoff * 2))
+                    c.next_start = now + c.backoff
+                    self.restarts += 1
+                    delay = f" in {c.backoff:.1f}s" if c.backoff else ""
+                    print(f"mayu: worker process {pid} exited with {_describe(code)}; restarting{delay}",
+                          file=sys.stderr, flush=True)
+        finally:
+            self._shutdown()
         return 0
 
     def _spawn(self, c: _Child) -> None:
-        c.proc = subprocess.Popen(self.argv, env=self._env)
+        try:
+            c.proc = subprocess.Popen(self.argv, env=self._env)
+        except OSError as exc:
+            # Transient (EAGAIN/EMFILE/ENOMEM) or permanent: retry with the crash backoff.
+            self.spawn_failures += 1
+            c.backoff = min(self.max_backoff, max(self.min_backoff, c.backoff * 2))
+            c.next_start = time.monotonic() + c.backoff
+            print(f"mayu: failed to start worker process: {exc}", file=sys.stderr, flush=True)
+            return
         c.started = time.monotonic()
 
     def _shutdown(self) -> None:
