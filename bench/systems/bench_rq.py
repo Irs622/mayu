@@ -1,4 +1,11 @@
-"""RQ adapter: `rq worker-pool` with c workers; each job runs in a forked work horse (RQ's default)."""
+"""RQ adapter: `rq worker-pool` with c SimpleWorker processes; each runs jobs in-process, with no fork per job.
+
+RQ's default Worker forks a work horse per job, and every horse opens fresh Redis connections. At ~900 jobs/s that
+is ~1700 connections/s; through Docker's userland proxy the proxy-to-container leg piles up TIME_WAIT sockets
+(~60 s each) until the ephemeral ports run out and Redis resets new connections ("Connection reset by peer",
+jobs fail, the run stalls). So the default Worker cannot finish 20000 jobs on this setup. SimpleWorker avoids the
+churn, and it is RQ's own documented option; it skips the per-job process isolation, which only helps RQ here.
+"""
 import pathlib
 import sys
 
@@ -28,5 +35,5 @@ def enqueue(name: str, n: int) -> None:
 
 def worker_cmd(c: int):
     rq = pathlib.Path(sys.executable).with_name("rq")
-    return ([str(rq), "worker-pool", "-n", str(c), "-u", workload.URL, "-q", QUEUE],
-            {}, f"{c} workers, fork per job")
+    return ([str(rq), "worker-pool", "-n", str(c), "-u", workload.URL, "-w", "rq.worker.SimpleWorker", "-q", QUEUE],
+            {}, f"{c} SimpleWorker processes, no fork per job")

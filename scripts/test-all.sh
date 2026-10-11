@@ -7,3 +7,9 @@ cargo test --workspace
 cargo test -p mayu-redis --test reconnect -- --ignored
 scripts/matrix.sh
 .venv/bin/pytest tests/chaos -q
+if [ -x .venv-bench/bin/python ]; then
+  .venv-bench/bin/pytest bench/tests -q
+  .venv/bin/pytest bench/tests -q
+else
+  echo "skipping bench smoke tests: run bench/setup.sh first" >&2
+fi

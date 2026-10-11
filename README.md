@@ -201,6 +201,12 @@ queries) join the caller's trace. Retries, rate-limit deferrals and `link=` call
 trace context. A failed attempt marks its span as an error. Without OpenTelemetry installed, nothing
 changes.
 
+## Benchmarks
+
+mayu vs Celery, RQ, Dramatiq and streaQ at 64 concurrent tasks: no-op throughput, a realistic task
+(JSON decode + 5 ms I/O + 1 ms CPU), and memory at equal concurrency. Results and method:
+[`bench/RESULTS.md`](bench/RESULTS.md). Reproduce with `bench/setup.sh && bench/all.sh` (needs Docker and uv).
+
 ## Development
 
 ```bash
