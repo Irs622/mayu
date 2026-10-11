@@ -17,7 +17,7 @@ HERE = pathlib.Path(__file__).parent
 
 def _spawn(redis_url, queue, *flags):
     env = {**os.environ, "MAYU_BROKER": redis_url, "MAYU_DEFAULT_QUEUE": queue, "PYTHONPATH": str(HERE)}
-    return subprocess.Popen([sys.executable, "-m", "mayu", "worker", "sample_app:app", *flags],
+    return subprocess.Popen([sys.executable, "-m", "mayu", "worker", "sample_app:app", "--mode", "thread", *flags],
                             env=env, stderr=subprocess.DEVNULL)
 
 

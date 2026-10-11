@@ -32,7 +32,7 @@ def test_task_of_killed_worker_is_recovered(app, running, redis_url, tmp_path):
     env = {**os.environ, "MAYU_BROKER": redis_url, "MAYU_DEFAULT_QUEUE": app.default_queue,
            "PYTHONPATH": str(HERE)}
     proc = subprocess.Popen(
-        [sys.executable, "-m", "mayu", "worker", "sample_app:app", "--threads", "1",
+        [sys.executable, "-m", "mayu", "worker", "sample_app:app", "--mode", "thread", "--threads", "1",
          "--visibility-timeout", "1", "--heartbeat-interval", "0.3"],
         env=env, stderr=subprocess.DEVNULL,
     )

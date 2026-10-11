@@ -78,6 +78,22 @@ The worker recycles itself (graceful stop, then a fresh interpreter in the same 
 zombies exceed `--max-zombie-threads` (default 4), after `--max-tasks-per-process` tasks, or
 above `--max-memory-per-process` MB of RSS.
 
+## Modes
+
+```bash
+mayu worker tasks:app --threads 32 --processes 2      # thread mode: 2 processes × 32 threads
+mayu worker tasks:app --mode process --processes 8    # process mode: 8 processes × 1 task each
+```
+
+`--mode auto` (default) uses thread mode when the GIL is off after importing your app, and
+process mode otherwise, naming the module that re-enabled the GIL. With more than one process,
+a supervising parent keeps the workers running, restarts any that crash (with backoff), and
+shuts them all down gracefully on SIGTERM. In process mode, a task that exceeds its hard time
+limit takes its process down with it, and the process is replaced.
+
+Prefer **a few processes × many threads**: a segfault in a C extension takes down every task in
+its process.
+
 ## Development
 
 ```bash
@@ -87,6 +103,9 @@ uv venv --python 3.14t .venv
 uv pip install --python .venv/bin/python maturin pytest msgpack
 VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop --uv
 .venv/bin/pytest
+uv venv --python 3.14+gil .venv-gil && uv pip install --python .venv-gil/bin/python maturin pytest msgpack
+VIRTUAL_ENV=$PWD/.venv-gil .venv-gil/bin/maturin develop --uv
+scripts/test-all.sh                                   # everything, both builds
 ```
 
 Design: `docs/specs/2026-10-11-mayu-architecture-design.md`.

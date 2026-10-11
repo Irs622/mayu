@@ -19,7 +19,7 @@ def _env(redis_url, queue):
 
 def test_worker_cli_runs_tasks_and_exits_cleanly_on_sigterm(redis_url, queue):
     proc = subprocess.Popen(
-        [sys.executable, "-m", "mayu", "worker", "sample_app:app", "--threads", "2"],
+        [sys.executable, "-m", "mayu", "worker", "sample_app:app", "--mode", "thread", "--threads", "2"],
         env=_env(redis_url, queue), stderr=subprocess.PIPE, text=True,
     )
     try:

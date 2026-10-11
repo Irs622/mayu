@@ -98,7 +98,8 @@ def test_thread_mode_multi_process_runs_and_restarts_children(redis_url, queue):
     whoami, _ = _producer(redis_url, queue)
     # A SIGKILLed child can still be handed a task by Redis before the server notices its socket
     # closed; that task comes back only after the visibility timeout, so keep it under _round's 20 s.
-    proc = _spawn(redis_url, queue, "--processes", "2", "--threads", "2", "--shutdown-grace", "5",
+    proc = _spawn(redis_url, queue, "--mode", "thread", "--processes", "2", "--threads", "2",
+                  "--shutdown-grace", "5",
                   "--visibility-timeout", "3", "--heartbeat-interval", "1")
     seen = set()
     try:
