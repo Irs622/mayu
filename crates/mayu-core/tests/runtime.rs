@@ -442,3 +442,84 @@ fn link_callbacks_are_enqueued_with_the_ack() {
     assert_eq!(d.payload, b"[[5],{}]");
     rt.shutdown(Duration::from_secs(1));
 }
+
+fn ok() -> Outcome {
+    Outcome::Success { result: None, links: vec![] }
+}
+
+#[test]
+fn outcomes_are_recorded_concurrently() {
+    let mem = MemoryBroker::default();
+    mem.set_record_delay(Duration::from_millis(100));
+    for _ in 0..16 { mem.push(&Header::new("t", "q", 0, "ct"), b""); }
+    let rt = start(&mem, cfg(16, 1));
+    let tasks: Vec<_> = (0..16).map(|_| rt.recv_timeout(RECV).expect("task")).collect();
+    let first = Instant::now();
+    for t in tasks { rt.complete(t.token, ok()); }
+    // One at a time these take 16 * 100ms; concurrently about one delay.
+    while !(mem.stream_len("q") == 0 && mem.pending_len() == 0) {
+        assert!(first.elapsed() < Duration::from_millis(800), "only {} of 16 acked after {:?}", 16 - mem.pending_len(), first.elapsed());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn shutdown_drains_outstanding_writes() {
+    let mem = MemoryBroker::default();
+    mem.set_record_delay(Duration::from_millis(200));
+    for _ in 0..8 { mem.push(&Header::new("t", "q", 0, "ct"), b""); }
+    let rt = start(&mem, cfg(8, 1));
+    let tasks: Vec<_> = (0..8).map(|_| rt.recv_timeout(RECV).expect("task")).collect();
+    for t in tasks { rt.complete(t.token, ok()); }
+    let t = Instant::now();
+    rt.shutdown(Duration::from_secs(3));
+    assert!(t.elapsed() < Duration::from_millis(1000), "drain took {:?}; writes are not concurrent", t.elapsed());
+    assert_eq!(mem.pending_len(), 0, "shutdown returned with writes still outstanding");
+    assert_eq!(mem.stream_len("q"), 0);
+}
+
+#[test]
+fn failure_and_retry_outcomes_still_recorded_concurrently() {
+    let mem = MemoryBroker::default();
+    mem.set_record_delay(Duration::from_millis(50));
+    let mut ok_ids = Vec::new();
+    let mut failed_ids = Vec::new();
+    for _ in 0..4 {
+        let h = Header::new("t", "q", 3, "ct");
+        ok_ids.push(h.id.clone());
+        mem.push(&h, b"");
+        let h = Header::new("t", "q", 3, "ct");
+        failed_ids.push(h.id.clone());
+        mem.push(&h, b"");
+        mem.push(&Header::new("t", "q", 3, "ct"), b"");
+    }
+    let rt = start(&mem, cfg(12, 1));
+    let tasks: Vec<_> = (0..12).map(|_| rt.recv_timeout(RECV).expect("task")).collect();
+    for t in tasks {
+        let outcome = if ok_ids.contains(&t.id) {
+            Outcome::Success { result: Some(b"r".to_vec()), links: vec![] }
+        } else if failed_ids.contains(&t.id) {
+            Outcome::Failure { error: "E".into(), traceback: "tb".into() }
+        } else {
+            Outcome::Retry { countdown_ms: Some(60_000), error: "e".into() } // parked in the delayed set
+        };
+        rt.complete(t.token, outcome);
+    }
+    wait_until(|| mem.pending_len() == 0);
+    // `wait_until` returns as soon as the last write lands; give any duplicate a chance to show.
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(mem.stream_len("q"), 0);
+    assert_eq!(mem.pending_len(), 0);
+    assert_eq!(mem.delayed_len("q"), 4, "each retry parked exactly once");
+    assert_eq!(mem.dead().len(), 4, "each failure dead-lettered exactly once");
+    for id in &ok_ids {
+        let rec = ResultRecord::decode(&mem.result(id).expect("success result stored")).unwrap();
+        assert_eq!(rec.status, "success");
+    }
+    for id in &failed_ids {
+        let rec = ResultRecord::decode(&mem.result(id).expect("failure result stored")).unwrap();
+        assert_eq!(rec.status, "failure");
+    }
+    rt.shutdown(Duration::from_secs(1));
+}

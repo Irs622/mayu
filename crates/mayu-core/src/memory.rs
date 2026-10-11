@@ -1,6 +1,6 @@
 //! In-process `Broker` used to test the runtime without Redis.
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -95,6 +95,7 @@ pub struct MemoryBroker {
     failing: Arc<AtomicBool>,
     fail_retries: Arc<AtomicBool>,
     fetch_extra: Arc<AtomicUsize>,
+    record_delay_ns: Arc<AtomicU64>,
     consumer: String,
 }
 
@@ -119,6 +120,19 @@ impl MemoryBroker {
     /// blocking read across queues that claims one entry per queue past the limit.
     pub fn fetch_extra(&self, n: usize) {
         self.fetch_extra.store(n, Ordering::SeqCst);
+    }
+
+    /// Test aid: while set, `ack`, `retry` and `dead_letter` first wait `d`, like a broker with a
+    /// slow round trip. `Duration::ZERO` clears it.
+    pub fn set_record_delay(&self, d: Duration) {
+        self.record_delay_ns.store(d.as_nanos().min(u64::MAX as u128) as u64, Ordering::SeqCst);
+    }
+
+    async fn record_delay(&self) {
+        let ns = self.record_delay_ns.load(Ordering::SeqCst);
+        if ns > 0 {
+            tokio::time::sleep(Duration::from_nanos(ns)).await;
+        }
     }
 
     fn check(&self) -> Result<()> {
@@ -193,6 +207,7 @@ impl Broker for MemoryBroker {
     }
 
     async fn ack(&self, d: &Delivery, result: Option<StoredResult>, follow_ups: &[(Header, Vec<u8>)]) -> Result<()> {
+        self.record_delay().await;
         self.check()?;
         let acked = {
             let mut s = self.state.lock().unwrap();
@@ -212,6 +227,7 @@ impl Broker for MemoryBroker {
     }
 
     async fn retry(&self, d: &Delivery, header: &Header) -> Result<()> {
+        self.record_delay().await;
         self.check()?;
         if self.fail_retries.load(Ordering::SeqCst) {
             return Err(Error::Broker("injected retry failure".into()));
@@ -224,6 +240,7 @@ impl Broker for MemoryBroker {
     }
 
     async fn dead_letter(&self, d: &Delivery, error: &str, result: Option<StoredResult>) -> Result<()> {
+        self.record_delay().await;
         self.check()?;
         let mut s = self.state.lock().unwrap();
         s.pending.remove(&d.stream_id);

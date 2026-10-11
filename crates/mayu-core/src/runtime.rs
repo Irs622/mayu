@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Semaphore, mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 
 use crate::dispatch::{Admit, Dispatcher, ReadyQueue};
@@ -532,7 +532,22 @@ async fn completion_loop<B: Broker>(
     record_deadline: Duration,
     metrics: Arc<Metrics>,
 ) {
-    while let Some((token, outcome)) = rx.recv().await {
+    // Outcomes are decided here, in order, but written concurrently: a write is one broker round
+    // trip, and awaiting each before taking the next capped a worker at 1 / RTT. Each write holds
+    // its message's prefetch permit until `add_permits(1)`, so at most concurrency * prefetch
+    // writes are outstanding and no further bound is needed.
+    let mut writes = JoinSet::new();
+    loop {
+        let (token, outcome) = tokio::select! {
+            got = rx.recv() => match got {
+                Some(c) => c,
+                None => break,
+            },
+            Some(done) = writes.join_next(), if !writes.is_empty() => {
+                reap(done);
+                continue;
+            }
+        };
         // Unknown token: a zombie finished after its message was settled. Drop it.
         let Some(f) = inflight.lock().unwrap().remove(&token) else { continue };
         let started = f.started;
@@ -572,30 +587,47 @@ async fn completion_loop<B: Broker>(
             Record::Dead(..) => Settled::Dead,
         };
         // Buffer through broker outages (bounded by the prefetch permits this message holds).
-        let began = Instant::now();
-        let mut delay = Duration::from_millis(100);
-        loop {
-            match record(&*broker, &d, &rec).await {
-                Ok(()) => {
-                    metrics.settled(&d.queue, &d.header.task, how, started.map(|s| s.elapsed()));
-                    log_settled(&d, &rec);
-                    break;
-                }
-                Err(e) if began.elapsed() + delay < record_deadline => {
-                    metrics.broker_error("record");
-                    tracing::warn!(error = %e, task_id = %d.header.id, "recording outcome failed; retrying");
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(Duration::from_secs(5));
-                }
-                Err(e) => {
-                    metrics.broker_error("record");
-                    tracing::error!(error = %e, task_id = %d.header.id,
-                        "giving up recording outcome; the message will be reclaimed and run again");
-                    break;
+        let (broker, metrics, sem) = (broker.clone(), metrics.clone(), sem.clone());
+        writes.spawn(async move {
+            let began = Instant::now();
+            let mut delay = Duration::from_millis(100);
+            loop {
+                match record(&*broker, &d, &rec).await {
+                    Ok(()) => {
+                        metrics.settled(&d.queue, &d.header.task, how, started.map(|s| s.elapsed()));
+                        log_settled(&d, &rec);
+                        break;
+                    }
+                    Err(e) if began.elapsed() + delay < record_deadline => {
+                        metrics.broker_error("record");
+                        tracing::warn!(error = %e, task_id = %d.header.id, "recording outcome failed; retrying");
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(5));
+                    }
+                    Err(e) => {
+                        metrics.broker_error("record");
+                        tracing::error!(error = %e, task_id = %d.header.id,
+                            "giving up recording outcome; the message will be reclaimed and run again");
+                        break;
+                    }
                 }
             }
+            sem.add_permits(1);
+        });
+    }
+    // The channel is closed (shutdown): finish the writes still in flight before returning.
+    while let Some(done) = writes.join_next().await {
+        reap(done);
+    }
+}
+
+/// A write task only ends in an error by panicking; take the worker down, as a panic in the
+/// loop itself would.
+fn reap(done: std::result::Result<(), JoinError>) {
+    if let Err(e) = done {
+        if let Ok(p) = e.try_into_panic() {
+            std::panic::resume_unwind(p);
         }
-        sem.add_permits(1);
     }
 }
 
