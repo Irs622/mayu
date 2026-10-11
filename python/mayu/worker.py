@@ -351,14 +351,25 @@ class WorkerRunner:
         try:
             data = None if self.app.result_ttl is None else serializer.dumps(result)
             # link callbacks get the result first; Rust enqueues them atomically with the ack
-            follow_ups = [(cb["task"], cb["queue"], serializer.dumps([[result, *cb["args"]], cb["kwargs"]]),
-                           cb["max_retries"]) for cb in links]
+            follow_ups = [self._follow_up(serializer, result, cb) for cb in links]
         except BaseException as e:
             self.native.complete_failure(token, f"result not serializable: {e!r}", traceback.format_exc())
             self._settled()
             return
-        self.native.complete_success(token, data, follow_ups)
+        try:
+            self.native.complete_success(token, data, follow_ups)
+        except (TypeError, ValueError, OverflowError) as e:
+            # argument extraction failed before reaching Rust, so no outcome was recorded yet
+            self.native.complete_failure(token, f"bad link callback: {e!r}", traceback.format_exc())
         self._settled()
+
+    @staticmethod
+    def _follow_up(serializer, result, cb) -> tuple:
+        max_retries = int(cb["max_retries"])
+        if not 0 <= max_retries <= 2**32 - 1:
+            raise ValueError(f"link max_retries out of range: {max_retries}")
+        payload = bytes(serializer.dumps([[result, *cb["args"]], cb["kwargs"]]))
+        return (str(cb["task"]), str(cb["queue"]), payload, max_retries)
 
     def _report_error(self, token, task, e: BaseException) -> None:
         if isinstance(e, Retry):

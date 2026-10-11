@@ -1,4 +1,3 @@
-import threading
 import time
 
 import pytest
@@ -178,3 +177,33 @@ def test_link_is_a_reserved_parameter_name(app):
         @app.task
         def bad(link):
             pass
+
+
+def test_link_on_threadsafe_false_parent(app, running):
+    got = []
+
+    @app.task(threadsafe=False)
+    def make():
+        return 41
+
+    @app.task
+    def use(result):
+        got.append(result)
+
+    with running(app):
+        make.send(link=use)
+        _wait(lambda: got)
+    assert got == [41]
+
+
+@pytest.mark.parametrize("bad", ["nope", -1, 2**32, None])
+def test_malformed_link_field_fails_the_parent_instead_of_hanging(app, running, queue, bad):
+    @app.task
+    def parent():
+        return 1
+
+    link = {"task": "x", "queue": queue, "max_retries": bad, "args": [], "kwargs": {}}
+    payload = app.serializer.dumps([[], {}, {"links": [link]}])
+    app.client.enqueue(parent.name, queue, payload, app.serializer.content_type, 0)
+    with running(app):
+        _wait(lambda: app.client.queue_stats(queue)["dead"] == 1)
