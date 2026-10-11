@@ -57,6 +57,27 @@ means the task runs again, never that it is lost. **Write idempotent tasks.**
 Chaos test (needs Docker): `.venv/bin/pytest tests/chaos -v`
 (`MAYU_CHAOS_N` / `MAYU_CHAOS_SECONDS` scale it).
 
+## Time limits
+
+```python
+@app.task(soft_time_limit=30, hard_time_limit=60)
+def crunch(): ...
+```
+
+- **Soft limit:** `mayu.SoftTimeLimitExceeded` is raised inside the task at its next Python
+  bytecode, so it can be caught to clean up. It **cannot interrupt blocking C calls or socket
+  reads**: set timeouts on network clients.
+- **Hard limit:** Python threads cannot be killed. The task is recorded as failed with
+  `mayu.TimeLimitExceeded` (retried if it is in `retry_on`), its thread is abandoned as a
+  *zombie*, and a replacement thread takes over. Whatever the zombie produces later is discarded.
+- Async tasks are cancelled at their limit instead.
+- `@app.task(threadsafe=False)` runs a task on one dedicated thread, one call at a time, for
+  legacy code that is not thread-safe.
+
+The worker recycles itself (graceful stop, then a fresh interpreter in the same process) when
+zombies exceed `--max-zombie-threads` (default 4), after `--max-tasks-per-process` tasks, or
+above `--max-memory-per-process` MB of RSS.
+
 ## Development
 
 ```bash

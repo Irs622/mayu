@@ -19,3 +19,18 @@ def slow_once(path):
     open(path, "w").close()
     time.sleep(60)
     return "slow"
+
+
+import uuid
+
+BOOT = uuid.uuid4().hex
+
+
+@app.task(name="sample.boot")
+def boot():
+    return BOOT
+
+
+@app.task(name="sample.sleepy", hard_time_limit=0.5)
+def sleepy():
+    time.sleep(30)

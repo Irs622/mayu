@@ -1,6 +1,7 @@
 import asyncio
 import queue
 import signal
+import sys
 import threading
 import time
 import traceback
@@ -8,6 +9,7 @@ import traceback
 from . import _native
 from .exceptions import Retry, SoftTimeLimitExceeded, TimeLimitExceeded
 from .limits import TimeLimits
+from .recycle import rss_mb
 from .serializers import for_content_type
 
 _RECV_TIMEOUT_MS = 100
@@ -51,13 +53,20 @@ class WorkerRunner:
     def __init__(self, app, *, threads: int, queues: list[str] | None = None,
                  prefetch_multiplier: int = 2, shutdown_grace: float = 30.0,
                  visibility_timeout: float = 30.0, heartbeat_interval: float = 5.0,
-                 max_deliveries: int = 5):
+                 max_deliveries: int = 5, max_zombie_threads: int = 4,
+                 max_tasks_per_process: int | None = None, max_memory_per_process: float | None = None):
         if threads < 1:
             raise ValueError("threads must be >= 1")
         if visibility_timeout <= 0 or heartbeat_interval <= 0:
             raise ValueError("visibility_timeout and heartbeat_interval must be positive")
         if max_deliveries < 1:
             raise ValueError("max_deliveries must be >= 1")
+        if max_zombie_threads < 0:
+            raise ValueError("max_zombie_threads must be >= 0")
+        if max_tasks_per_process is not None and max_tasks_per_process < 1:
+            raise ValueError("max_tasks_per_process must be >= 1")
+        if max_memory_per_process is not None and max_memory_per_process <= 0:
+            raise ValueError("max_memory_per_process must be positive (MB)")
         self.app = app
         self.threads = threads
         self.queues = list(queues or app.queues())
@@ -66,6 +75,14 @@ class WorkerRunner:
         self.visibility_timeout = visibility_timeout
         self.heartbeat_interval = heartbeat_interval
         self.max_deliveries = max_deliveries
+        self.max_zombie_threads = max_zombie_threads
+        self.max_tasks_per_process = max_tasks_per_process
+        self.max_memory_per_process = max_memory_per_process
+        self.restart_reason: str | None = None
+        self._restart_lock = threading.Lock()
+        self._settled_count = 0
+        self._settled_lock = threading.Lock()
+        self._next_memory_check = 0.0
         self.native = None
         self._running = threading.Event()
         self._stopped = threading.Event()
@@ -131,7 +148,8 @@ class WorkerRunner:
         if not self._loop_thread.is_alive():
             self._loop.close()
 
-    def run(self) -> None:
+    def run(self) -> str | None:
+        """Runs until stopped. Returns why the worker stopped to recycle itself, or None."""
         self.start()
         if threading.current_thread() is threading.main_thread():
             for sig in (signal.SIGTERM, signal.SIGINT):
@@ -139,6 +157,39 @@ class WorkerRunner:
         while not self._stopped.wait(0.5):
             pass
         self.join()
+        return self.restart_reason
+
+    # -- recycling -----------------------------------------------------------
+
+    def _request_restart(self, reason: str) -> None:
+        with self._restart_lock:
+            if self.restart_reason is not None:
+                return
+            self.restart_reason = reason
+        print(f"mayu: recycling worker: {reason}", file=sys.stderr, flush=True)
+        self.stop()
+
+    def _settled(self) -> None:
+        if self.max_tasks_per_process is None:
+            return
+        with self._settled_lock:
+            self._settled_count += 1
+            n = self._settled_count
+        if n >= self.max_tasks_per_process:
+            self._request_restart(f"max_tasks_per_process ({self.max_tasks_per_process}) reached")
+
+    def _check_recycle(self) -> None:
+        with self._slots_lock:
+            zombies = sum(1 for s in self._slots if s.zombie and s.thread is not None and s.thread.is_alive())
+        if zombies > self.max_zombie_threads:
+            self._request_restart(f"{zombies} zombie threads exceed max_zombie_threads ({self.max_zombie_threads})")
+        now = time.monotonic()
+        if self.max_memory_per_process is not None and now >= self._next_memory_check:
+            self._next_memory_check = now + 1.0
+            rss = rss_mb()
+            if rss is not None and rss > self.max_memory_per_process:
+                self._request_restart(
+                    f"memory {rss:.0f} MB exceeds max_memory_per_process ({self.max_memory_per_process:g} MB)")
 
     # -- threads -------------------------------------------------------------
 
@@ -192,12 +243,19 @@ class WorkerRunner:
                         self._on_hard_limit(run)
                     except Exception:
                         traceback.print_exc()  # one failed report must not stop the others
+                self._check_recycle()
             except Exception:
                 traceback.print_exc()  # the supervisor must outlive a bad tick
 
     def _on_hard_limit(self, run) -> None:
         task, slot = run.context
         slot.zombie = True
+        try:
+            # Decide before reporting: once clients see the failure they may submit new work, and a
+            # worker that is about to recycle must already have stopped fetching.
+            self._check_recycle()
+        except Exception:
+            traceback.print_exc()
         try:
             self._report_error(run.token, task, TimeLimitExceeded(f"hard time limit ({run.hard}s) exceeded"))
         finally:
@@ -214,6 +272,7 @@ class WorkerRunner:
         task = self.app.registry.get(ready.task)
         if task is None:
             self.native.complete_failure(ready.token, f"unknown task {ready.task!r}", "")
+            self._settled()
             return
         try:
             serializer = for_content_type(ready.content_type, allow_pickle=self.app.allow_pickle)
@@ -286,19 +345,25 @@ class WorkerRunner:
     def _report_success(self, token, serializer, result) -> None:
         if self.app.result_ttl is None:
             self.native.complete_success(token, None)
+            self._settled()
             return
         try:
             data = serializer.dumps(result)
         except BaseException as e:
             self.native.complete_failure(token, f"result not serializable: {e!r}", traceback.format_exc())
+            self._settled()
             return
         self.native.complete_success(token, data)
+        self._settled()
 
     def _report_error(self, token, task, e: BaseException) -> None:
         if isinstance(e, Retry):
             ms = None if e.countdown is None else max(0, int(e.countdown * 1000))
             self.native.complete_retry(token, ms, repr(e.exc) if e.exc is not None else "Retry requested")
+            self._settled()
         elif task.retry_on and isinstance(e, task.retry_on):
             self.native.complete_retry(token, None, repr(e))
+            self._settled()
         else:
             self.native.complete_failure(token, repr(e), "".join(traceback.format_exception(e)))
+            self._settled()

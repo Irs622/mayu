@@ -202,7 +202,19 @@ impl<B: Broker> Runtime<B> {
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> Option<ReadyTask> {
-        self.ready_rx.recv_timeout(timeout).ok()
+        let task = self.ready_rx.recv_timeout(timeout).ok()?;
+        if *self.stop_tx.borrow() {
+            // Fetched by a read that was already in flight when fetching stopped: don't start new
+            // work while stopping; give it back to the queue (as `shutdown` does for the rest).
+            let f = self.inflight.lock().unwrap().remove(&task.token);
+            if let Some(f) = f {
+                if let Err(e) = self.rt.block_on(self.broker.requeue(&f.delivery)) {
+                    tracing::warn!(error = %e, task_id = %f.delivery.header.id, "requeue after stop failed");
+                }
+            }
+            return None;
+        }
+        Some(task)
     }
 
     pub fn complete(&self, token: u64, outcome: Outcome) {

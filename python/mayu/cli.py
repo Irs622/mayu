@@ -36,11 +36,18 @@ def _cmd_worker(args) -> int:
                               shutdown_grace=args.shutdown_grace,
                               visibility_timeout=args.visibility_timeout,
                               heartbeat_interval=args.heartbeat_interval,
-                              max_deliveries=args.max_deliveries)
+                              max_deliveries=args.max_deliveries,
+                              max_zombie_threads=args.max_zombie_threads,
+                              max_tasks_per_process=args.max_tasks_per_process,
+                              max_memory_per_process=args.max_memory_per_process)
     except ValueError as e:
         print(f"mayu: {e}", file=sys.stderr)
         return 2
-    runner.run()
+    reason = runner.run()
+    if reason is not None:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.execv(sys.executable, [sys.executable, "-m", "mayu", *args.argv])
     return 0
 
 
@@ -58,8 +65,14 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--heartbeat-interval", type=float, default=5.0)
     w.add_argument("--max-deliveries", type=int, default=5,
                    help="dead-letter a task after this many crash-redeliveries")
+    w.add_argument("--max-zombie-threads", type=int, default=4,
+                   help="recycle the worker when more threads than this are stuck past their hard limit")
+    w.add_argument("--max-tasks-per-process", type=int, default=None)
+    w.add_argument("--max-memory-per-process", type=float, default=None, metavar="MB")
     w.set_defaults(func=_cmd_worker)
+    argv = sys.argv[1:] if argv is None else list(argv)
     args = parser.parse_args(argv)
+    args.argv = argv
     return args.func(args)
 
 
