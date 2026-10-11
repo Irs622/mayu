@@ -27,6 +27,8 @@ SYSTEMS = {
     "mayu-process": ("bench_mayu", "process_cmd"),
     "celery": ("bench_celery", "worker_cmd"),
     "rq": ("bench_rq", "worker_cmd"),
+    "dramatiq": ("bench_dramatiq", "worker_cmd"),
+    "streaq": ("bench_streaq", "worker_cmd"),
 }
 OWNER_KEY = "bench:owner"
 SAMPLE_EVERY = 0.005
