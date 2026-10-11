@@ -17,7 +17,9 @@ pytestmark = pytest.mark.skipif(not os.path.exists(GIL_PYTHON),
 
 
 def test_auto_mode_on_gil_build_uses_process_mode(redis_url, queue):
-    env = {**os.environ, "MAYU_BROKER": redis_url, "MAYU_DEFAULT_QUEUE": queue, "PYTHONPATH": str(HERE)}
+    # The ft-stress leg exports PYTHON_GIL=0, and a GIL build refuses to start with it.
+    env = {**{k: v for k, v in os.environ.items() if k != "PYTHON_GIL"},
+           "MAYU_BROKER": redis_url, "MAYU_DEFAULT_QUEUE": queue, "PYTHONPATH": str(HERE)}
     proc = subprocess.Popen([GIL_PYTHON, "-m", "mayu", "worker", "sample_app:app",
                              "--processes", "2", "--shutdown-grace", "5"],
                             env=env, stderr=subprocess.PIPE, text=True)

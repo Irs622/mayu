@@ -17,7 +17,7 @@ otel = ["opentelemetry-api>=1.30"]
 mayu = "mayu.cli:main"
 
 [dependency-groups]
-dev = ["maturin>=1.9,<2", "pytest>=8", "opentelemetry-sdk>=1.30"]
+dev = ["maturin>=1.9,<2", "pytest>=8", "opentelemetry-sdk>=1.30", "pytest-run-parallel>=0.10"]
 
 [tool.maturin]
 manifest-path = "crates/mayu-py/Cargo.toml"
@@ -26,3 +26,6 @@ module-name = "mayu._native"
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
+# Under pytest-run-parallel (scripts/matrix.sh ft-stress) a function-scoped fixture is created once and
+# shared by every thread, so tests that register tasks on `app` or start a worker run single-threaded.
+thread_unsafe_fixtures = ["app", "queue", "running"]

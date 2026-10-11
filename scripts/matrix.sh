@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # The CI matrix, run locally (Linux legs only; macOS is not covered).
 #   ft     3.14t thread mode           (.venv)
+#   ft-stress  3.14t, PYTHON_GIL=0, every test on 4 threads at once (pytest-run-parallel)  (.venv)
 #   gil    3.14 process mode           (.venv-gil)
 #   py313  3.13 process mode           (.venv-313)
 # Usage: scripts/matrix.sh [leg...]   (default: every leg). Needs uv and Docker.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ALL_LEGS=(ft gil py313)
-DEPS=(maturin pytest msgpack opentelemetry-sdk)
+ALL_LEGS=(ft ft-stress gil py313)
+DEPS=(maturin pytest msgpack opentelemetry-sdk pytest-run-parallel)
 
 venv_for() {
   case $1 in
-    ft) echo .venv ;;
+    ft | ft-stress) echo .venv ;;
     gil) echo .venv-gil ;;
     py313) echo .venv-313 ;;
   esac
@@ -20,7 +21,7 @@ venv_for() {
 
 python_for() {
   case $1 in
-    ft) echo 3.14t ;;
+    ft | ft-stress) echo 3.14t ;;
     gil) echo 3.14+gil ;;
     py313) echo 3.13 ;;
   esac
@@ -30,6 +31,7 @@ run_leg() {
   local v; v=$(venv_for "$1")
   case $1 in
     ft | gil | py313) "$v/bin/pytest" tests/python -q ;;
+    ft-stress) PYTHON_GIL=0 .venv/bin/pytest tests/python -q --parallel-threads=4 ;;
   esac
 }
 

@@ -25,6 +25,7 @@ class App:
         self.registry: dict[str, Task] = {}
         self._client = None
         self._client_lock = threading.Lock()
+        self._registry_lock = threading.Lock()
 
     @property
     def client(self) -> "_native.Client":
@@ -53,9 +54,10 @@ class App:
                 threadsafe=threadsafe,
                 rate_limit=rate_limit,
             )
-            if t.name in self.registry:
-                raise ValueError(f"task {t.name!r} is already registered")
-            self.registry[t.name] = t
+            with self._registry_lock:
+                if t.name in self.registry:
+                    raise ValueError(f"task {t.name!r} is already registered")
+                self.registry[t.name] = t
             return t
 
         return register(fn) if fn is not None else register

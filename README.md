@@ -207,12 +207,12 @@ changes.
 scripts/redis-up.sh                                   # Redis on :6390 for tests
 cargo test --workspace                                # Rust tests (need Redis)
 uv venv --python 3.14t .venv
-uv pip install --python .venv/bin/python maturin pytest msgpack opentelemetry-sdk
+uv pip install --python .venv/bin/python maturin pytest msgpack opentelemetry-sdk pytest-run-parallel
 VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop --uv
 .venv/bin/pytest
 uv venv --python 3.14+gil .venv-gil && uv pip install --python .venv-gil/bin/python maturin pytest msgpack
 VIRTUAL_ENV=$PWD/.venv-gil .venv-gil/bin/maturin develop --uv
-scripts/matrix.sh                                     # CI matrix, Linux legs: ft (3.14t), gil (3.14), py313 (3.13)
+scripts/matrix.sh                                     # CI matrix, Linux legs: ft (3.14t), ft-stress (3.14t, PYTHON_GIL=0, 4 threads per test), gil (3.14), py313 (3.13)
 scripts/matrix.sh py313                               # one leg
 scripts/test-all.sh                                   # Rust + matrix + chaos
 ```
