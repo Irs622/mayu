@@ -25,6 +25,8 @@ import workload  # noqa: E402
 SYSTEMS = {
     "mayu-thread": ("bench_mayu", "thread_cmd"),
     "mayu-process": ("bench_mayu", "process_cmd"),
+    "celery": ("bench_celery", "worker_cmd"),
+    "rq": ("bench_rq", "worker_cmd"),
 }
 OWNER_KEY = "bench:owner"
 SAMPLE_EVERY = 0.005
