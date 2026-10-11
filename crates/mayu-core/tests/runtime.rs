@@ -140,3 +140,14 @@ fn rejects_zero_concurrency() {
     let m = mem.clone();
     assert!(Runtime::start(move || async move { Ok(m) }, cfg(0, 1)).is_err());
 }
+
+#[test]
+fn shutdown_is_prompt_while_broker_is_failing() {
+    let mem = MemoryBroker::default();
+    let rt = start(&mem, cfg(1, 1));
+    mem.set_failing(true);
+    std::thread::sleep(Duration::from_millis(60)); // fetch loop is now in its 500ms error backoff
+    let t = Instant::now();
+    rt.shutdown(Duration::from_millis(100));
+    assert!(t.elapsed() < Duration::from_millis(250), "shutdown took {:?}", t.elapsed());
+}

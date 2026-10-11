@@ -1,5 +1,6 @@
 //! In-process `Broker` used to test the runtime without Redis.
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -7,7 +8,7 @@ use tokio::sync::Notify;
 
 use crate::broker::{Broker, Delivery, StoredResult};
 use crate::envelope::{Header, decode_header, encode_header, now_ms};
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 #[derive(Debug, Clone)]
 pub struct DeadEntry {
@@ -62,9 +63,23 @@ impl State {
 pub struct MemoryBroker {
     state: Arc<Mutex<State>>,
     notify: Arc<Notify>,
+    failing: Arc<AtomicBool>,
 }
 
 impl MemoryBroker {
+    /// While set, every `Broker` call fails, simulating an outage.
+    pub fn set_failing(&self, on: bool) {
+        self.failing.store(on, Ordering::SeqCst);
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.failing.load(Ordering::SeqCst) {
+            Err(Error::Broker("injected failure".into()))
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn push(&self, header: &Header, payload: &[u8]) {
         let h = encode_header(header);
         {
@@ -95,14 +110,18 @@ impl MemoryBroker {
 }
 
 impl Broker for MemoryBroker {
-    async fn ensure_queues(&self, _queues: &[String]) -> Result<()> { Ok(()) }
+    async fn ensure_queues(&self, _queues: &[String]) -> Result<()> {
+        self.check()
+    }
 
     async fn enqueue(&self, header: &Header, payload: &[u8]) -> Result<()> {
+        self.check()?;
         self.push(header, payload);
         Ok(())
     }
 
     async fn fetch(&self, queues: &[String], count: usize, block_ms: u64) -> Result<Vec<Delivery>> {
+        self.check()?;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(block_ms);
         loop {
             let notified = self.notify.notified();
@@ -115,6 +134,7 @@ impl Broker for MemoryBroker {
     }
 
     async fn ack(&self, d: &Delivery, result: Option<StoredResult>) -> Result<()> {
+        self.check()?;
         let mut s = self.state.lock().unwrap();
         s.pending.remove(&d.stream_id);
         Self::store(&mut s, result);
@@ -122,6 +142,7 @@ impl Broker for MemoryBroker {
     }
 
     async fn retry(&self, d: &Delivery, header: &Header) -> Result<()> {
+        self.check()?;
         let mut s = self.state.lock().unwrap();
         s.pending.remove(&d.stream_id);
         s.delayed.entry(d.queue.clone()).or_default()
@@ -130,6 +151,7 @@ impl Broker for MemoryBroker {
     }
 
     async fn dead_letter(&self, d: &Delivery, error: &str, result: Option<StoredResult>) -> Result<()> {
+        self.check()?;
         let mut s = self.state.lock().unwrap();
         s.pending.remove(&d.stream_id);
         s.dead.push(DeadEntry { queue: d.queue.clone(), header: Some(d.header.clone()), error: error.into() });
@@ -138,6 +160,7 @@ impl Broker for MemoryBroker {
     }
 
     async fn requeue(&self, d: &Delivery) -> Result<()> {
+        self.check()?;
         {
             let mut s = self.state.lock().unwrap();
             s.pending.remove(&d.stream_id);
@@ -148,6 +171,7 @@ impl Broker for MemoryBroker {
     }
 
     async fn promote(&self, queue: &str, now_ms: u64, limit: usize) -> Result<usize> {
+        self.check()?;
         let n = {
             let mut s = self.state.lock().unwrap();
             let delayed = s.delayed.entry(queue.to_string()).or_default();
@@ -161,7 +185,10 @@ impl Broker for MemoryBroker {
         Ok(n)
     }
 
-    async fn get_result(&self, id: &str) -> Result<Option<Vec<u8>>> { Ok(self.result(id)) }
+    async fn get_result(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        self.check()?;
+        Ok(self.result(id))
+    }
 }
 
 #[cfg(test)]
@@ -245,6 +272,20 @@ mod tests {
             assert_eq!(b.dead().len(), 1);
             assert_eq!(b.dead()[0].error, "bad");
             assert_eq!(b.stream_len("q"), 1);
+        });
+    }
+
+    #[test]
+    fn failing_switch_fails_calls_until_cleared() {
+        rt().block_on(async {
+            let b = MemoryBroker::default();
+            let h = Header::new("t", "q", 0, "ct");
+            b.set_failing(true);
+            assert!(b.enqueue(&h, b"").await.is_err());
+            assert!(b.fetch(&["q".into()], 1, 10).await.is_err());
+            b.set_failing(false);
+            b.enqueue(&h, b"").await.unwrap();
+            assert_eq!(b.fetch(&["q".into()], 1, 10).await.unwrap().len(), 1);
         });
     }
 }

@@ -214,7 +214,10 @@ async fn fetch_loop<B: Broker>(mut c: FetchCtx<B>) {
             Err(e) => {
                 tracing::warn!(error = %e, "fetch failed; backing off");
                 c.sem.add_permits(n);
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    _ = c.stop.wait_for(|s| *s) => return,
+                }
                 continue;
             }
         };

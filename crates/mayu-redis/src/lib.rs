@@ -6,13 +6,14 @@ use mayu_core::{
     Broker, Delivery, Error, Header, Result, StoredResult, decode_header, encode_delayed_member,
     encode_header, now_ms,
 };
-use redis::aio::MultiplexedConnection;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::streams::StreamReadReply;
-use redis::{AsyncConnectionConfig, Script, Value};
+use redis::{Script, Value};
 
 pub const GROUP: &str = "mayu";
 /// XREADGROUP BLOCK is clamped below the fetch connection's response timeout.
 const MAX_BLOCK_MS: u64 = 10_000;
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn stream_key(q: &str) -> String { format!("mayu:{{{q}}}:stream") }
 pub fn delayed_key(q: &str) -> String { format!("mayu:{{{q}}}:delayed") }
@@ -41,10 +42,18 @@ struct Scripts {
     promote: Script,
 }
 
+async fn manager(client: &redis::Client, response_timeout: Duration) -> Result<ConnectionManager> {
+    let cfg = ConnectionManagerConfig::new()
+        .set_connection_timeout(Some(COMMAND_TIMEOUT))
+        .set_response_timeout(Some(response_timeout))
+        .set_number_of_retries(2);
+    ConnectionManager::new_with_config(client.clone(), cfg).await.map_err(be)
+}
+
 pub struct RedisBroker {
-    conn: MultiplexedConnection,
+    conn: ConnectionManager,
     /// Dedicated connection: a blocking XREADGROUP would stall other commands pipelined behind it.
-    fetch_conn: MultiplexedConnection,
+    fetch_conn: ConnectionManager,
     consumer: String,
     scripts: Scripts,
 }
@@ -52,10 +61,9 @@ pub struct RedisBroker {
 impl RedisBroker {
     pub async fn connect(url: &str, consumer: impl Into<String>) -> Result<Self> {
         let client = redis::Client::open(url).map_err(be)?;
-        let conn = client.get_multiplexed_async_connection().await.map_err(be)?;
-        let fetch_cfg = AsyncConnectionConfig::new()
-            .set_response_timeout(Some(Duration::from_millis(MAX_BLOCK_MS + 5_000)));
-        let fetch_conn = client.get_multiplexed_async_connection_with_config(&fetch_cfg).await.map_err(be)?;
+        let conn = manager(&client, COMMAND_TIMEOUT).await?;
+        // Dedicated: a blocking XREADGROUP would stall commands pipelined behind it.
+        let fetch_conn = manager(&client, Duration::from_millis(MAX_BLOCK_MS) + COMMAND_TIMEOUT).await?;
         Ok(RedisBroker {
             conn,
             fetch_conn,
