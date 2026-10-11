@@ -67,3 +67,61 @@ def test_bad_url_raises():
 
     with pytest.raises(RuntimeError):
         _native.Client("redis://127.0.0.1:1/0")
+
+
+def test_async_raise_interrupts_busy_thread():
+    class Boom(Exception):
+        pass
+
+    caught, idents = [], []
+    ready = threading.Event()
+
+    def busy():
+        idents.append(threading.get_ident())
+        ready.set()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                pass
+        except Boom:
+            caught.append(True)
+
+    th = threading.Thread(target=busy)
+    th.start()
+    ready.wait()
+    assert _native.async_raise(idents[0], Boom) == 1
+    th.join(5)
+    assert caught == [True]
+
+
+def test_async_raise_unknown_thread_returns_zero():
+    assert _native.async_raise(1, RuntimeError) == 0
+
+
+def test_async_raise_none_clears_pending():
+    class Boom(Exception):
+        pass
+
+    gate = threading.Event()
+    idents, errors = [], []
+    started = threading.Event()
+
+    def blocked():
+        idents.append(threading.get_ident())
+        started.set()
+        try:
+            gate.wait()  # inside a C call: the async exception stays pending
+            for _ in range(1000):
+                pass
+        except Boom:
+            errors.append("raised")
+
+    th = threading.Thread(target=blocked)
+    th.start()
+    started.wait()
+    time.sleep(0.05)
+    assert _native.async_raise(idents[0], Boom) == 1
+    assert _native.async_raise(idents[0], None) == 1
+    gate.set()
+    th.join(5)
+    assert errors == []

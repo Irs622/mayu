@@ -15,3 +15,11 @@ class TaskFailed(Exception):
         self.task_id = task_id
         self.error = error
         self.traceback = traceback
+
+
+class SoftTimeLimitExceeded(Exception):
+    """Raised inside a task that ran past its soft_time_limit; catch it to clean up."""
+
+
+class TimeLimitExceeded(Exception):
+    """The task ran past its hard_time_limit and was abandoned (its thread may still be running)."""

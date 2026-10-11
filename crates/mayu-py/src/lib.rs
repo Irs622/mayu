@@ -201,11 +201,23 @@ impl PyReadyTask {
     }
 }
 
+/// Schedules `exc` to be raised in the thread `thread_id` (a `threading.get_ident()` value) at its
+/// next bytecode boundary; `None` clears a pending one. Returns the number of threads affected.
+#[pyfunction]
+#[pyo3(signature = (thread_id, exc=None))]
+fn async_raise(thread_id: u64, exc: Option<Bound<'_, PyAny>>) -> i32 {
+    let ptr = exc.as_ref().map_or(std::ptr::null_mut(), |e| e.as_ptr());
+    // SAFETY: the interpreter is attached (we hold `Bound`s); the call only reads `ptr` and takes
+    // its own reference. pyo3-ffi declares the id as c_long; the cast preserves the bits.
+    unsafe { pyo3::ffi::PyThreadState_SetAsyncExc(thread_id as std::os::raw::c_long, ptr) }
+}
+
 #[pymodule]
 #[pyo3(name = "_native")]
 fn mayu_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Client>()?;
     m.add_class::<Worker>()?;
     m.add_class::<PyReadyTask>()?;
+    m.add_function(wrap_pyfunction!(async_raise, m)?)?;
     Ok(())
 }
