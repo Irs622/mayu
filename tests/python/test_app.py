@@ -156,3 +156,24 @@ def test_missing_broker_raises(monkeypatch):
 def test_taskfailed_is_exported():
     e = TaskFailed("id", "ValueError('x')", "tb")
     assert "ValueError" in str(e) and e.traceback == "tb"
+
+
+def test_time_limit_options_validated(app):
+    with pytest.raises(ValueError):
+        @app.task(soft_time_limit=0)
+        def a():
+            pass
+    with pytest.raises(ValueError):
+        @app.task(hard_time_limit=-1)
+        def b():
+            pass
+    with pytest.raises(ValueError, match="less than"):
+        @app.task(soft_time_limit=5, hard_time_limit=5)
+        def c():
+            pass
+
+    @app.task(soft_time_limit=1, hard_time_limit=2.5)
+    def d():
+        pass
+
+    assert (d.soft_time_limit, d.hard_time_limit) == (1, 2.5)

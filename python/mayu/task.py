@@ -21,7 +21,8 @@ def _eta_ms(countdown: float | None, eta: dt.datetime | None) -> int | None:
 
 
 class Task:
-    def __init__(self, app, fn, *, name: str, queue: str, max_retries: int, retry_on: tuple):
+    def __init__(self, app, fn, *, name: str, queue: str, max_retries: int, retry_on: tuple,
+                 soft_time_limit: float | None = None, hard_time_limit: float | None = None):
         self.app = app
         self.fn = fn
         self.name = name
@@ -32,6 +33,13 @@ class Task:
         clash = RESERVED_OPTIONS & set(self.signature.parameters)
         if clash:
             raise TypeError(f"task {name!r} uses reserved parameter name(s) {sorted(clash)}")
+        for label, value in (("soft_time_limit", soft_time_limit), ("hard_time_limit", hard_time_limit)):
+            if value is not None and value <= 0:
+                raise ValueError(f"{label} must be a positive number of seconds")
+        if soft_time_limit is not None and hard_time_limit is not None and soft_time_limit >= hard_time_limit:
+            raise ValueError("soft_time_limit must be less than hard_time_limit")
+        self.soft_time_limit = soft_time_limit
+        self.hard_time_limit = hard_time_limit
         self.is_async = inspect.iscoroutinefunction(fn)
         functools.update_wrapper(self, fn)
 

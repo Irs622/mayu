@@ -38,7 +38,8 @@ class App:
         return sorted({self.default_queue, *(t.queue for t in self.registry.values())})
 
     def task(self, fn=None, /, *, name: str | None = None, queue: str | None = None,
-             max_retries: int | None = None, retry_on=()):
+             max_retries: int | None = None, retry_on=(),
+             soft_time_limit: float | None = None, hard_time_limit: float | None = None):
         def register(f):
             t = Task(
                 self, f,
@@ -46,6 +47,8 @@ class App:
                 queue=queue or self.default_queue,
                 max_retries=self.max_retries if max_retries is None else max_retries,
                 retry_on=tuple(retry_on),
+                soft_time_limit=soft_time_limit,
+                hard_time_limit=hard_time_limit,
             )
             if t.name in self.registry:
                 raise ValueError(f"task {t.name!r} is already registered")
