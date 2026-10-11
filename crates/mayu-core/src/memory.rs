@@ -178,11 +178,22 @@ impl Broker for MemoryBroker {
         }
     }
 
-    async fn ack(&self, d: &Delivery, result: Option<StoredResult>) -> Result<()> {
+    async fn ack(&self, d: &Delivery, result: Option<StoredResult>, follow_ups: &[(Header, Vec<u8>)]) -> Result<()> {
         self.check()?;
-        let mut s = self.state.lock().unwrap();
-        s.pending.remove(&d.stream_id);
-        Self::store(&mut s, result);
+        let acked = {
+            let mut s = self.state.lock().unwrap();
+            let acked = s.pending.remove(&d.stream_id).is_some();
+            Self::store(&mut s, result);
+            if acked {
+                for (h, p) in follow_ups {
+                    s.push_stream(&h.queue, encode_header(h), p.clone());
+                }
+            }
+            acked
+        };
+        if acked && !follow_ups.is_empty() {
+            self.notify.notify_waiters();
+        }
         Ok(())
     }
 
@@ -324,8 +335,7 @@ mod tests {
             assert_eq!(ds[0].header, h);
             assert_eq!(ds[0].payload, b"p");
             assert_eq!(b.pending_len(), 1);
-            b.ack(&ds[0], Some(StoredResult { id: h.id.clone(), record: b"r".to_vec(), ttl_secs: 9 }))
-                .await.unwrap();
+            b.ack(&ds[0], Some(StoredResult { id: h.id.clone(), record: b"r".to_vec(), ttl_secs: 9 }), &[]).await.unwrap();
             assert_eq!(b.pending_len(), 0);
             assert_eq!(b.result(&h.id), Some(b"r".to_vec()));
         });
@@ -449,6 +459,22 @@ mod tests {
             b.heartbeat(&info, 60_000).await.unwrap();
             b.unregister("w1").await.unwrap();
             assert_eq!(b.worker("w1"), None);
+        });
+    }
+
+    #[test]
+    fn ack_enqueues_follow_ups_only_once() {
+        rt().block_on(async {
+            let b = MemoryBroker::default();
+            b.enqueue(&Header::new("t", "q", 0, "ct"), b"").await.unwrap();
+            let d = b.fetch(&["q".into()], 1, 10).await.unwrap().remove(0);
+            let follow = [(Header::new("cb", "q2", 1, "ct"), b"x".to_vec())];
+            b.ack(&d, None, &follow).await.unwrap();
+            b.ack(&d, None, &follow).await.unwrap(); // a retried ack: already acked, adds nothing
+            let got = b.fetch(&["q2".into()], 10, 10).await.unwrap();
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].header, follow[0].0);
+            assert_eq!(got[0].payload, b"x");
         });
     }
 }

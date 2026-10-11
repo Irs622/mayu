@@ -46,7 +46,10 @@ pub trait Broker: Send + Sync + 'static {
     /// When none are ready it blocks up to `block_ms` and may return up to one entry per queue.
     fn fetch(&self, queues: &[String], count: usize, block_ms: u64)
         -> impl Future<Output = Result<Vec<Delivery>>> + Send;
-    fn ack(&self, d: &Delivery, result: Option<StoredResult>) -> impl Future<Output = Result<()>> + Send;
+    /// Acks `d` and enqueues `follow_ups` (link callbacks) in one atomic step. The follow-ups are
+    /// enqueued only if this call is the one that acks `d`, so a repeated ack adds no duplicates.
+    fn ack(&self, d: &Delivery, result: Option<StoredResult>, follow_ups: &[(Header, Vec<u8>)])
+        -> impl Future<Output = Result<()>> + Send;
     fn retry(&self, d: &Delivery, header: &Header) -> impl Future<Output = Result<()>> + Send;
     fn dead_letter(&self, d: &Delivery, error: &str, result: Option<StoredResult>)
         -> impl Future<Output = Result<()>> + Send;

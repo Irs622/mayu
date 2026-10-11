@@ -433,14 +433,14 @@ async fn bury_poison<B: Broker>(c: &FetchCtx<B>, d: &Delivery) {
 
 /// How an outcome is written to the broker.
 enum Record {
-    Ack(Option<StoredResult>),
+    Ack(Option<StoredResult>, Vec<(Header, Vec<u8>)>),
     Retry(Header),
     Dead(String, Option<StoredResult>),
 }
 
 async fn record<B: Broker>(broker: &B, d: &Delivery, r: &Record) -> Result<()> {
     match r {
-        Record::Ack(stored) => broker.ack(d, stored.clone()).await,
+        Record::Ack(stored, follow_ups) => broker.ack(d, stored.clone(), follow_ups).await,
         Record::Retry(header) => broker.retry(d, header).await,
         Record::Dead(error, stored) => broker.dead_letter(d, error, stored.clone()).await,
     }
@@ -461,14 +461,23 @@ async fn completion_loop<B: Broker>(
         let d = f.delivery;
         let ct = d.header.content_type.clone();
         let rec = match decide(&d.header, outcome, &retry, now_ms(), full_jitter) {
-            Action::Ack { result } => Record::Ack(match (result, ttl) {
-                (Some(v), Some(ttl_secs)) => Some(StoredResult {
-                    id: d.header.id.clone(),
-                    record: ResultRecord::success(v, &ct).encode(),
-                    ttl_secs,
-                }),
-                _ => None,
-            }),
+            Action::Ack { result, links } => {
+                let stored = match (result, ttl) {
+                    (Some(v), Some(ttl_secs)) => Some(StoredResult {
+                        id: d.header.id.clone(),
+                        record: ResultRecord::success(v, &ct).encode(),
+                        ttl_secs,
+                    }),
+                    _ => None,
+                };
+                // Built once, so retried records reuse the same callback ids.
+                let follow_ups = links.into_iter().map(|l| {
+                    let mut h = Header::new(l.task, l.queue, l.max_retries, ct.clone());
+                    h.trace_ctx = d.header.trace_ctx.clone();
+                    (h, l.payload)
+                }).collect();
+                Record::Ack(stored, follow_ups)
+            }
             Action::Retry { header } => Record::Retry(header),
             Action::Dead { error, traceback } => {
                 let stored = ttl.map(|ttl_secs| StoredResult {

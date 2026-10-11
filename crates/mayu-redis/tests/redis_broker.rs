@@ -58,7 +58,7 @@ async fn ack_removes_entry_and_stores_result() {
     let h = Header::new("t", &q, 0, "ct");
     b.enqueue(&h, b"").await.unwrap();
     let d = b.fetch(&[q.clone()], 1, 100).await.unwrap().remove(0);
-    b.ack(&d, Some(StoredResult { id: h.id.clone(), record: b"rec".to_vec(), ttl_secs: 60 })).await.unwrap();
+    b.ack(&d, Some(StoredResult { id: h.id.clone(), record: b"rec".to_vec(), ttl_secs: 60 }), &[]).await.unwrap();
     let s = b.stats(&q).await.unwrap();
     assert_eq!((s.stream, s.pending), (0, 0));
     assert_eq!(b.get_result(&h.id).await.unwrap(), Some(b"rec".to_vec()));
@@ -245,7 +245,7 @@ async fn prune_removes_only_idle_consumers_without_heartbeat_or_pending() {
     for _ in 0..3 { ghost.enqueue(&Header::new("t", &q, 0, "ct"), b"").await.unwrap(); }
     for b in [&ghost, &live] {
         let d = b.fetch(&[q.clone()], 1, 100).await.unwrap().remove(0);
-        b.ack(&d, None).await.unwrap(); // consumer exists, 0 pending
+        b.ack(&d, None, &[]).await.unwrap(); // consumer exists, 0 pending
     }
     busy.fetch(&[q.clone()], 1, 100).await.unwrap(); // 1 pending, no heartbeat
     live.heartbeat(&WorkerInfo {
@@ -320,4 +320,21 @@ async fn fetch_with_zero_count_returns_nothing() {
     b.enqueue(&Header::new("t", &q, 0, "ct"), b"").await.unwrap();
     assert!(b.fetch(std::slice::from_ref(&q), 0, 100).await.unwrap().is_empty());
     assert_eq!(b.stats(&q).await.unwrap().pending, 0);
+}
+
+#[tokio::test]
+async fn ack_enqueues_follow_ups_only_once() {
+    let (b, q) = setup().await;
+    let q2 = uniq("q");
+    b.ensure_queues(std::slice::from_ref(&q2)).await.unwrap();
+    b.enqueue(&Header::new("t", &q, 0, "ct"), b"").await.unwrap();
+    let d = b.fetch(std::slice::from_ref(&q), 1, 100).await.unwrap().remove(0);
+    let cb = Header::new("cb", &q2, 2, "ct");
+    let follow = [(cb.clone(), b"x".to_vec())];
+    b.ack(&d, None, &follow).await.unwrap();
+    b.ack(&d, None, &follow).await.unwrap(); // a retried ack whose first reply was lost
+    let got = b.fetch(std::slice::from_ref(&q2), 10, 100).await.unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].header, cb);
+    assert_eq!(got[0].payload, b"x");
 }

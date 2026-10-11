@@ -134,7 +134,7 @@ impl Worker {
 
     #[pyo3(signature = (token, result=None))]
     fn complete_success(&self, token: u64, result: Option<Vec<u8>>) {
-        self.inner.complete(token, Outcome::Success { result });
+        self.inner.complete(token, Outcome::Success { result, links: vec![] });
     }
 
     fn complete_failure(&self, token: u64, error: String, traceback: String) {

@@ -1,15 +1,25 @@
 use crate::envelope::Header;
 
+/// A `link=` callback: a task enqueued in the same atomic step that acks its parent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Link {
+    pub task: String,
+    pub queue: String,
+    pub max_retries: u32,
+    /// Encoded by the worker with the parent's serializer; the parent's result comes first.
+    pub payload: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
-    Success { result: Option<Vec<u8>> },
+    Success { result: Option<Vec<u8>>, links: Vec<Link> },
     Failure { error: String, traceback: String },
     Retry { countdown_ms: Option<u64>, error: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
-    Ack { result: Option<Vec<u8>> },
+    Ack { result: Option<Vec<u8>>, links: Vec<Link> },
     Retry { header: Header },
     Dead { error: String, traceback: String },
 }
@@ -46,7 +56,7 @@ pub fn decide(
     jitter: impl FnOnce(u64) -> u64,
 ) -> Action {
     match outcome {
-        Outcome::Success { result } => Action::Ack { result },
+        Outcome::Success { result, links } => Action::Ack { result, links },
         Outcome::Failure { error, traceback } => Action::Dead { error, traceback },
         Outcome::Retry { countdown_ms, error } => {
             if header.attempt >= header.max_retries {
@@ -95,10 +105,18 @@ mod tests {
     }
 
     #[test]
-    fn success_acks() {
-        let a = decide(&hdr(0, 3), Outcome::Success { result: Some(b"r".to_vec()) },
+    fn success_carries_links_to_the_ack() {
+        let link = Link { task: "cb".into(), queue: "q2".into(), max_retries: 1, payload: b"p".to_vec() };
+        let a = decide(&hdr(0, 3), Outcome::Success { result: None, links: vec![link.clone()] },
                        &RetryPolicy::default(), 1_000, |m| m);
-        assert!(matches!(a, Action::Ack { result: Some(ref r) } if r == b"r"));
+        assert_eq!(a, Action::Ack { result: None, links: vec![link] });
+    }
+
+    #[test]
+    fn success_acks() {
+        let a = decide(&hdr(0, 3), Outcome::Success { result: Some(b"r".to_vec()), links: vec![] },
+                       &RetryPolicy::default(), 1_000, |m| m);
+        assert!(matches!(a, Action::Ack { result: Some(ref r), .. } if r == b"r"));
     }
 
     #[test]

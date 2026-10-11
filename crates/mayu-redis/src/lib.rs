@@ -355,15 +355,17 @@ impl Broker for RedisBroker {
         self.fetch_blocking(queues, (count / queues.len()).max(1), block_ms).await
     }
 
-    async fn ack(&self, d: &Delivery, result: Option<StoredResult>) -> Result<()> {
+    async fn ack(&self, d: &Delivery, result: Option<StoredResult>, follow_ups: &[(Header, Vec<u8>)]) -> Result<()> {
         let (flag, id, record, ttl) = match result {
             Some(r) => ("1", r.id, r.record, r.ttl_secs),
             None => ("0", String::new(), Vec::new(), 0),
         };
-        self.scripts.ack
-            .key(stream_key(&d.queue)).key(result_key(&id))
-            .arg(GROUP).arg(&d.stream_id).arg(flag).arg(record).arg(ttl)
-            .invoke_async::<i64>(&mut self.conn.clone()).await.map_err(be)?;
+        let mut inv = self.scripts.ack.prepare_invoke();
+        inv.key(stream_key(&d.queue)).key(result_key(&id));
+        for (h, _) in follow_ups { inv.key(stream_key(&h.queue)); }
+        inv.arg(GROUP).arg(&d.stream_id).arg(flag).arg(record).arg(ttl);
+        for (h, p) in follow_ups { inv.arg(encode_header(h)).arg(p); }
+        inv.invoke_async::<i64>(&mut self.conn.clone()).await.map_err(be)?;
         Ok(())
     }
 

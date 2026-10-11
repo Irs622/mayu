@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use mayu_core::{Header, MemoryBroker, Outcome, ResultRecord, RetryPolicy, Runtime, RuntimeConfig, now_ms};
+use mayu_core::{Header, Link, MemoryBroker, Outcome, ResultRecord, RetryPolicy, Runtime, RuntimeConfig, now_ms};
 
 fn cfg(concurrency: usize, prefetch: usize) -> RuntimeConfig {
     RuntimeConfig {
@@ -42,7 +42,7 @@ fn success_acks_and_stores_result() {
     let rt = start(&mem, cfg(2, 2));
     let t = rt.recv_timeout(RECV).expect("task");
     assert_eq!((t.id.as_str(), t.task.as_str(), t.payload.as_slice()), (h.id.as_str(), "t", &b"p"[..]));
-    rt.complete(t.token, Outcome::Success { result: Some(b"r".to_vec()) });
+    rt.complete(t.token, Outcome::Success { result: Some(b"r".to_vec()), links: vec![] });
     wait_until(|| mem.pending_len() == 0 && mem.result(&h.id).is_some());
     let rec = ResultRecord::decode(&mem.result(&h.id).unwrap()).unwrap();
     assert_eq!(rec.status, "success");
@@ -99,7 +99,7 @@ fn prefetch_caps_inflight() {
     assert_eq!(mem.pending_len(), 2, "must not claim beyond concurrency * prefetch");
     assert_eq!(mem.stream_len("q"), 3);
     let t = rt.recv_timeout(RECV).unwrap();
-    rt.complete(t.token, Outcome::Success { result: None });
+    rt.complete(t.token, Outcome::Success { result: None, links: vec![] });
     wait_until(|| mem.stream_len("q") == 2 && mem.pending_len() == 2);
     rt.shutdown(Duration::from_secs(1));
 }
@@ -108,7 +108,7 @@ fn prefetch_caps_inflight() {
 fn unknown_token_is_ignored() {
     let mem = MemoryBroker::default();
     let rt = start(&mem, cfg(1, 1));
-    rt.complete(999_999, Outcome::Success { result: None });
+    rt.complete(999_999, Outcome::Success { result: None, links: vec![] });
     mem.push(&Header::new("t", "q", 0, "ct"), b"");
     assert!(rt.recv_timeout(RECV).is_some(), "runtime still works after a stray completion");
     rt.shutdown(Duration::from_secs(1));
@@ -183,7 +183,7 @@ fn running_task_is_kept_alive_and_not_stolen() {
     let t = a.recv_timeout(RECV).unwrap();
     let b = start_as(&mem, "b", rel_cfg("b", 200, 5));
     assert!(b.recv_timeout(Duration::from_millis(700)).is_none(), "b stole a task a is still running");
-    a.complete(t.token, Outcome::Success { result: None });
+    a.complete(t.token, Outcome::Success { result: None, links: vec![] });
     wait_until(|| mem.pending_len() == 0);
     a.shutdown(Duration::from_secs(1));
     b.shutdown(Duration::from_secs(1));
@@ -200,7 +200,7 @@ fn crashed_workers_task_is_reclaimed() {
     let b = start_as(&mem, "b", rel_cfg("b", 200, 5));
     let t = b.recv_timeout(RECV).expect("reclaimed after visibility timeout");
     assert_eq!(t.id, h.id);
-    b.complete(t.token, Outcome::Success { result: None });
+    b.complete(t.token, Outcome::Success { result: None, links: vec![] });
     wait_until(|| mem.pending_len() == 0);
     b.shutdown(Duration::from_secs(1));
 }
@@ -232,7 +232,7 @@ fn lost_ownership_still_completes() {
     let thief = mem.with_consumer("thief");
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     assert_eq!(rt.block_on(thief.reclaim("q", 0, "0-0", 10)).unwrap().deliveries.len(), 1);
-    a.complete(t.token, Outcome::Success { result: None });
+    a.complete(t.token, Outcome::Success { result: None, links: vec![] });
     wait_until(|| mem.pending_len() == 0);
     a.shutdown(Duration::from_secs(1));
 }
@@ -259,7 +259,7 @@ fn outcome_is_recorded_after_transient_broker_failure() {
     let rt = start(&mem, cfg(1, 1));
     let t = rt.recv_timeout(RECV).unwrap();
     mem.set_failing(true);
-    rt.complete(t.token, Outcome::Success { result: Some(b"r".to_vec()) });
+    rt.complete(t.token, Outcome::Success { result: Some(b"r".to_vec()), links: vec![] });
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(mem.pending_len(), 1, "not recorded while the broker is down");
     mem.set_failing(false);
@@ -307,7 +307,7 @@ fn equal_priority_takes_turns_between_queues() {
     for _ in 0..4 {
         let t = rt.recv_timeout(RECV).unwrap();
         seen.push(t.queue.clone());
-        rt.complete(t.token, Outcome::Success { result: None });
+        rt.complete(t.token, Outcome::Success { result: None, links: vec![] });
     }
     assert!(seen.iter().any(|q| q == "hi") && seen.iter().any(|q| q == "lo"), "{seen:?}");
     rt.shutdown(Duration::from_secs(1));
@@ -322,7 +322,7 @@ fn rate_limit_spaces_task_starts() {
     for _ in 0..3 {
         let t = rt.recv_timeout(RECV).unwrap();
         at.push(Instant::now());
-        rt.complete(t.token, Outcome::Success { result: None });
+        rt.complete(t.token, Outcome::Success { result: None, links: vec![] });
     }
     for w in at.windows(2) {
         assert!(w[1] - w[0] >= Duration::from_millis(80), "starts {:?} apart", w[1] - w[0]);
@@ -339,7 +339,7 @@ fn rate_limited_backlog_goes_back_to_the_broker_and_frees_prefetch() {
     let rt = start(&mem, limited(0.5, 1, 1));
     let first = rt.recv_timeout(RECV).unwrap();
     assert_eq!(first.task, "slow");
-    rt.complete(first.token, Outcome::Success { result: None });
+    rt.complete(first.token, Outcome::Success { result: None, links: vec![] });
     let t = Instant::now();
     let next = rt.recv_timeout(RECV).unwrap();
     assert_eq!(next.task, "fast", "an unthrottled task must not wait behind the throttled backlog");
@@ -368,4 +368,26 @@ fn rejects_unusable_rate_limits() {
     let m = mem.clone();
     let r = Runtime::start(move || async move { Ok(m) }, limited(0.0, 1, 1));
     assert!(matches!(r, Err(mayu_core::Error::Config(_))));
+}
+
+#[test]
+fn link_callbacks_are_enqueued_with_the_ack() {
+    let mem = MemoryBroker::default();
+    let mut parent = Header::new("t", "q", 0, "application/json");
+    parent.trace_ctx = Some("00-trace-01".into());
+    mem.push(&parent, b"");
+    let rt = start(&mem, cfg(1, 1));
+    let t = rt.recv_timeout(RECV).unwrap();
+    let link = Link { task: "cb".into(), queue: "q2".into(), max_retries: 2, payload: b"[[5],{}]".to_vec() };
+    rt.complete(t.token, Outcome::Success { result: None, links: vec![link] });
+    wait_until(|| mem.stream_len("q2") == 1 && mem.pending_len() == 0);
+    let peek = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let d = peek.block_on(mem.fetch(&["q2".into()], 1, 100)).unwrap().remove(0);
+    assert_eq!((d.header.task.as_str(), d.header.queue.as_str()), ("cb", "q2"));
+    assert_eq!((d.header.max_retries, d.header.attempt, d.header.eta), (2, 0, None));
+    assert_eq!(d.header.content_type, "application/json", "callbacks use the parent's serializer");
+    assert_eq!(d.header.trace_ctx.as_deref(), Some("00-trace-01"));
+    assert_ne!(d.header.id, parent.id);
+    assert_eq!(d.payload, b"[[5],{}]");
+    rt.shutdown(Duration::from_secs(1));
 }
