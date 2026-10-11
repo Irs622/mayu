@@ -7,11 +7,6 @@ from mayu import App, TaskFailed
 from mayu import serializers
 
 
-@pytest.fixture
-def app(redis_url, queue):
-    return App(broker=redis_url, result_ttl=60, default_queue=queue)
-
-
 def test_serializers_roundtrip():
     for name in ("msgpack", "json", "pickle"):
         s = serializers.get_serializer(name)
