@@ -51,19 +51,8 @@ impl Client {
     }
 
     fn get_result<'py>(&self, py: Python<'py>, id: &str, timeout_ms: u64) -> PyResult<Option<Bound<'py, PyBytes>>> {
-        let found: mayu_core::Result<Option<Vec<u8>>> = py.detach(|| {
-            self.rt.block_on(async {
-                let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
-                loop {
-                    if let Some(v) = self.broker.get_result(id).await? {
-                        return Ok(Some(v));
-                    }
-                    if tokio::time::Instant::now() >= deadline {
-                        return Ok(None);
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
+        let found = py.detach(|| {
+            self.rt.block_on(mayu_core::wait_result(&self.broker, id, Duration::from_millis(timeout_ms)))
         });
         Ok(found.map_err(rt_err)?.map(|v| PyBytes::new(py, &v)))
     }

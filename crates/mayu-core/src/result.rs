@@ -1,6 +1,31 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
+use crate::broker::Broker;
 use crate::error::{Error, Result};
+
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Polls for a stored result until it appears or `timeout` elapses (`Ok(None)`).
+///
+/// Reading a result is idempotent, so broker errors (e.g. the first command on a connection that
+/// a Redis restart left stale) are retried until the deadline; only an error still present then
+/// is returned.
+pub async fn wait_result<B: Broker>(broker: &B, id: &str, timeout: Duration) -> Result<Option<Vec<u8>>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let err = match broker.get_result(id).await {
+            Ok(Some(v)) => return Ok(Some(v)),
+            Ok(None) => None,
+            Err(e) => Some(e),
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return err.map_or(Ok(None), Err);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
 
 /// Stored at `mayu:result:{id}`. Encoded as a msgpack map.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

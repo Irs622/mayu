@@ -137,6 +137,10 @@ impl MemoryBroker {
         self.state.lock().unwrap().delayed.get(q).map_or(0, |d| d.len())
     }
     pub fn dead(&self) -> Vec<DeadEntry> { self.state.lock().unwrap().dead.clone() }
+    /// Stores a result record directly, as a finished task's ack would.
+    pub fn put_result(&self, id: &str, record: Vec<u8>) {
+        self.state.lock().unwrap().results.insert(id.to_string(), record);
+    }
     pub fn result(&self, id: &str) -> Option<Vec<u8>> { self.state.lock().unwrap().results.get(id).cloned() }
     pub fn delivery_count(&self, stream_id: &str) -> Option<u64> {
         self.state.lock().unwrap().pending.get(stream_id).map(|p| p.count)

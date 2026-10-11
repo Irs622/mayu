@@ -37,6 +37,26 @@ Configuration comes from constructor arguments, overridden by `MAYU_BROKER`,
 `MAYU_RESULT_TTL` (`0` disables results), `MAYU_DEFAULT_QUEUE`, `MAYU_SERIALIZER`.
 `countdown`, `eta` and `queue` are reserved option names and cannot be task parameters.
 
+## Reliability
+
+mayu delivers **at least once**: a task is acknowledged only after it finishes, so a crash
+means the task runs again, never that it is lost. **Write idempotent tasks.**
+
+- Each worker heartbeats to `mayu:workers:{worker_id}` (TTL = 3 × `--heartbeat-interval`).
+- A worker keeps ownership of tasks it is running by re-claiming them every half
+  `--visibility-timeout` (default 30 s).
+- When a worker dies (`kill -9`, OOM, segfault), the other workers reclaim its tasks once they
+  have been silent for `--visibility-timeout`.
+- A task whose worker dies `--max-deliveries` times in a row (default 5) is treated as poison
+  and dead-lettered instead of being retried forever.
+- Redis restarts are survived: connections reconnect, and outcomes produced while Redis is
+  down are recorded when it returns. Use Redis persistence (AOF) if queued tasks must survive
+  a Redis restart.
+- Python threads cannot be killed: set timeouts on network clients inside tasks.
+
+Chaos test (needs Docker): `.venv/bin/pytest tests/chaos -v`
+(`MAYU_CHAOS_N` / `MAYU_CHAOS_SECONDS` scale it).
+
 ## Development
 
 ```bash
