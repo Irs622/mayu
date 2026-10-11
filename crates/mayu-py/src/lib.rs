@@ -68,6 +68,21 @@ impl Client {
         Ok(found.map_err(rt_err)?.map(|v| PyBytes::new(py, &v)))
     }
 
+    fn worker_info<'py>(&self, py: Python<'py>, worker_id: &str) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let info = py.detach(|| self.rt.block_on(self.broker.worker_info(worker_id))).map_err(rt_err)?;
+        let Some(w) = info else { return Ok(None) };
+        let d = PyDict::new(py);
+        d.set_item("worker_id", w.worker_id)?;
+        d.set_item("hostname", w.hostname)?;
+        d.set_item("pid", w.pid)?;
+        d.set_item("queues", w.queues)?;
+        d.set_item("concurrency", w.concurrency)?;
+        d.set_item("inflight", w.inflight)?;
+        d.set_item("started_at", w.started_at)?;
+        d.set_item("last_seen", w.last_seen)?;
+        Ok(Some(d))
+    }
+
     fn queue_stats<'py>(&self, py: Python<'py>, queue: &str) -> PyResult<Bound<'py, PyDict>> {
         let s = py.detach(|| self.rt.block_on(self.broker.stats(queue))).map_err(rt_err)?;
         let d = PyDict::new(py);
@@ -88,7 +103,8 @@ struct Worker {
 #[pymethods]
 impl Worker {
     #[new]
-    #[pyo3(signature = (url, queues, concurrency, prefetch_multiplier=2, result_ttl_secs=None, consumer=None))]
+    #[pyo3(signature = (url, queues, concurrency, prefetch_multiplier=2, result_ttl_secs=None, consumer=None, visibility_timeout_ms=None, reclaim_interval_ms=None, heartbeat_interval_ms=None, max_deliveries=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         url: String,
@@ -97,17 +113,30 @@ impl Worker {
         prefetch_multiplier: usize,
         result_ttl_secs: Option<u64>,
         consumer: Option<String>,
+        visibility_timeout_ms: Option<u64>,
+        reclaim_interval_ms: Option<u64>,
+        heartbeat_interval_ms: Option<u64>,
+        max_deliveries: Option<u64>,
     ) -> PyResult<Self> {
         let consumer = consumer.unwrap_or_else(|| format!("w-{}-{}", std::process::id(), ulid::Ulid::generate()));
-        let cfg = RuntimeConfig {
+        let mut cfg = RuntimeConfig {
             queues, concurrency, prefetch_multiplier, result_ttl_secs,
             worker_id: consumer.clone(),
             ..RuntimeConfig::default()
         };
+        if let Some(v) = visibility_timeout_ms { cfg.visibility_timeout_ms = v; }
+        if let Some(v) = reclaim_interval_ms { cfg.reclaim_interval_ms = v; }
+        if let Some(v) = heartbeat_interval_ms { cfg.heartbeat_interval_ms = v; }
+        if let Some(v) = max_deliveries { cfg.max_deliveries = v; }
         let inner = py
             .detach(move || Runtime::start(move || async move { RedisBroker::connect(&url, consumer).await }, cfg))
             .map_err(rt_err)?;
         Ok(Worker { inner })
+    }
+
+    #[getter]
+    fn worker_id(&self) -> &str {
+        self.inner.worker_id()
     }
 
     fn recv(&self, py: Python<'_>, timeout_ms: u64) -> Option<PyReadyTask> {

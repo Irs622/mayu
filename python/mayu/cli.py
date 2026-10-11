@@ -30,9 +30,17 @@ def _cmd_worker(args) -> int:
         print("mayu: warning: the GIL is enabled; threads will not run Python code in parallel. "
               "Use a free-threaded build (python3.14t).", file=sys.stderr)
     queues = [q for q in args.queues.split(",") if q] if args.queues else None
-    WorkerRunner(app, threads=args.threads, queues=queues,
-                 prefetch_multiplier=args.prefetch_multiplier,
-                 shutdown_grace=args.shutdown_grace).run()
+    try:
+        runner = WorkerRunner(app, threads=args.threads, queues=queues,
+                              prefetch_multiplier=args.prefetch_multiplier,
+                              shutdown_grace=args.shutdown_grace,
+                              visibility_timeout=args.visibility_timeout,
+                              heartbeat_interval=args.heartbeat_interval,
+                              max_deliveries=args.max_deliveries)
+    except ValueError as e:
+        print(f"mayu: {e}", file=sys.stderr)
+        return 2
+    runner.run()
     return 0
 
 
@@ -45,6 +53,11 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--queues", default=None, help="comma-separated; default: every queue the app's tasks use")
     w.add_argument("--prefetch-multiplier", type=int, default=2)
     w.add_argument("--shutdown-grace", type=float, default=30.0)
+    w.add_argument("--visibility-timeout", type=float, default=30.0,
+                   help="seconds before a silent worker's tasks are reclaimed by others")
+    w.add_argument("--heartbeat-interval", type=float, default=5.0)
+    w.add_argument("--max-deliveries", type=int, default=5,
+                   help="dead-letter a task after this many crash-redeliveries")
     w.set_defaults(func=_cmd_worker)
     args = parser.parse_args(argv)
     return args.func(args)

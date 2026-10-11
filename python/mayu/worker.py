@@ -11,13 +11,26 @@ from .serializers import for_content_type
 _RECV_TIMEOUT_MS = 100
 
 
+def _ms(seconds: float) -> int:
+    return max(1, int(seconds * 1000))
+
+
 class WorkerRunner:
     """Runs tasks on real OS threads; Rust owns fetching, acks, retries and timers."""
 
     def __init__(self, app, *, threads: int, queues: list[str] | None = None,
-                 prefetch_multiplier: int = 2, shutdown_grace: float = 30.0):
+                 prefetch_multiplier: int = 2, shutdown_grace: float = 30.0,
+                 visibility_timeout: float = 30.0, heartbeat_interval: float = 5.0,
+                 max_deliveries: int = 5):
         if threads < 1:
             raise ValueError("threads must be >= 1")
+        if visibility_timeout <= 0 or heartbeat_interval <= 0:
+            raise ValueError("visibility_timeout and heartbeat_interval must be positive")
+        if max_deliveries < 1:
+            raise ValueError("max_deliveries must be >= 1")
+        self.visibility_timeout = visibility_timeout
+        self.heartbeat_interval = heartbeat_interval
+        self.max_deliveries = max_deliveries
         self.app = app
         self.threads = threads
         self.queues = list(queues or app.queues())
@@ -32,9 +45,17 @@ class WorkerRunner:
         self._pending_async: set = set()
         self._pending_lock = threading.Lock()
 
+    @property
+    def worker_id(self) -> str | None:
+        return None if self.native is None else self.native.worker_id
+
     def start(self) -> None:
         self.native = _native.Worker(
-            self.app.broker_url, self.queues, self.threads, self.prefetch_multiplier, self.app.result_ttl
+            self.app.broker_url, self.queues, self.threads, self.prefetch_multiplier, self.app.result_ttl,
+            visibility_timeout_ms=_ms(self.visibility_timeout),
+            reclaim_interval_ms=_ms(min(5.0, self.visibility_timeout / 2)),
+            heartbeat_interval_ms=_ms(self.heartbeat_interval),
+            max_deliveries=self.max_deliveries,
         )
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(target=self._loop.run_forever, name="mayu-async", daemon=True)
