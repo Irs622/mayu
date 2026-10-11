@@ -88,7 +88,10 @@ def call_api(): ...
 Starts are spaced evenly (no bursts). The limit is **per worker process**: with
 `--processes 4`, a `10/s` task can start 40 times a second across them. Tasks that would wait
 more than a second for their turn go back to Redis until then, so a rate-limited backlog never
-fills a worker's prefetch buffer or delays other tasks.
+fills a worker's prefetch buffer or delays other tasks. A deferred task returns to Redis as a
+fresh entry, so its crash-redelivery count (`--max-deliveries`) starts over. Deferred tasks are
+spaced for the worker that deferred them, so adding workers doesn't speed up a backlog that is
+already deferred.
 
 ## Queue priority
 
@@ -96,9 +99,10 @@ fills a worker's prefetch buffer or delays other tasks.
 mayu worker tasks:app --queues high,default,low
 ```
 
-The order of `--queues` is a strict priority: a worker starts a `default` task only when no
-`high` task is waiting, so a constantly busy high queue starves the ones after it. Without
-`--queues`, a worker consumes every queue your app uses, at equal priority.
+The order of `--queues` is a strict priority: whenever a worker picks the next task to start,
+it prefers `high` tasks over `default` ones. Tasks already claimed into its prefetch buffer, or
+already running, are not preempted, and a constantly busy high queue still starves the ones
+after it. Without `--queues`, a worker consumes every queue your app uses, at equal priority.
 
 ## Callbacks
 

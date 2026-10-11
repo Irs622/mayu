@@ -2,7 +2,7 @@ import time
 
 import pytest
 
-from mayu import App, Retry, Signature, TaskFailed
+from mayu import App, Retry, Signature, TaskFailed, TaskHandle
 
 
 def _wait(pred, timeout=5.0):
@@ -203,7 +203,24 @@ def test_malformed_link_field_fails_the_parent_instead_of_hanging(app, running, 
         return 1
 
     link = {"task": "x", "queue": queue, "max_retries": bad, "args": [], "kwargs": {}}
+    _assert_parent_fails_on(app, running, queue, parent, link)
+
+
+def test_link_entry_missing_a_key_fails_the_parent(app, running, queue):
+    @app.task
+    def parent():
+        return 1
+
+    link = {"task": "x", "queue": queue, "args": [], "kwargs": {}}  # no max_retries
+    _assert_parent_fails_on(app, running, queue, parent, link)
+
+
+def _assert_parent_fails_on(app, running, queue, parent, link):
     payload = app.serializer.dumps([[], {}, {"links": [link]}])
-    app.client.enqueue(parent.name, queue, payload, app.serializer.content_type, 0)
+    task_id = app.client.enqueue(parent.name, queue, payload, app.serializer.content_type, 0)
     with running(app):
         _wait(lambda: app.client.queue_stats(queue)["dead"] == 1)
+    with pytest.raises(TaskFailed) as exc:
+        TaskHandle(app, task_id).result(timeout=5)
+    assert "bad link callback" in exc.value.error
+    assert "not serializable" not in exc.value.error

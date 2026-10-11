@@ -1,6 +1,6 @@
 //! In-process `Broker` used to test the runtime without Redis.
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -93,6 +93,8 @@ pub struct MemoryBroker {
     state: Arc<Mutex<State>>,
     notify: Arc<Notify>,
     failing: Arc<AtomicBool>,
+    fail_retries: Arc<AtomicBool>,
+    fetch_extra: Arc<AtomicUsize>,
     consumer: String,
 }
 
@@ -105,6 +107,18 @@ impl MemoryBroker {
     /// While set, every `Broker` call fails, simulating an outage.
     pub fn set_failing(&self, on: bool) {
         self.failing.store(on, Ordering::SeqCst);
+    }
+
+    /// Test aid: while set, only `retry` fails (every other call keeps working), simulating a
+    /// broker that rejects deferring a task.
+    pub fn fail_retries(&self, on: bool) {
+        self.fail_retries.store(on, Ordering::SeqCst);
+    }
+
+    /// Test aid: lets `fetch` return up to `n` entries beyond the requested `count`, like a
+    /// blocking read across queues that claims one entry per queue past the limit.
+    pub fn fetch_extra(&self, n: usize) {
+        self.fetch_extra.store(n, Ordering::SeqCst);
     }
 
     fn check(&self) -> Result<()> {
@@ -172,7 +186,7 @@ impl Broker for MemoryBroker {
             let notified = self.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let got = self.state.lock().unwrap().take(queues, count, &self.consumer);
+            let got = self.state.lock().unwrap().take(queues, count + self.fetch_extra.load(Ordering::SeqCst), &self.consumer);
             if !got.is_empty() { return Ok(got); }
             if tokio::time::timeout_at(deadline, notified).await.is_err() { return Ok(Vec::new()); }
         }
@@ -199,6 +213,9 @@ impl Broker for MemoryBroker {
 
     async fn retry(&self, d: &Delivery, header: &Header) -> Result<()> {
         self.check()?;
+        if self.fail_retries.load(Ordering::SeqCst) {
+            return Err(Error::Broker("injected retry failure".into()));
+        }
         let mut s = self.state.lock().unwrap();
         s.pending.remove(&d.stream_id);
         s.delayed.entry(d.queue.clone()).or_default()

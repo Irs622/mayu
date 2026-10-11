@@ -36,6 +36,10 @@ async def _with_time_limits(coro, soft: float | None, hard: float | None):
         raise TimeLimitExceeded(f"hard time limit ({hard}s) exceeded") from None
 
 
+class _BadLink(Exception):
+    """A link entry is malformed; the original error is the cause."""
+
+
 class _Slot:
     """One task-running OS thread. A zombie's thread is abandoned: never joined, given no new work."""
 
@@ -350,8 +354,17 @@ class WorkerRunner:
     def _report_success(self, token, serializer, result, links=()) -> None:
         try:
             data = None if self.app.result_ttl is None else serializer.dumps(result)
+        except BaseException as e:
+            self.native.complete_failure(token, f"result not serializable: {e!r}", traceback.format_exc())
+            self._settled()
+            return
+        try:
             # link callbacks get the result first; Rust enqueues them atomically with the ack
             follow_ups = [self._follow_up(serializer, result, cb) for cb in links]
+        except _BadLink as e:
+            self.native.complete_failure(token, f"bad link callback: {e.__cause__!r}", traceback.format_exc())
+            self._settled()
+            return
         except BaseException as e:
             self.native.complete_failure(token, f"result not serializable: {e!r}", traceback.format_exc())
             self._settled()
@@ -365,11 +378,17 @@ class WorkerRunner:
 
     @staticmethod
     def _follow_up(serializer, result, cb) -> tuple:
-        max_retries = int(cb["max_retries"])
-        if not 0 <= max_retries <= 2**32 - 1:
-            raise ValueError(f"link max_retries out of range: {max_retries}")
-        payload = bytes(serializer.dumps([[result, *cb["args"]], cb["kwargs"]]))
-        return (str(cb["task"]), str(cb["queue"]), payload, max_retries)
+        try:
+            task, queue = str(cb["task"]), str(cb["queue"])
+            max_retries = int(cb["max_retries"])
+            if not 0 <= max_retries <= 2**32 - 1:
+                raise ValueError(f"link max_retries out of range: {max_retries}")
+            args, kwargs = cb["args"], cb["kwargs"]
+            args = [result, *args]
+        except (KeyError, TypeError, ValueError, OverflowError) as e:
+            raise _BadLink() from e
+        payload = bytes(serializer.dumps([args, kwargs]))
+        return (task, queue, payload, max_retries)
 
     def _report_error(self, token, task, e: BaseException) -> None:
         if isinstance(e, Retry):

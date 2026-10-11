@@ -363,6 +363,57 @@ fn shutdown_requeues_tasks_waiting_on_the_rate_limit() {
 }
 
 #[test]
+fn failed_defer_holds_the_task_until_its_slot() {
+    let mem = MemoryBroker::default();
+    mem.fail_retries(true); // deferring a task back to the broker is rejected
+    for _ in 0..2 { mem.push(&Header::new("slow", "q", 0, "ct"), b""); }
+    let rt = start(&mem, limited(0.5, 2, 2));
+    let first = rt.recv_timeout(RECV).unwrap();
+    let t = Instant::now();
+    // the second is claimed and (its deferral having failed) held here, not in the delayed set
+    wait_until(|| mem.pending_len() == 2);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(mem.delayed_len("q"), 0, "a failed deferral must not reach the delayed set");
+    assert_eq!(mem.pending_len(), 2, "the held task stays claimed");
+    mem.fail_retries(false);
+    // still delivered, once its ~2 s slot arrives
+    let second = rt.recv_timeout(Duration::from_secs(4)).expect("held task is delivered at its slot");
+    assert!(t.elapsed() >= Duration::from_millis(1500), "delivered {:?} after the first", t.elapsed());
+    assert_ne!(first.token, second.token);
+    rt.complete(first.token, Outcome::Success { result: None, links: vec![] });
+    rt.complete(second.token, Outcome::Success { result: None, links: vec![] });
+    wait_until(|| mem.pending_len() == 0);
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn blocking_fetch_overshoot_is_paid_back() {
+    let mem = MemoryBroker::default();
+    mem.fetch_extra(3); // a fetch for 1 returns 4
+    for _ in 0..12 { mem.push(&Header::new("t", "q", 0, "ct"), b""); }
+    let rt = start(&mem, cfg(1, 1)); // one permit
+    wait_until(|| mem.pending_len() == 4);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(mem.pending_len(), 4, "claims never exceed cap + extra");
+    assert_eq!(mem.stream_len("q"), 8, "no further fetch while the overshoot is outstanding");
+    // completions repay the 3 overshoot permits before any new claim
+    for done in 1..=3 {
+        let t = rt.recv_timeout(RECV).unwrap();
+        rt.complete(t.token, Outcome::Success { result: None, links: vec![] });
+        wait_until(|| mem.pending_len() == 4 - done);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(mem.pending_len(), 4 - done, "no new fetch while permits are still owed");
+        assert_eq!(mem.stream_len("q"), 8);
+    }
+    // the last claimed task holds the only permit; finishing it lets the next batch in
+    let last = rt.recv_timeout(RECV).unwrap();
+    rt.complete(last.token, Outcome::Success { result: None, links: vec![] });
+    wait_until(|| mem.stream_len("q") == 4);
+    assert!(mem.pending_len() <= 4);
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
 fn rejects_unusable_rate_limits() {
     let mem = MemoryBroker::default();
     let m = mem.clone();
