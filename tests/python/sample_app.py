@@ -40,3 +40,8 @@ def sleepy():
 def whoami():
     time.sleep(0.2)
     return [BOOT, os.getpid()]
+
+
+@app.task(name="sample.fail", max_retries=0)
+def fail():
+    raise ValueError("sample failure")

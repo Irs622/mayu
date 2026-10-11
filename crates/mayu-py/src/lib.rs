@@ -236,6 +236,26 @@ fn async_raise(thread_id: u64, exc: Option<Bound<'_, PyAny>>) -> i32 {
     unsafe { pyo3::ffi::PyThreadState_SetAsyncExc(thread_id as std::os::raw::c_long, ptr) }
 }
 
+/// Routes the Rust core's log events to stderr as text or JSON lines. Only the first call installs
+/// the subscriber; later calls return `false`.
+#[pyfunction]
+fn init_logging(format: &str, level: &str) -> PyResult<bool> {
+    let level: tracing::Level = match level {
+        "debug" => tracing::Level::DEBUG,
+        "info" => tracing::Level::INFO,
+        "warn" => tracing::Level::WARN,
+        "error" => tracing::Level::ERROR,
+        _ => return Err(PyValueError::new_err(format!("bad log level {level:?}"))),
+    };
+    let base = tracing_subscriber::fmt().with_writer(std::io::stderr).with_max_level(level).with_ansi(false);
+    let installed = match format {
+        "json" => base.json().flatten_event(true).with_current_span(false).with_span_list(false).try_init(),
+        "text" => base.with_target(false).try_init(),
+        _ => return Err(PyValueError::new_err(format!("bad log format {format:?}"))),
+    };
+    Ok(installed.is_ok())
+}
+
 #[pymodule]
 #[pyo3(name = "_native")]
 fn mayu_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -243,5 +263,6 @@ fn mayu_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Worker>()?;
     m.add_class::<PyReadyTask>()?;
     m.add_function(wrap_pyfunction!(async_raise, m)?)?;
+    m.add_function(wrap_pyfunction!(init_logging, m)?)?;
     Ok(())
 }

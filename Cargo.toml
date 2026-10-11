@@ -20,5 +20,6 @@ ulid = "3"
 thiserror = "2"
 rand = "0.10"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "json", "std"] }
 proptest = "1.12"
 pyo3 = "0.29"

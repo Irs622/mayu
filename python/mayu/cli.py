@@ -1,9 +1,12 @@
 import argparse
 import importlib
+import logging
 import os
 import sys
 
 from .app import App
+
+log = logging.getLogger("mayu.cli")
 
 
 def load_app(path: str) -> App:
@@ -35,6 +38,8 @@ def _build_runner(app, args, threads: int):
 
 
 def _cmd_worker(args) -> int:
+    from .log import configure_logging
+    configure_logging(args.log_format, args.log_level)
     from .modes import gil_enabled, import_app_detecting_gil, resolve_mode
     from .supervisor import RESTART_EXIT_CODE, ProcessSupervisor, watch_parent
 
@@ -84,11 +89,10 @@ def _cmd_worker(args) -> int:
     if args.mode == "auto" and mode == "process":
         why = (f"re-enabled by importing {', '.join(offenders)}" if offenders
                else "this Python build has a GIL")
-        print(f"mayu: the GIL is enabled ({why}); using process mode with {processes} processes",
-              file=sys.stderr, flush=True)
+        log.warning("the GIL is enabled (%s); using process mode with %s processes", why, processes)
     elif mode == "thread" and gil:
-        print("mayu: warning: the GIL is enabled; threads will not run Python code in parallel. "
-              "Use a free-threaded build (python3.14t) or --mode process.", file=sys.stderr)
+        log.warning("the GIL is enabled; threads will not run Python code in parallel. "
+                    "Use a free-threaded build (python3.14t) or --mode process.")
 
     if mode == "thread" and processes == 1:
         try:
@@ -150,6 +154,9 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--metrics-port", type=int, default=os.environ.get("MAYU_METRICS_PORT") or None,
                    help="serve Prometheus metrics on this port (process i of --processes uses port+i)")
     w.add_argument("--metrics-host", default="0.0.0.0", help="address to serve metrics on")
+    w.add_argument("--log-format", choices=("text", "json"), default=os.environ.get("MAYU_LOG_FORMAT") or "text")
+    w.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+                   type=str.upper, default=(os.environ.get("MAYU_LOG_LEVEL") or "INFO").upper())
     w.set_defaults(func=_cmd_worker)
     argv = sys.argv[1:] if argv is None else list(argv)
     args = parser.parse_args(argv)

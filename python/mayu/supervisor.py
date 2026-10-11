@@ -1,12 +1,14 @@
 """Parent of multi-process workers: keeps N child interpreters running, restarts any that exit,
 and forwards graceful shutdown. Children are spawned, never forked (tokio and threads do not
 survive fork)."""
+import logging
 import os
 import signal
 import subprocess
-import sys
 import threading
 import time
+
+log = logging.getLogger("mayu.supervisor")
 
 RESTART_EXIT_CODE = 75  # EX_TEMPFAIL: a child asking to be replaced now (recycling, hard limit)
 _POLL = 0.1
@@ -79,8 +81,8 @@ class ProcessSupervisor:
                     c.next_start = now + c.backoff
                     self.restarts += 1
                     delay = f" in {c.backoff:.1f}s" if c.backoff else ""
-                    print(f"mayu: worker process {pid} exited with {_describe(code)}; restarting{delay}",
-                          file=sys.stderr, flush=True)
+                    log.warning("worker process %s exited with %s; restarting%s", pid, _describe(code), delay,
+                                extra={"pid": pid, "exit_code": code, "backoff_s": c.backoff})
         finally:
             self._shutdown()
         return 0
@@ -94,7 +96,7 @@ class ProcessSupervisor:
             self.spawn_failures += 1
             c.backoff = min(self.max_backoff, max(self.min_backoff, c.backoff * 2))
             c.next_start = time.monotonic() + c.backoff
-            print(f"mayu: failed to start worker process: {exc}", file=sys.stderr, flush=True)
+            log.error("failed to start worker process: %s", exc)
             return
         c.started = time.monotonic()
 

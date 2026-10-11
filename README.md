@@ -157,6 +157,18 @@ processes listen on 9100–9103, so scrape all four. `MAYU_METRICS_PORT` sets th
 Queue gauges are read from Redis on each scrape, so every worker reports the same values: use
 `max by (queue) (mayu_queue_ready)`. If Redis cannot be read, the scrape still answers without them.
 
+## Logging
+
+```bash
+mayu worker tasks:app --log-format json --log-level INFO
+```
+
+`text` (default) writes readable lines; `json` writes one object per line on stderr, from both the
+Rust core and Python, with `timestamp`, `level`, `message`, `target` and event fields such as
+`task_id`, `task`, `queue` and `error`. `MAYU_LOG_FORMAT` and `MAYU_LOG_LEVEL` set the defaults. Failed
+tasks are logged at `WARN`, retries at `INFO`, successes at `DEBUG`. When you run `WorkerRunner`
+from your own code, call `mayu.configure_logging("json")` first.
+
 ## Development
 
 ```bash

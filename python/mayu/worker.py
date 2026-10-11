@@ -1,7 +1,7 @@
 import asyncio
+import logging
 import queue
 import signal
-import sys
 import threading
 import time
 import traceback
@@ -11,6 +11,8 @@ from .exceptions import Retry, SoftTimeLimitExceeded, TimeLimitExceeded
 from .limits import TimeLimits
 from .recycle import rss_mb
 from .serializers import for_content_type
+
+log = logging.getLogger("mayu.worker")
 
 _RECV_TIMEOUT_MS = 100
 _SUPERVISOR_TICK = 0.05
@@ -143,6 +145,7 @@ class WorkerRunner:
             self._start_slot()
         self._supervisor = threading.Thread(target=self._supervise, name="mayu-supervisor", daemon=True)
         self._supervisor.start()
+        log.info("worker started", extra={"worker_id": self.worker_id, "queues": self.queues, "threads": self.threads})
 
     def stop(self) -> None:
         self._running.clear()
@@ -171,6 +174,7 @@ class WorkerRunner:
         self._loop_thread.join(1.0)
         if not self._loop_thread.is_alive():
             self._loop.close()
+        log.info("worker stopped", extra={"worker_id": self.worker_id})
 
     def run(self) -> str | None:
         """Runs until stopped. Returns why the worker stopped to recycle itself, or None."""
@@ -190,7 +194,7 @@ class WorkerRunner:
             if self.restart_reason is not None:
                 return
             self.restart_reason = reason
-        print(f"mayu: recycling worker: {reason}", file=sys.stderr, flush=True)
+        log.warning("recycling worker: %s", reason, extra={"reason": reason})
         self.stop()
 
     def _settled(self) -> None:
@@ -266,10 +270,10 @@ class WorkerRunner:
                     try:
                         self._on_hard_limit(run)
                     except Exception:
-                        traceback.print_exc()  # one failed report must not stop the others
+                        log.exception("worker supervisor step failed")  # one failed report must not stop the others
                 self._check_recycle()
             except Exception:
-                traceback.print_exc()  # the supervisor must outlive a bad tick
+                log.exception("worker supervisor step failed")  # the supervisor must outlive a bad tick
 
     def _on_hard_limit(self, run) -> None:
         task, slot = run.context
@@ -279,7 +283,7 @@ class WorkerRunner:
             # worker that is about to recycle must already have stopped fetching.
             self._check_recycle()
         except Exception:
-            traceback.print_exc()
+            log.exception("worker supervisor step failed")
         try:
             self._report_error(run.token, task, TimeLimitExceeded(f"hard time limit ({run.hard}s) exceeded"))
         finally:

@@ -15,4 +15,6 @@ mayu-core = { workspace = true }
 mayu-redis = { workspace = true }
 pyo3 = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 ulid = { workspace = true }
