@@ -45,6 +45,7 @@ struct Scripts {
     extend: Script,
     reclaim: Script,
     prune: Script,
+    fetch: Script,
 }
 
 async fn manager(client: &redis::Client, response_timeout: Duration) -> Result<ConnectionManager> {
@@ -82,6 +83,7 @@ impl RedisBroker {
                 extend: Script::new(include_str!("lua/extend.lua")),
                 reclaim: Script::new(include_str!("lua/reclaim.lua")),
                 prune: Script::new(include_str!("lua/prune.lua")),
+                fetch: Script::new(include_str!("lua/fetch.lua")),
             },
         })
     }
@@ -111,6 +113,61 @@ impl RedisBroker {
             .arg(GROUP).arg(stream_id).arg(h).arg(p).arg(error).arg(flag).arg(record).arg(ttl)
             .invoke_async::<i64>(&mut self.conn.clone()).await.map_err(be)?;
         Ok(())
+    }
+
+    /// Non-blocking ordered claim of up to `count` entries (one round trip).
+    async fn fetch_ordered(&self, queues: &[String], count: usize) -> Result<Vec<Delivery>> {
+        let mut inv = self.scripts.fetch.prepare_invoke();
+        for q in queues { inv.key(stream_key(q)); }
+        inv.arg(GROUP).arg(&self.consumer).arg(count);
+        let v: Value = match inv.invoke_async(&mut self.conn.clone()).await {
+            Ok(v) => v,
+            Err(e) if is_nogroup(&e) => {
+                self.ensure_queues(queues).await?;
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(be(e)),
+        };
+        let mut out = Vec::new();
+        for (i, id, mut fields) in parse_fetch(v)? {
+            let Some(queue) = queues.get(i) else { continue };
+            let h = fields.remove("h");
+            let p = fields.remove("p").unwrap_or_default();
+            if let Some(d) = self.decode_or_bury(queue, id, h, p, 1).await? {
+                out.push(d);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Blocks on every stream until one has entries; `per_stream` caps each stream.
+    async fn fetch_blocking(&self, queues: &[String], per_stream: usize, block_ms: u64) -> Result<Vec<Delivery>> {
+        let mut cmd = redis::cmd("XREADGROUP");
+        cmd.arg("GROUP").arg(GROUP).arg(&self.consumer)
+            .arg("COUNT").arg(per_stream).arg("BLOCK").arg(block_ms.min(MAX_BLOCK_MS)).arg("STREAMS");
+        for q in queues { cmd.arg(stream_key(q)); }
+        for _ in queues { cmd.arg(">"); }
+        let reply: Option<StreamReadReply> = match cmd.query_async(&mut self.fetch_conn.clone()).await {
+            Ok(r) => r,
+            Err(e) if is_nogroup(&e) => {
+                self.ensure_queues(queues).await?;
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(be(e)),
+        };
+        let mut out = Vec::new();
+        for key in reply.map(|r| r.keys).unwrap_or_default() {
+            let queue = queue_from_stream_key(&key.key).to_string();
+            for entry in key.ids {
+                let mut map = entry.map;
+                let h = take_bytes(&mut map, "h");
+                let p = take_bytes(&mut map, "p").unwrap_or_default();
+                if let Some(d) = self.decode_or_bury(&queue, entry.id, h, p, 1).await? {
+                    out.push(d);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// A stream entry as a `Delivery`, or dead-lettered if its header cannot be decoded.
@@ -206,6 +263,36 @@ fn parse_reclaim(v: Value) -> Result<(String, Vec<RawEntry>)> {
     Ok((cursor, out))
 }
 
+fn is_nogroup(e: &redis::RedisError) -> bool {
+    e.code() == Some("NOGROUP") || e.to_string().contains("NOGROUP")
+}
+
+/// A claimed entry: (queue index, entry id, fields).
+type Claimed = (usize, String, HashMap<String, Vec<u8>>);
+
+/// `fetch.lua` reply -> claimed entries.
+fn parse_fetch(v: Value) -> Result<Vec<Claimed>> {
+    let Value::Array(entries) = v else { return Err(be("unexpected fetch reply")) };
+    let mut out = Vec::new();
+    for e in entries {
+        let Value::Array(parts) = e else { continue };
+        let mut parts = parts.into_iter();
+        let (Some(Value::Int(i)), Some(id), Some(Value::Array(flat))) = (parts.next(), parts.next(), parts.next())
+        else { continue };
+        let Some(id) = text(&id) else { continue };
+        let mut fields = HashMap::new();
+        for pair in flat.chunks(2) {
+            if let [k, v] = pair {
+                if let (Some(k), Some(v)) = (text(k), bulk(v)) {
+                    fields.insert(k, v);
+                }
+            }
+        }
+        out.push(((i as usize).saturating_sub(1), id, fields));
+    }
+    Ok(out)
+}
+
 impl Broker for RedisBroker {
     async fn ensure_queues(&self, queues: &[String]) -> Result<()> {
         let mut c = self.conn.clone();
@@ -241,32 +328,12 @@ impl Broker for RedisBroker {
     }
 
     async fn fetch(&self, queues: &[String], count: usize, block_ms: u64) -> Result<Vec<Delivery>> {
-        let mut cmd = redis::cmd("XREADGROUP");
-        cmd.arg("GROUP").arg(GROUP).arg(&self.consumer)
-            .arg("COUNT").arg(count).arg("BLOCK").arg(block_ms.min(MAX_BLOCK_MS)).arg("STREAMS");
-        for q in queues { cmd.arg(stream_key(q)); }
-        for _ in queues { cmd.arg(">"); }
-        let reply: Option<StreamReadReply> = match cmd.query_async(&mut self.fetch_conn.clone()).await {
-            Ok(r) => r,
-            Err(e) if e.code() == Some("NOGROUP") => {
-                self.ensure_queues(queues).await?;
-                return Ok(Vec::new());
-            }
-            Err(e) => return Err(be(e)),
-        };
-        let mut out = Vec::new();
-        for key in reply.map(|r| r.keys).unwrap_or_default() {
-            let queue = queue_from_stream_key(&key.key).to_string();
-            for entry in key.ids {
-                let mut map = entry.map;
-                let h = take_bytes(&mut map, "h");
-                let p = take_bytes(&mut map, "p").unwrap_or_default();
-                if let Some(d) = self.decode_or_bury(&queue, entry.id, h, p, 1).await? {
-                    out.push(d);
-                }
-            }
+        let got = self.fetch_ordered(queues, count).await?;
+        if !got.is_empty() || block_ms == 0 || queues.is_empty() {
+            return Ok(got);
         }
-        Ok(out)
+        // COUNT is per stream: spread `count` so a multi-queue wake-up stays near it.
+        self.fetch_blocking(queues, (count / queues.len()).max(1), block_ms).await
     }
 
     async fn ack(&self, d: &Delivery, result: Option<StoredResult>) -> Result<()> {

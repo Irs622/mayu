@@ -1,3 +1,4 @@
+use std::time::Duration;
 use mayu_core::{Broker, Header, StoredResult, WorkerInfo, now_ms};
 use mayu_redis::{RedisBroker, stream_key, worker_key};
 use redis::Value;
@@ -256,4 +257,37 @@ async fn prune_removes_only_idle_consumers_without_heartbeat_or_pending() {
     assert_eq!(consumer_count(&q).await, 2, "live (heartbeat) and busy (pending) are kept");
     assert_eq!(ghost.prune_consumers(&q, 60_000).await.unwrap(), 0, "min idle respected");
     assert_eq!(ghost.prune_consumers(&uniq("nope"), 0).await.unwrap(), 0, "missing stream is fine");
+}
+
+#[tokio::test]
+async fn fetch_takes_queues_in_order_and_caps_the_total() {
+    let (b, q1) = setup().await;
+    let q2 = uniq("q");
+    b.ensure_queues(std::slice::from_ref(&q2)).await.unwrap();
+    for q in [&q1, &q2] {
+        for _ in 0..3 { b.enqueue(&Header::new("t", q, 0, "ct"), b"").await.unwrap(); }
+    }
+    let got = b.fetch(&[q2.clone(), q1.clone()], 4, 100).await.unwrap();
+    let queues: Vec<&str> = got.iter().map(|d| d.queue.as_str()).collect();
+    assert_eq!(queues, vec![q2.as_str(), q2.as_str(), q2.as_str(), q1.as_str()]);
+    assert_eq!(b.stats(&q1).await.unwrap().pending, 1);
+    assert_eq!(b.stats(&q2).await.unwrap().pending, 3);
+}
+
+#[tokio::test]
+async fn blocking_fetch_across_queues_stays_within_count() {
+    let (b, q1) = setup().await;
+    let q2 = uniq("q");
+    b.ensure_queues(std::slice::from_ref(&q2)).await.unwrap();
+    let producer = RedisBroker::connect(&url(), uniq("p")).await.unwrap();
+    let (qa, qb) = (q1.clone(), q2.clone());
+    let push = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for q in [&qa, &qb] {
+            for _ in 0..3 { producer.enqueue(&Header::new("t", q, 0, "ct"), b"").await.unwrap(); }
+        }
+    });
+    let got = b.fetch(&[q1.clone(), q2.clone()], 2, 2_000).await.unwrap();
+    push.await.unwrap();
+    assert!(!got.is_empty() && got.len() <= 2, "claimed {}", got.len());
 }
