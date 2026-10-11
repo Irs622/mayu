@@ -65,3 +65,36 @@ def test_hard_wins_when_both_due():
     clock.t = 2.0
     assert tl.tick() == [run]
     assert sent == []
+
+
+def test_tick_survives_concurrent_arm_and_disarm():
+    import threading
+    import time
+
+    tl = TimeLimits(raise_in_thread=lambda ident, exc: 1)
+    stop = threading.Event()
+    errors = []
+
+    def churn(base):
+        n = 0
+        while not stop.is_set():
+            run = tl.arm(base + n, 1, 0.0001, 5.0)
+            tl.disarm(run)
+            n += 1
+
+    def ticker():
+        try:
+            while not stop.is_set():
+                tl.tick()
+        except BaseException as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=churn, args=(i * 10_000_000,)) for i in range(4)]
+    threads.append(threading.Thread(target=ticker))
+    for t in threads:
+        t.start()
+    time.sleep(1.0)
+    stop.set()
+    for t in threads:
+        t.join()
+    assert errors == []

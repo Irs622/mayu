@@ -161,11 +161,14 @@ class WorkerRunner:
 
     def _supervise(self) -> None:
         while not self._halt.wait(_SUPERVISOR_TICK):
-            for run in self._limits.tick():
-                try:
-                    self._on_hard_limit(run)
-                except Exception:
-                    traceback.print_exc()  # the supervisor must outlive a failed report
+            try:
+                for run in self._limits.tick():
+                    try:
+                        self._on_hard_limit(run)
+                    except Exception:
+                        traceback.print_exc()  # one failed report must not stop the others
+            except Exception:
+                traceback.print_exc()  # the supervisor must outlive a bad tick
 
     def _on_hard_limit(self, run) -> None:
         task, slot = run.context

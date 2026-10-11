@@ -85,7 +85,7 @@ class TimeLimits:
         which the caller then owns."""
         now = self._clock()
         expired = []
-        for token, run in list(self._runs.items()):
+        for token, run in self._runs.copy().items():  # copy() is atomic; iterating the live dict is not
             if run.hard_deadline is not None and now >= run.hard_deadline:
                 run.log.append(_HARD)
                 if run.owner() == _HARD:
