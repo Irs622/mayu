@@ -18,11 +18,6 @@ def load_app(path: str) -> App:
     return obj
 
 
-def _env_int(name: str) -> int | None:
-    raw = os.environ.get(name)
-    return int(raw) if raw else None
-
-
 def _build_runner(app, args, threads: int):
     from .worker import WorkerRunner
 
@@ -77,7 +72,7 @@ def _cmd_worker(args) -> int:
         watch_parent(runner.stop)
         try:
             reason = runner.run()
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
             print(f"mayu: cannot start worker: {e}", file=sys.stderr)
             return 1
         sys.stdout.flush()
@@ -103,7 +98,7 @@ def _cmd_worker(args) -> int:
             return 2
         try:
             reason = runner.run()
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
             print(f"mayu: cannot start worker: {e}", file=sys.stderr)
             return 1
         if reason is not None:
@@ -152,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="recycle the worker when more threads than this are stuck past their hard limit")
     w.add_argument("--max-tasks-per-process", type=int, default=None)
     w.add_argument("--max-memory-per-process", type=float, default=None, metavar="MB")
-    w.add_argument("--metrics-port", type=int, default=_env_int("MAYU_METRICS_PORT"),
+    w.add_argument("--metrics-port", type=int, default=os.environ.get("MAYU_METRICS_PORT") or None,
                    help="serve Prometheus metrics on this port (process i of --processes uses port+i)")
     w.add_argument("--metrics-host", default="0.0.0.0", help="address to serve metrics on")
     w.set_defaults(func=_cmd_worker)

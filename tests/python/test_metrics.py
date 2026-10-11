@@ -176,3 +176,21 @@ def test_cli_port_in_use_fails_with_a_clear_message(redis_url, queue):
     assert r.returncode == 1
     assert "cannot serve metrics" in r.stderr
     assert "Traceback" not in r.stderr
+
+
+def test_cli_unresolvable_metrics_host_fails_cleanly(redis_url, queue):
+    r = subprocess.run([sys.executable, "-m", "mayu", "worker", "sample_app:app", "--mode", "thread",
+                        "--threads", "1", "--metrics-port", "9100", "--metrics-host", "no.such.host.invalid"],
+                       env=_env(redis_url, queue), capture_output=True, text=True, timeout=30)
+    assert r.returncode == 1
+    assert "bad metrics address" in r.stderr
+    assert "Traceback" not in r.stderr
+
+
+def test_cli_bad_metrics_port_env_is_a_usage_error(redis_url, queue):
+    r = subprocess.run([sys.executable, "-m", "mayu", "worker", "sample_app:app", "--mode", "thread"],
+                       env={**_env(redis_url, queue), "MAYU_METRICS_PORT": "abc"},
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 2
+    assert "--metrics-port" in r.stderr
+    assert "Traceback" not in r.stderr
