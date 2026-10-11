@@ -6,7 +6,7 @@ import time
 
 from .handle import TaskHandle
 
-RESERVED_OPTIONS = frozenset({"countdown", "eta", "queue"})
+RESERVED_OPTIONS = frozenset({"countdown", "eta", "queue", "link"})
 
 
 _RATE_UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0}
@@ -17,7 +17,10 @@ def parse_rate(rate) -> float:
     if isinstance(rate, bool):
         raise ValueError(f"bad rate_limit {rate!r}")
     if isinstance(rate, (int, float)):
-        n, per = float(rate), 1.0
+        try:
+            n, per = float(rate), 1.0
+        except OverflowError:
+            raise ValueError(f"bad rate_limit {rate!r}") from None
     elif isinstance(rate, str):
         num, _, unit = rate.strip().partition("/")
         try:
@@ -29,6 +32,46 @@ def parse_rate(rate) -> float:
     if not (math.isfinite(n) and n > 0):
         raise ValueError(f"bad rate_limit {rate!r}: must be a positive number")
     return n / per
+
+
+_RESULT = object()  # stands in for the parent's result when checking a callback's arguments
+
+
+class Signature:
+    """A task plus extra arguments, for ``link=``. The parent's result is passed first."""
+
+    def __init__(self, task, args=(), kwargs=None):
+        kwargs = dict(kwargs or {})
+        try:
+            task.signature.bind(_RESULT, *args, **kwargs)
+        except TypeError as e:
+            raise TypeError(f"{task.name} cannot be a link callback with these arguments "
+                            f"(it receives the parent's result first): {e}") from None
+        self.task = task
+        self.args = tuple(args)
+        self.kwargs = kwargs
+
+    def __repr__(self) -> str:
+        return f"<Signature {self.task.name} args={self.args!r} kwargs={self.kwargs!r}>"
+
+    def _wire(self) -> dict:
+        return {"task": self.task.name, "queue": self.task.queue, "max_retries": self.task.max_retries,
+                "args": list(self.args), "kwargs": self.kwargs}
+
+
+def _as_links(link) -> list[Signature]:
+    if link is None:
+        return []
+    items = link if isinstance(link, (list, tuple)) else [link]
+    out = []
+    for item in items:
+        if isinstance(item, Signature):
+            out.append(item)
+        elif isinstance(item, Task):
+            out.append(Signature(item))
+        else:
+            raise TypeError(f"link must be a task, task.s(...), or a list of them; got {item!r}")
+    return out
 
 
 def _eta_ms(countdown: float | None, eta: dt.datetime | None) -> int | None:
@@ -79,14 +122,22 @@ class Task:
         return self.fn(*args, **kwargs)
 
     def send(self, *args, countdown: float | None = None, eta: dt.datetime | None = None,
-             queue: str | None = None, **kwargs) -> TaskHandle:
+             queue: str | None = None, link=None, **kwargs) -> TaskHandle:
         self.signature.bind(*args, **kwargs)
+        links = _as_links(link)
         eta_ms = _eta_ms(countdown, eta)
         serializer = self.app.serializer
-        payload = serializer.dumps([list(args), kwargs])
+        body = [list(args), kwargs]
+        if links:
+            body.append({"links": [s._wire() for s in links]})
+        payload = serializer.dumps(body)
         task_id = self.app.client.enqueue(
             self.name, queue or self.queue, payload, serializer.content_type, self.max_retries, eta_ms
         )
         return TaskHandle(self.app, task_id)
+
+    def s(self, *args, **kwargs) -> Signature:
+        """This task with extra arguments, as a ``link=`` callback (the result comes first)."""
+        return Signature(self, args, kwargs)
 
     delay = send

@@ -70,7 +70,7 @@ class WorkerRunner:
         self.app = app
         self.threads = threads
         self.queues = list(queues or app.queues())
-        self.strict_priority = queues is not None  # an explicit queue list is a priority order
+        self.strict_priority = bool(queues)  # only a non-empty explicit list is a priority order
         self.prefetch_multiplier = prefetch_multiplier
         self.shutdown_grace = shutdown_grace
         self.visibility_timeout = visibility_timeout
@@ -232,12 +232,12 @@ class WorkerRunner:
         slot.ident = threading.get_ident()
         while not slot.zombie:
             try:
-                token, task, serializer, args, kwargs = self._serial_q.get(timeout=_RECV_TIMEOUT_MS / 1000)
+                token, task, serializer, args, kwargs, links = self._serial_q.get(timeout=_RECV_TIMEOUT_MS / 1000)
             except queue.Empty:
                 if not self._running.is_set():
                     return  # drained after stop
                 continue
-            self._run_sync(token, task, serializer, args, kwargs, slot)
+            self._run_sync(token, task, serializer, args, kwargs, slot, links)
 
     def _supervise(self) -> None:
         while not self._halt.wait(_SUPERVISOR_TICK):
@@ -280,20 +280,21 @@ class WorkerRunner:
             return
         try:
             serializer = for_content_type(ready.content_type, allow_pickle=self.app.allow_pickle)
-            args, kwargs = serializer.loads(ready.payload)
+            args, kwargs, *extra = serializer.loads(ready.payload)
+            links = extra[0].get("links", ()) if extra else ()
             if task.is_async:
-                self._submit_async(ready.token, task, serializer, args, kwargs)
+                self._submit_async(ready.token, task, serializer, args, kwargs, links)
                 return
         except BaseException as e:
             self._report_error(ready.token, task, e)
             return
         if not task.threadsafe:
             self._ensure_serial()
-            self._serial_q.put((ready.token, task, serializer, args, kwargs))
+            self._serial_q.put((ready.token, task, serializer, args, kwargs, links))
             return
-        self._run_sync(ready.token, task, serializer, args, kwargs, slot)
+        self._run_sync(ready.token, task, serializer, args, kwargs, slot, links)
 
-    def _run_sync(self, token, task, serializer, args, kwargs, slot: _Slot) -> None:
+    def _run_sync(self, token, task, serializer, args, kwargs, slot: _Slot, links=()) -> None:
         """Exactly one outcome per task, and a soft-limit exception never leaves this method.
 
         The soft-limit exception can land on any bytecode of this thread from the moment the run is
@@ -325,18 +326,18 @@ class WorkerRunner:
             return
         ok, value = outcome
         if ok:
-            self._report_success(token, serializer, value)
+            self._report_success(token, serializer, value, links)
         else:
             self._report_error(token, task, value)
 
-    def _submit_async(self, token, task, serializer, args, kwargs) -> None:
+    def _submit_async(self, token, task, serializer, args, kwargs, links=()) -> None:
         coro = _with_time_limits(task.fn(*args, **kwargs), task.soft_time_limit, task.hard_time_limit)
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         with self._pending_lock:
             self._pending_async.add(fut)
-        fut.add_done_callback(lambda f: self._async_done(token, task, serializer, f))
+        fut.add_done_callback(lambda f: self._async_done(token, task, serializer, links, f))
 
-    def _async_done(self, token, task, serializer, fut) -> None:
+    def _async_done(self, token, task, serializer, links, fut) -> None:
         with self._pending_lock:
             self._pending_async.discard(fut)
         try:
@@ -344,20 +345,19 @@ class WorkerRunner:
         except BaseException as e:
             self._report_error(token, task, e)
         else:
-            self._report_success(token, serializer, result)
+            self._report_success(token, serializer, result, links)
 
-    def _report_success(self, token, serializer, result) -> None:
-        if self.app.result_ttl is None:
-            self.native.complete_success(token, None)
-            self._settled()
-            return
+    def _report_success(self, token, serializer, result, links=()) -> None:
         try:
-            data = serializer.dumps(result)
+            data = None if self.app.result_ttl is None else serializer.dumps(result)
+            # link callbacks get the result first; Rust enqueues them atomically with the ack
+            follow_ups = [(cb["task"], cb["queue"], serializer.dumps([[result, *cb["args"]], cb["kwargs"]]),
+                           cb["max_retries"]) for cb in links]
         except BaseException as e:
             self.native.complete_failure(token, f"result not serializable: {e!r}", traceback.format_exc())
             self._settled()
             return
-        self.native.complete_success(token, data)
+        self.native.complete_success(token, data, follow_ups)
         self._settled()
 
     def _report_error(self, token, task, e: BaseException) -> None:

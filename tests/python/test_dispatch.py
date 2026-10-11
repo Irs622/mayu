@@ -13,7 +13,7 @@ def test_parse_rate(rate, per_sec):
     assert parse_rate(rate) == pytest.approx(per_sec)
 
 
-@pytest.mark.parametrize("rate", ["0/s", "-1/s", "abc", "10/d", "", "/s", "nan/s", "inf", 0, True])
+@pytest.mark.parametrize("rate", ["0/s", "-1/s", "abc", "10/d", "", "/s", "nan/s", "inf", 0, True, 10**400])
 def test_parse_rate_rejects_bad_rates(rate):
     with pytest.raises(ValueError):
         parse_rate(rate)

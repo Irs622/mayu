@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use mayu_core::{Broker, Header, Outcome, ReadyTask, Runtime, RuntimeConfig};
+use mayu_core::{Broker, Header, Link, Outcome, ReadyTask, Runtime, RuntimeConfig};
 use mayu_redis::RedisBroker;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -137,9 +137,14 @@ impl Worker {
         py.detach(|| self.inner.recv_timeout(Duration::from_millis(timeout_ms))).map(PyReadyTask)
     }
 
-    #[pyo3(signature = (token, result=None))]
-    fn complete_success(&self, token: u64, result: Option<Vec<u8>>) {
-        self.inner.complete(token, Outcome::Success { result, links: vec![] });
+    #[pyo3(signature = (token, result=None, links=None))]
+    fn complete_success(&self, token: u64, result: Option<Vec<u8>>, links: Option<Vec<(String, String, Vec<u8>, u32)>>) {
+        let links = links
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(task, queue, payload, max_retries)| Link { task, queue, max_retries, payload })
+            .collect();
+        self.inner.complete(token, Outcome::Success { result, links });
     }
 
     fn complete_failure(&self, token: u64, error: String, traceback: String) {

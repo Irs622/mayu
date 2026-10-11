@@ -35,7 +35,7 @@ h.result(timeout=30)   # 5
 
 Configuration comes from constructor arguments, overridden by `MAYU_BROKER`,
 `MAYU_RESULT_TTL` (`0` disables results), `MAYU_DEFAULT_QUEUE`, `MAYU_SERIALIZER`.
-`countdown`, `eta` and `queue` are reserved option names and cannot be task parameters.
+`countdown`, `eta`, `queue` and `link` are reserved option names and cannot be task parameters.
 
 ## Reliability
 
@@ -99,6 +99,19 @@ mayu worker tasks:app --queues high,default,low
 The order of `--queues` is a strict priority: a worker starts a `default` task only when no
 `high` task is waiting, so a constantly busy high queue starves the ones after it. Without
 `--queues`, a worker consumes every queue your app uses, at equal priority.
+
+## Callbacks
+
+```python
+add.send(2, 3, link=notify.s("sum"))      # after add succeeds: notify(5, "sum")
+add.send(2, 3, link=[audit, notify.s("sum")])
+```
+
+A `link=` callback runs only after its parent **succeeds**, with the parent's result as its first
+argument (even when results are disabled). The callback is enqueued in the same atomic step
+that acks the parent, so it is enqueued exactly once per successful parent. Like every task, it
+can still run more than once if a worker crashes. Callbacks run on the callback task's queue
+and do not chain further (no canvas).
 
 ## Modes
 

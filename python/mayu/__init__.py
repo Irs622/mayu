@@ -3,6 +3,6 @@
 from .app import App
 from .exceptions import Retry, SoftTimeLimitExceeded, TaskFailed, TimeLimitExceeded
 from .handle import TaskHandle
-from .task import Task
+from .task import Signature, Task
 
-__all__ = ["App", "Retry", "SoftTimeLimitExceeded", "Task", "TaskFailed", "TaskHandle", "TimeLimitExceeded"]
+__all__ = ["App", "Retry", "Signature", "SoftTimeLimitExceeded", "Task", "TaskFailed", "TaskHandle", "TimeLimitExceeded"]

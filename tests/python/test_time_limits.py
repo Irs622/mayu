@@ -134,7 +134,7 @@ def test_soft_limit_landing_anywhere_in_run_sync_yields_exactly_one_outcome():
     outcomes = collections.defaultdict(list)
 
     class Native:
-        def complete_success(self, token, data):
+        def complete_success(self, token, data, links=None):
             outcomes[token].append("ok")
 
         def complete_failure(self, token, error, tb):
