@@ -1,4 +1,5 @@
 import asyncio
+import queue
 import signal
 import threading
 import time
@@ -36,8 +37,9 @@ async def _with_time_limits(coro, soft: float | None, hard: float | None):
 class _Slot:
     """One task-running OS thread. A zombie's thread is abandoned: never joined, given no new work."""
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, serial: bool = False):
         self.name = name
+        self.serial = serial
         self.thread: threading.Thread | None = None
         self.ident: int | None = None
         self.zombie = False
@@ -71,6 +73,8 @@ class WorkerRunner:
         self._slots: list[_Slot] = []
         self._slots_lock = threading.Lock()
         self._slot_seq = 0
+        self._serial_q: queue.Queue = queue.Queue()
+        self._serial_lock = threading.Lock()
         self._limits = TimeLimits()
         self._supervisor: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -138,14 +142,24 @@ class WorkerRunner:
 
     # -- threads -------------------------------------------------------------
 
-    def _start_slot(self) -> _Slot:
+    def _start_slot(self, serial: bool = False) -> _Slot:
         with self._slots_lock:
-            slot = _Slot(f"mayu-worker-{self._slot_seq}")
+            kind = "serial" if serial else "worker"
+            slot = _Slot(f"mayu-{kind}-{self._slot_seq}", serial=serial)
             self._slot_seq += 1
             self._slots.append(slot)
-        slot.thread = threading.Thread(target=self._thread_main, args=(slot,), name=slot.name, daemon=True)
+        target = self._serial_main if serial else self._thread_main
+        slot.thread = threading.Thread(target=target, args=(slot,), name=slot.name, daemon=True)
         slot.thread.start()
         return slot
+
+    def _ensure_serial(self) -> None:
+        """Starts the serial thread unless a live one exists (never two at once)."""
+        with self._serial_lock:
+            with self._slots_lock:
+                alive = any(s.serial and not s.zombie for s in self._slots)
+            if not alive:
+                self._start_slot(serial=True)
 
     def _live_slots(self) -> list[_Slot]:
         with self._slots_lock:
@@ -158,6 +172,17 @@ class WorkerRunner:
             ready = native.recv(_RECV_TIMEOUT_MS)
             if ready is not None:
                 self._execute(ready, slot)
+
+    def _serial_main(self, slot: _Slot) -> None:
+        slot.ident = threading.get_ident()
+        while not slot.zombie:
+            try:
+                token, task, serializer, args, kwargs = self._serial_q.get(timeout=_RECV_TIMEOUT_MS / 1000)
+            except queue.Empty:
+                if not self._running.is_set():
+                    return  # drained after stop
+                continue
+            self._run_sync(token, task, serializer, args, kwargs, slot)
 
     def _supervise(self) -> None:
         while not self._halt.wait(_SUPERVISOR_TICK):
@@ -177,7 +202,11 @@ class WorkerRunner:
             self._report_error(run.token, task, TimeLimitExceeded(f"hard time limit ({run.hard}s) exceeded"))
         finally:
             if self._running.is_set():
-                self._start_slot()  # keep capacity even if the report failed
+                # keep capacity even if the report failed
+                if slot.serial:
+                    self._ensure_serial()
+                else:
+                    self._start_slot()
 
     # -- execution -----------------------------------------------------------
 
@@ -194,6 +223,10 @@ class WorkerRunner:
                 return
         except BaseException as e:
             self._report_error(ready.token, task, e)
+            return
+        if not task.threadsafe:
+            self._ensure_serial()
+            self._serial_q.put((ready.token, task, serializer, args, kwargs))
             return
         self._run_sync(ready.token, task, serializer, args, kwargs, slot)
 

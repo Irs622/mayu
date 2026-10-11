@@ -22,7 +22,7 @@ def _eta_ms(countdown: float | None, eta: dt.datetime | None) -> int | None:
 
 class Task:
     def __init__(self, app, fn, *, name: str, queue: str, max_retries: int, retry_on: tuple,
-                 soft_time_limit: float | None = None, hard_time_limit: float | None = None):
+                 soft_time_limit: float | None = None, hard_time_limit: float | None = None, threadsafe: bool = True):
         self.app = app
         self.fn = fn
         self.name = name
@@ -41,6 +41,9 @@ class Task:
         self.soft_time_limit = soft_time_limit
         self.hard_time_limit = hard_time_limit
         self.is_async = inspect.iscoroutinefunction(fn)
+        if not threadsafe and self.is_async:
+            raise ValueError("threadsafe=False is for sync tasks; async tasks already run on one event-loop thread")
+        self.threadsafe = threadsafe
         functools.update_wrapper(self, fn)
 
     def __repr__(self) -> str:
