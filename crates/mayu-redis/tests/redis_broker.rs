@@ -1,5 +1,5 @@
 use std::time::Duration;
-use mayu_core::{Broker, Header, StoredResult, WorkerInfo, now_ms};
+use mayu_core::{Broker, Header, ResultRecord, StoredResult, WorkerInfo, now_ms};
 use mayu_redis::{RedisBroker, stream_key, worker_key};
 use redis::Value;
 
@@ -337,4 +337,124 @@ async fn ack_enqueues_follow_ups_only_once() {
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].header, cb);
     assert_eq!(got[0].payload, b"x");
+}
+
+async fn dead_one(b: &RedisBroker, q: &str, attempt: u32, error: &str) -> Header {
+    let mut h = Header::new("t", q, 3, "ct");
+    h.attempt = attempt;
+    b.enqueue(&h, b"payload").await.unwrap();
+    let d = b.fetch(&[q.to_string()], 1, 100).await.unwrap().remove(0);
+    let stored = StoredResult { id: h.id.clone(), record: ResultRecord::failure(error, "", "ct").encode(), ttl_secs: 60 };
+    b.dead_letter(&d, error, Some(stored)).await.unwrap();
+    h
+}
+
+#[tokio::test]
+async fn dead_letters_list_oldest_first_and_page() {
+    let (b, q) = setup().await;
+    let h1 = dead_one(&b, &q, 0, "first").await;
+    let h2 = dead_one(&b, &q, 0, "second").await;
+    let all = b.dead_letters(&q, None, None, 10).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].header.as_ref().unwrap().id, h1.id);
+    assert_eq!(all[0].error, "first");
+    assert_eq!(all[0].payload, b"payload");
+    assert!(all[0].dead_at_ms() > 0 && all[0].dead_at_ms() <= now_ms());
+    let rest = b.dead_letters(&q, Some(&all[0].entry_id), None, 10).await.unwrap();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].header.as_ref().unwrap().id, h2.id);
+    let upto = b.dead_letters(&q, None, Some(&all[0].entry_id), 10).await.unwrap();
+    assert_eq!(upto.len(), 1);
+    assert_eq!(b.last_dead_id(&q).await.unwrap(), Some(all[1].entry_id.clone()));
+}
+
+#[tokio::test]
+async fn last_dead_id_of_empty_queue_is_none() {
+    let (b, q) = setup().await;
+    assert_eq!(b.last_dead_id(&q).await.unwrap(), None);
+    assert!(b.dead_letters(&q, None, None, 10).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn replay_resets_attempt_keeps_id_and_clears_the_failure_result() {
+    let (b, q) = setup().await;
+    let h = dead_one(&b, &q, 3, "boom").await;
+    assert!(b.get_result(&h.id).await.unwrap().is_some());
+    let dl = b.dead_letters(&q, None, None, 10).await.unwrap();
+    assert_eq!(b.replay_dead(&q, &[dl[0].entry_id.clone()]).await.unwrap(), 1);
+    assert!(b.dead_letters(&q, None, None, 10).await.unwrap().is_empty());
+    assert_eq!(b.get_result(&h.id).await.unwrap(), None, "a waiting client must see the new outcome");
+    let d = b.fetch(&[q.clone()], 1, 100).await.unwrap().remove(0);
+    assert_eq!(d.header.id, h.id);
+    assert_eq!(d.header.attempt, 0);
+    assert_eq!(d.header.eta, None);
+    assert_eq!(d.payload, b"payload");
+}
+
+#[tokio::test]
+async fn replay_twice_moves_once() {
+    let (b, q) = setup().await;
+    dead_one(&b, &q, 0, "e").await;
+    let id = b.dead_letters(&q, None, None, 1).await.unwrap()[0].entry_id.clone();
+    assert_eq!(b.replay_dead(&q, &[id.clone()]).await.unwrap(), 1);
+    assert_eq!(b.replay_dead(&q, &[id]).await.unwrap(), 0);
+    assert_eq!(b.queue_stats(&q).await.unwrap().stream, 1);
+}
+
+#[tokio::test]
+async fn concurrent_replays_move_once() {
+    let (b, q) = setup().await;
+    for _ in 0..20 {
+        dead_one(&b, &q, 0, "e").await;
+    }
+    let ids: Vec<String> = b.dead_letters(&q, None, None, 100).await.unwrap().into_iter().map(|d| d.entry_id).collect();
+    let b2 = RedisBroker::connect(&url(), uniq("c")).await.unwrap();
+    let (x, y) = tokio::join!(b.replay_dead(&q, &ids), b2.replay_dead(&q, &ids));
+    assert_eq!(x.unwrap() + y.unwrap(), 20);
+    assert_eq!(b.queue_stats(&q).await.unwrap().stream, 20);
+}
+
+#[tokio::test]
+async fn replay_skips_missing_and_undecodable_entries() {
+    let (b, q) = setup().await;
+    let mut c = redis::Client::open(url()).unwrap().get_multiplexed_async_connection().await.unwrap();
+    let _: String = redis::cmd("XADD").arg(stream_key(&q)).arg("*").arg("h").arg(b"garbage".as_slice()).arg("p").arg(b"".as_slice())
+        .query_async(&mut c).await.unwrap();
+    assert!(b.fetch(&[q.clone()], 10, 100).await.unwrap().is_empty(), "undecodable entries are buried on fetch");
+    let dl = b.dead_letters(&q, None, None, 10).await.unwrap();
+    assert_eq!(dl.len(), 1);
+    assert!(dl[0].header.is_none());
+    assert_eq!(dl[0].raw_header, b"garbage");
+    assert_eq!(b.replay_dead(&q, &[dl[0].entry_id.clone(), "1-1".into()]).await.unwrap(), 0);
+    assert_eq!(b.dead_letters(&q, None, None, 10).await.unwrap().len(), 1, "left in place");
+}
+
+#[tokio::test]
+async fn workers_lists_live_heartbeats() {
+    let (b, q) = setup().await;
+    let (a, z) = (uniq("w"), uniq("w"));
+    for id in [&a, &z] {
+        let info = WorkerInfo { worker_id: id.clone(), hostname: "h".into(), pid: 1, queues: vec![q.clone()],
+                                concurrency: 2, inflight: 0, started_at: 1, last_seen: 2 };
+        b.heartbeat(&info, 10_000).await.unwrap();
+    }
+    let ws = b.workers().await.unwrap();
+    let mine: Vec<&WorkerInfo> = ws.iter().filter(|w| w.worker_id == a || w.worker_id == z).collect();
+    assert_eq!(mine.len(), 2);
+    assert!(ws.windows(2).all(|p| p[0].worker_id <= p[1].worker_id), "sorted");
+    assert_eq!(mine[0].queues, vec![q.clone()]);
+    b.unregister(&a).await.unwrap();
+    assert!(!b.workers().await.unwrap().iter().any(|w| w.worker_id == a));
+}
+
+#[tokio::test]
+async fn known_queues_finds_queues_in_redis() {
+    let (b, q) = setup().await;
+    let delayed_only = uniq("q");
+    let mut h = Header::new("t", &delayed_only, 0, "ct");
+    h.eta = Some(now_ms() + 60_000);
+    b.enqueue(&h, b"").await.unwrap();
+    let qs = b.known_queues().await.unwrap();
+    assert!(qs.contains(&q) && qs.contains(&delayed_only));
+    assert!(qs.windows(2).all(|p| p[0] < p[1]), "sorted and unique");
 }

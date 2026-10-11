@@ -38,6 +38,7 @@ struct Scripts {
     reclaim: Script,
     prune: Script,
     fetch: Script,
+    replay: Script,
 }
 
 async fn manager(client: &redis::Client, response_timeout: Duration) -> Result<ConnectionManager> {
@@ -46,6 +47,47 @@ async fn manager(client: &redis::Client, response_timeout: Duration) -> Result<C
         .set_response_timeout(Some(response_timeout))
         .set_number_of_retries(2);
     ConnectionManager::new_with_config(client.clone(), cfg).await.map_err(be)
+}
+
+/// A dead-lettered entry (`mayu:{q}:dead`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeadLetter {
+    /// Entry id in the dead stream; its millisecond part is when it was dead-lettered.
+    pub entry_id: String,
+    /// `None` if the header cannot be decoded (such entries are never replayed).
+    pub header: Option<Header>,
+    pub raw_header: Vec<u8>,
+    pub payload: Vec<u8>,
+    pub error: String,
+}
+
+impl DeadLetter {
+    pub fn dead_at_ms(&self) -> u64 {
+        self.entry_id.split('-').next().and_then(|ms| ms.parse().ok()).unwrap_or(0)
+    }
+}
+
+/// A stream entry: (entry id, fields).
+type RangeEntry = (String, HashMap<String, Vec<u8>>);
+
+/// An `XRANGE`/`XREVRANGE` reply.
+fn parse_range(v: Value) -> Result<Vec<RangeEntry>> {
+    let bad = || be("malformed stream range reply");
+    let Value::Array(entries) = v else { return Err(bad()) };
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        let Value::Array(parts) = e else { return Err(bad()) };
+        let mut parts = parts.into_iter();
+        let (Some(id), Some(Value::Array(flat))) = (parts.next(), parts.next()) else { return Err(bad()) };
+        let id = text(&id).ok_or_else(bad)?;
+        let mut fields = HashMap::new();
+        for pair in flat.chunks(2) {
+            let [k, v] = pair else { return Err(bad()) };
+            fields.insert(text(k).ok_or_else(bad)?, bulk(v).ok_or_else(bad)?);
+        }
+        out.push((id, fields));
+    }
+    Ok(out)
 }
 
 pub struct RedisBroker {
@@ -76,6 +118,7 @@ impl RedisBroker {
                 reclaim: Script::new(include_str!("lua/reclaim.lua")),
                 prune: Script::new(include_str!("lua/prune.lua")),
                 fetch: Script::new(include_str!("lua/fetch.lua")),
+                replay: Script::new(include_str!("lua/replay.lua")),
             },
         })
     }
@@ -188,6 +231,100 @@ impl RedisBroker {
             started_at: num("started_at"),
             last_seen: num("last_seen"),
         }))
+    }
+
+    /// Dead letters of `queue`, oldest first: strictly after `after`, up to and including `until`.
+    pub async fn dead_letters(&self, queue: &str, after: Option<&str>, until: Option<&str>, count: usize)
+        -> Result<Vec<DeadLetter>>
+    {
+        let start = after.map_or_else(|| "-".to_string(), |id| format!("({id}"));
+        let v: Value = redis::cmd("XRANGE").arg(dead_key(queue)).arg(start).arg(until.unwrap_or("+"))
+            .arg("COUNT").arg(count.max(1))
+            .query_async(&mut self.conn.clone()).await.map_err(be)?;
+        Ok(parse_range(v)?.into_iter().map(|(entry_id, mut f)| {
+            let raw_header = f.remove("h").unwrap_or_default();
+            DeadLetter {
+                entry_id,
+                header: decode_header(&raw_header).ok(),
+                raw_header,
+                payload: f.remove("p").unwrap_or_default(),
+                error: String::from_utf8_lossy(&f.remove("e").unwrap_or_default()).into_owned(),
+            }
+        }).collect())
+    }
+
+    /// Id of the newest dead letter of `queue`.
+    pub async fn last_dead_id(&self, queue: &str) -> Result<Option<String>> {
+        let v: Value = redis::cmd("XREVRANGE").arg(dead_key(queue)).arg("+").arg("-").arg("COUNT").arg(1)
+            .query_async(&mut self.conn.clone()).await.map_err(be)?;
+        Ok(parse_range(v)?.into_iter().next().map(|(id, _)| id))
+    }
+
+    /// Moves dead letters back to `queue` to run again (attempt 0, no eta, same task id), deleting
+    /// their stored failure results. Missing or undecodable entries are skipped. Returns how many moved.
+    pub async fn replay_dead(&self, queue: &str, entry_ids: &[String]) -> Result<usize> {
+        let mut picked = Vec::new();
+        for id in entry_ids {
+            // Exactly this entry (XRANGE id id), not the oldest one up to it.
+            let v: Value = redis::cmd("XRANGE").arg(dead_key(queue)).arg(id).arg(id).arg("COUNT").arg(1)
+                .query_async(&mut self.conn.clone()).await.map_err(be)?;
+            let Some((entry_id, mut f)) = parse_range(v)?.into_iter().next() else { continue };
+            let Ok(mut h) = decode_header(&f.remove("h").unwrap_or_default()) else { continue };
+            h.attempt = 0;
+            h.eta = None;
+            picked.push((entry_id, h, f.remove("p").unwrap_or_default()));
+        }
+        if picked.is_empty() {
+            return Ok(0);
+        }
+        let mut inv = self.scripts.replay.prepare_invoke();
+        inv.key(dead_key(queue)).key(stream_key(queue));
+        for (_, h, _) in &picked { inv.key(result_key(&h.id)); }
+        for (id, h, p) in &picked { inv.arg(id).arg(encode_header(h)).arg(p); }
+        inv.invoke_async::<usize>(&mut self.conn.clone()).await.map_err(be)
+    }
+
+    async fn scan_keys(&self, pattern: &str) -> Result<Vec<String>> {
+        let mut c = self.conn.clone();
+        let mut cursor: u64 = 0;
+        let mut out = Vec::new();
+        loop {
+            let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN").arg(cursor).arg("MATCH").arg(pattern)
+                .arg("COUNT").arg(500).query_async(&mut c).await.map_err(be)?;
+            out.extend(keys);
+            if next == 0 { break; }
+            cursor = next;
+        }
+        out.sort();
+        out.dedup(); // SCAN may return a key more than once
+        Ok(out)
+    }
+
+    /// Workers with a live heartbeat, sorted by id.
+    pub async fn workers(&self) -> Result<Vec<WorkerInfo>> {
+        let mut out = Vec::new();
+        for key in self.scan_keys(&format!("{WORKER_KEY_PREFIX}*")).await? {
+            let id = key.strip_prefix(WORKER_KEY_PREFIX).unwrap_or(&key);
+            if let Some(w) = self.worker_info(id).await? { // gone if it expired since the scan
+                out.push(w);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Queues that have a stream, delayed set or dead stream in Redis, sorted.
+    pub async fn known_queues(&self) -> Result<Vec<String>> {
+        let mut qs = Vec::new();
+        for (suffix, pattern) in [("}:stream", "mayu:{*}:stream"), ("}:delayed", "mayu:{*}:delayed"), ("}:dead", "mayu:{*}:dead")] {
+            for k in self.scan_keys(pattern).await? {
+                if let Some(q) = k.strip_prefix("mayu:{").and_then(|s| s.strip_suffix(suffix)) {
+                    qs.push(q.to_string());
+                }
+            }
+        }
+        qs.sort();
+        qs.dedup();
+        Ok(qs)
     }
 }
 
