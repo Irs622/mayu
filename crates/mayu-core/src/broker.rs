@@ -20,6 +20,22 @@ pub struct StoredResult {
     pub ttl_secs: u64,
 }
 
+/// A queue's state in the broker. `stream` counts unclaimed and claimed entries (acked entries
+/// are deleted), so `ready()` is what no worker has claimed yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QueueStats {
+    pub stream: u64,
+    pub pending: u64,
+    pub delayed: u64,
+    pub dead: u64,
+}
+
+impl QueueStats {
+    pub fn ready(&self) -> u64 {
+        self.stream.saturating_sub(self.pending)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerInfo {
     pub worker_id: String,

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use mayu_core::{
-    Broker, Delivery, Error, Header, Reclaimed, Result, StoredResult, WorkerInfo, decode_header,
+    Broker, Delivery, Error, Header, QueueStats, Reclaimed, Result, StoredResult, WorkerInfo, decode_header,
     encode_delayed_member, encode_header, now_ms,
 };
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
@@ -27,14 +27,6 @@ fn queue_from_stream_key(k: &str) -> &str {
 }
 
 fn be(e: impl std::fmt::Display) -> Error { Error::Broker(e.to_string()) }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QueueStats {
-    pub stream: u64,
-    pub pending: u64,
-    pub delayed: u64,
-    pub dead: u64,
-}
 
 struct Scripts {
     ack: Script,
