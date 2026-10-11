@@ -16,6 +16,10 @@ _RECV_TIMEOUT_MS = 100
 _SUPERVISOR_TICK = 0.05
 
 
+def _hostport(host: str, port: int) -> str:
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
 def _ms(seconds: float) -> int:
     return max(1, int(seconds * 1000))
 
@@ -58,7 +62,8 @@ class WorkerRunner:
                  prefetch_multiplier: int = 2, shutdown_grace: float = 30.0,
                  visibility_timeout: float = 30.0, heartbeat_interval: float = 5.0,
                  max_deliveries: int = 5, max_zombie_threads: int = 4,
-                 max_tasks_per_process: int | None = None, max_memory_per_process: float | None = None):
+                 max_tasks_per_process: int | None = None, max_memory_per_process: float | None = None,
+                 metrics_port: int | None = None, metrics_host: str = "0.0.0.0"):
         if threads < 1:
             raise ValueError("threads must be >= 1")
         if visibility_timeout <= 0 or heartbeat_interval <= 0:
@@ -71,6 +76,8 @@ class WorkerRunner:
             raise ValueError("max_tasks_per_process must be >= 1")
         if max_memory_per_process is not None and max_memory_per_process <= 0:
             raise ValueError("max_memory_per_process must be positive (MB)")
+        if metrics_port is not None and not 0 <= metrics_port <= 65535:
+            raise ValueError("metrics_port must be between 0 and 65535")
         self.app = app
         self.threads = threads
         self.queues = list(queues or app.queues())
@@ -83,6 +90,8 @@ class WorkerRunner:
         self.max_zombie_threads = max_zombie_threads
         self.max_tasks_per_process = max_tasks_per_process
         self.max_memory_per_process = max_memory_per_process
+        self.metrics_port_requested = metrics_port
+        self.metrics_host = metrics_host
         self.restart_reason: str | None = None
         self._restart_lock = threading.Lock()
         self._settled_count = 0
@@ -108,6 +117,11 @@ class WorkerRunner:
     def worker_id(self) -> str | None:
         return None if self.native is None else self.native.worker_id
 
+    @property
+    def metrics_port(self) -> int | None:
+        """The port `/metrics` is served on once started (the real one when 0 was requested)."""
+        return None if self.native is None else self.native.metrics_port
+
     def start(self) -> None:
         rate_limits = {t.name: t.rate_per_sec for t in self.app.registry.values() if t.rate_per_sec is not None}
         self.native = _native.Worker(
@@ -118,6 +132,8 @@ class WorkerRunner:
             max_deliveries=self.max_deliveries,
             strict_priority=self.strict_priority,
             rate_limits=rate_limits,
+            metrics_addr=(None if self.metrics_port_requested is None
+                          else _hostport(self.metrics_host, self.metrics_port_requested)),
         )
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(target=self._loop.run_forever, name="mayu-async", daemon=True)

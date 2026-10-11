@@ -133,6 +133,30 @@ limit takes its process down with it, and the process is replaced.
 Prefer **a few processes × many threads**: a segfault in a C extension takes down every task in
 its process.
 
+## Metrics
+
+```bash
+mayu worker tasks:app --metrics-port 9100      # GET http://host:9100/metrics (Prometheus)
+```
+
+Each worker process serves its own metrics: with `--processes 4 --metrics-port 9100`, the
+processes listen on 9100–9103, so scrape all four. `MAYU_METRICS_PORT` sets the default;
+`--metrics-host` picks the interface (default `0.0.0.0`).
+
+| Metric | Type | Labels |
+|---|---|---|
+| `mayu_tasks_received_total` | counter | `queue`, `task` |
+| `mayu_tasks_settled_total` | counter | `queue`, `task`, `outcome` (`success`, `retry`, `dead`) |
+| `mayu_task_duration_seconds` | histogram | `queue`, `task` |
+| `mayu_tasks_deferred_total` | counter | `queue`, `task` (rate-limited tasks sent back to Redis) |
+| `mayu_tasks_reclaimed_total` | counter | `queue` (taken over from a dead worker) |
+| `mayu_broker_errors_total` | counter | `op` |
+| `mayu_worker_concurrency`, `mayu_tasks_inflight`, `mayu_tasks_running` | gauge | |
+| `mayu_queue_ready`, `mayu_queue_pending`, `mayu_queue_delayed`, `mayu_queue_dead` | gauge | `queue` |
+
+Queue gauges are read from Redis on each scrape, so every worker reports the same values: use
+`max by (queue) (mayu_queue_ready)`. If Redis cannot be read, the scrape still answers without them.
+
 ## Development
 
 ```bash

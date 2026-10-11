@@ -18,6 +18,11 @@ def load_app(path: str) -> App:
     return obj
 
 
+def _env_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    return int(raw) if raw else None
+
+
 def _build_runner(app, args, threads: int):
     from .worker import WorkerRunner
 
@@ -30,7 +35,8 @@ def _build_runner(app, args, threads: int):
                         max_deliveries=args.max_deliveries,
                         max_zombie_threads=args.max_zombie_threads,
                         max_tasks_per_process=args.max_tasks_per_process,
-                        max_memory_per_process=args.max_memory_per_process)
+                        max_memory_per_process=args.max_memory_per_process,
+                        metrics_port=args.metrics_port, metrics_host=args.metrics_host)
 
 
 def _cmd_worker(args) -> int:
@@ -53,6 +59,14 @@ def _cmd_worker(args) -> int:
     if processes < 1:
         print("mayu: --processes must be >= 1", file=sys.stderr)
         return 2
+    if args.metrics_port is not None and not args._child and processes > 1:
+        if args.metrics_port == 0:
+            print("mayu: --metrics-port 0 cannot be used with several processes; pass a port",
+                  file=sys.stderr)
+            return 2
+        if args.metrics_port + processes - 1 > 65535:
+            print("mayu: --metrics-port + --processes exceeds 65535", file=sys.stderr)
+            return 2
 
     if args._child:
         try:
@@ -61,7 +75,11 @@ def _cmd_worker(args) -> int:
             print(f"mayu: {e}", file=sys.stderr)
             return 2
         watch_parent(runner.stop)
-        reason = runner.run()
+        try:
+            reason = runner.run()
+        except RuntimeError as e:
+            print(f"mayu: cannot start worker: {e}", file=sys.stderr)
+            return 1
         sys.stdout.flush()
         sys.stderr.flush()
         if reason is not None:
@@ -83,7 +101,11 @@ def _cmd_worker(args) -> int:
         except ValueError as e:
             print(f"mayu: {e}", file=sys.stderr)
             return 2
-        reason = runner.run()
+        try:
+            reason = runner.run()
+        except RuntimeError as e:
+            print(f"mayu: cannot start worker: {e}", file=sys.stderr)
+            return 1
         if reason is not None:
             sys.stdout.flush()
             sys.stderr.flush()
@@ -98,7 +120,12 @@ def _cmd_worker(args) -> int:
     child = [sys.executable, "-m", "mayu", *args.argv, "--mode", mode, "--processes", "1", "--_child"]
     if mode == "process":
         child += ["--threads", "1", "--max-zombie-threads", "0"]
-    return ProcessSupervisor(child, processes, shutdown_grace=args.shutdown_grace).run()
+    per_child = None
+    if args.metrics_port is not None:
+        base = args.metrics_port
+        per_child = lambda i: ["--metrics-port", str(base + i)]  # noqa: E731
+    return ProcessSupervisor(child, processes, shutdown_grace=args.shutdown_grace,
+                             per_child_args=per_child).run()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -125,6 +152,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="recycle the worker when more threads than this are stuck past their hard limit")
     w.add_argument("--max-tasks-per-process", type=int, default=None)
     w.add_argument("--max-memory-per-process", type=float, default=None, metavar="MB")
+    w.add_argument("--metrics-port", type=int, default=_env_int("MAYU_METRICS_PORT"),
+                   help="serve Prometheus metrics on this port (process i of --processes uses port+i)")
+    w.add_argument("--metrics-host", default="0.0.0.0", help="address to serve metrics on")
     w.set_defaults(func=_cmd_worker)
     argv = sys.argv[1:] if argv is None else list(argv)
     args = parser.parse_args(argv)

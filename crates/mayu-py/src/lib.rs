@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use mayu_core::{Broker, Header, Link, Outcome, ReadyTask, Runtime, RuntimeConfig};
 use mayu_redis::RedisBroker;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
@@ -93,7 +93,7 @@ struct Worker {
 #[pymethods]
 impl Worker {
     #[new]
-    #[pyo3(signature = (url, queues, concurrency, prefetch_multiplier=2, result_ttl_secs=None, consumer=None, visibility_timeout_ms=None, reclaim_interval_ms=None, heartbeat_interval_ms=None, max_deliveries=None, strict_priority=false, rate_limits=None))]
+    #[pyo3(signature = (url, queues, concurrency, prefetch_multiplier=2, result_ttl_secs=None, consumer=None, visibility_timeout_ms=None, reclaim_interval_ms=None, heartbeat_interval_ms=None, max_deliveries=None, strict_priority=false, rate_limits=None, metrics_addr=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -109,6 +109,7 @@ impl Worker {
         max_deliveries: Option<u64>,
         strict_priority: bool,
         rate_limits: Option<HashMap<String, f64>>,
+        metrics_addr: Option<String>,
     ) -> PyResult<Self> {
         let consumer = consumer.unwrap_or_else(|| format!("w-{}-{}", std::process::id(), ulid::Ulid::generate()));
         let mut cfg = RuntimeConfig {
@@ -122,6 +123,14 @@ impl Worker {
         if let Some(v) = reclaim_interval_ms { cfg.reclaim_interval_ms = v; }
         if let Some(v) = heartbeat_interval_ms { cfg.heartbeat_interval_ms = v; }
         if let Some(v) = max_deliveries { cfg.max_deliveries = v; }
+        if let Some(a) = metrics_addr {
+            use std::net::ToSocketAddrs;
+            let bad = |e: String| PyValueError::new_err(format!("bad metrics address {a:?}: {e}"));
+            cfg.metrics_addr = Some(
+                a.to_socket_addrs().map_err(|e| bad(e.to_string()))?
+                    .next().ok_or_else(|| bad("resolves to no address".into()))?,
+            );
+        }
         let inner = py
             .detach(move || Runtime::start(move || async move { RedisBroker::connect(&url, consumer).await }, cfg))
             .map_err(rt_err)?;
@@ -131,6 +140,11 @@ impl Worker {
     #[getter]
     fn worker_id(&self) -> &str {
         self.inner.worker_id()
+    }
+
+    #[getter]
+    fn metrics_port(&self) -> Option<u16> {
+        self.inner.metrics_addr().map(|a| a.port())
     }
 
     fn recv(&self, py: Python<'_>, timeout_ms: u64) -> Option<PyReadyTask> {
