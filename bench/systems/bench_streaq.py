@@ -1,5 +1,7 @@
 """streaQ adapter: async tasks, 2 worker processes x c/2 concurrent tasks each."""
 import asyncio
+import contextlib
+import logging
 import os
 import pathlib
 import sys
@@ -8,7 +10,18 @@ import workload
 from streaq import Worker
 
 QUEUE = "bench"
-worker = Worker(redis_url=workload.URL, queue_name=QUEUE,
+
+
+@contextlib.asynccontextmanager
+async def quiet():
+    # `streaq run` applies logging.config.dictConfig(level INFO) after importing this module, which would reset a
+    # level set at import time and log two lines per task. The lifespan runs after that, so lower it here (warning
+    # level, as for every other system).
+    logging.getLogger("streaq").setLevel(logging.WARNING)
+    yield None
+
+
+worker = Worker(redis_url=workload.URL, queue_name=QUEUE, lifespan=quiet,
                 concurrency=int(os.environ.get("BENCH_STREAQ_CONCURRENCY", "32")))
 
 

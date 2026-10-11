@@ -24,7 +24,7 @@ The task body is one Redis `INCR` (the completion counter every system shares).
 | dramatiq | 2 processes × 32 threads (Python 3.14.7, 2.2.1) | 11116 | 2.0 | 81 | 137 | 12.62× |
 | mayu-process | 64 processes (Python 3.14.7, 0.1.0) | 10829 | 2.8 | 1374 | 2607 | 12.29× |
 | mayu-thread | 2 processes × 32 threads (Python 3.14.7t, 0.1.0) | 6398 | 3.3 | 261 | 308 | 7.26× |
-| streaq | 2 processes × 32 async tasks (Python 3.14.7, 7.2.0) | 1994 | 10.6 | 114 | 171 | 2.26× |
+| streaq | 2 processes × 32 async tasks (Python 3.14.7, 7.2.0) | 2246 | 9.4 | 114 | 170 | 2.55× |
 | rq | 64 SimpleWorker processes, no fork per job (Python 3.14.7, 2.12.0) | 1917 | 10.5 | 515 | 2224 | 2.18× |
 | celery | 64 prefork processes (Python 3.14.7, 5.6.3) | 881 | 25.1 | 1599 | 3205 | 1.00× |
 
@@ -37,8 +37,8 @@ JSON-decode a 2.6 KB payload, sleep 5 ms (simulated I/O), about 1 ms of pure-Pyt
 | mayu-thread | 2 processes × 32 threads (Python 3.14.7t, 0.1.0) | 3174 | 1.8 | 176 | 222 | 5.71× |
 | mayu-process | 64 processes (Python 3.14.7, 0.1.0) | 2588 | 3.0 | 1375 | 2608 | 4.66× |
 | rq | 64 SimpleWorker processes, no fork per job (Python 3.14.7, 2.12.0) | 1308 | 4.1 | 518 | 2226 | 2.35× |
+| streaq | 2 processes × 32 async tasks (Python 3.14.7, 7.2.0) | 945 | 5.7 | 118 | 175 | 1.70× |
 | dramatiq | 2 processes × 32 threads (Python 3.14.7, 2.2.1) | 825 | 6.4 | 82 | 137 | 1.48× |
-| streaq | 2 processes × 32 async tasks (Python 3.14.7, 7.2.0) | 639 | 8.5 | 119 | 176 | 1.15× |
 | celery | 64 prefork processes (Python 3.14.7, 5.6.3) | 556 | 11.0 | 1606 | 3212 | 1.00× |
 
 ## Memory at equal concurrency

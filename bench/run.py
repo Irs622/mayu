@@ -42,8 +42,9 @@ class BenchError(Exception):
 def claim_db(r) -> None:
     """Empties the bench DB. Refuses a DB that holds keys the bench did not create."""
     if r.dbsize() and not r.exists(OWNER_KEY):
-        raise BenchError(f"refusing to flush {r.connection_pool.connection_kwargs}: it holds keys and has no "
-                         f"{OWNER_KEY!r} marker; point MAYU_BENCH_REDIS at an empty database")
+        kw = r.connection_pool.connection_kwargs
+        raise BenchError(f"refusing to flush redis {kw.get('host')}:{kw.get('port')} db {kw.get('db')}: it holds keys "
+                         f"and has no {OWNER_KEY!r} marker; point MAYU_BENCH_REDIS at an empty database")
     r.flushdb()
     r.set(OWNER_KEY, "1")
 
@@ -97,6 +98,10 @@ def main(argv=None) -> int:
     a = p.parse_args(argv)
     if a.concurrency < 2 or a.concurrency % 2:
         p.error("--concurrency must be an even number >= 2")
+
+    # `timeout` and friends send SIGTERM; die through the `finally: stop(proc)` below, or the workers (their own
+    # session) outlive us and steal the next run's tasks.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 
     module, cmd_name = SYSTEMS[a.system]
     adapter = importlib.import_module(module)
