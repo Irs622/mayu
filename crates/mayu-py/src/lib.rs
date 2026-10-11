@@ -46,7 +46,7 @@ impl Client {
         })
     }
 
-    #[pyo3(signature = (task, queue, payload, content_type, max_retries, eta_ms=None))]
+    #[pyo3(signature = (task, queue, payload, content_type, max_retries, eta_ms=None, trace_ctx=None))]
     #[allow(clippy::too_many_arguments)]
     fn enqueue(
         &self,
@@ -57,9 +57,11 @@ impl Client {
         content_type: String,
         max_retries: u32,
         eta_ms: Option<u64>,
+        trace_ctx: Option<String>,
     ) -> PyResult<String> {
         let mut header = Header::new(task, queue, max_retries, content_type);
         header.eta = eta_ms;
+        header.trace_ctx = trace_ctx;
         py.detach(|| self.rt.block_on(self.broker.enqueue(&header, &payload))).map_err(rt_err)?;
         Ok(header.id)
     }
@@ -261,6 +263,10 @@ impl PyReadyTask {
     #[getter]
     fn payload<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.0.payload)
+    }
+    #[getter]
+    fn trace_ctx(&self) -> Option<&str> {
+        self.0.trace_ctx.as_deref()
     }
     fn __repr__(&self) -> String {
         format!("ReadyTask(id={:?}, task={:?}, attempt={})", self.0.id, self.0.task, self.0.attempt)

@@ -10,11 +10,14 @@ requires-python = ">=3.13"
 license = "MIT OR Apache-2.0"
 dependencies = ["msgpack>=1.1"]
 
+[project.optional-dependencies]
+otel = ["opentelemetry-api>=1.30"]
+
 [project.scripts]
 mayu = "mayu.cli:main"
 
 [dependency-groups]
-dev = ["maturin>=1.9,<2", "pytest>=8"]
+dev = ["maturin>=1.9,<2", "pytest>=8", "opentelemetry-sdk>=1.30"]
 
 [tool.maturin]
 manifest-path = "crates/mayu-py/Cargo.toml"

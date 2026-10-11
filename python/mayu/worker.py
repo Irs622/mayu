@@ -6,7 +6,7 @@ import threading
 import time
 import traceback
 
-from . import _native
+from . import _native, otel
 from .exceptions import Retry, SoftTimeLimitExceeded, TimeLimitExceeded
 from .limits import TimeLimits
 from .recycle import rss_mb
@@ -24,6 +24,11 @@ def _hostport(host: str, port: int) -> str:
 
 def _ms(seconds: float) -> int:
     return max(1, int(seconds * 1000))
+
+
+async def _in_span(span, coro):
+    with otel.activate(span):
+        return await coro
 
 
 async def _with_time_limits(coro, soft: float | None, hard: float | None):
@@ -114,6 +119,8 @@ class WorkerRunner:
         self._loop_thread: threading.Thread | None = None
         self._pending_async: set = set()
         self._pending_lock = threading.Lock()
+        self._spans: dict = {}
+        self._spans_lock = threading.Lock()
 
     @property
     def worker_id(self) -> str | None:
@@ -302,6 +309,10 @@ class WorkerRunner:
             self.native.complete_failure(ready.token, f"unknown task {ready.task!r}", "")
             self._settled()
             return
+        span = otel.start_process(ready)
+        if span is not None:
+            with self._spans_lock:
+                self._spans[ready.token] = span
         try:
             serializer = for_content_type(ready.content_type, allow_pickle=self.app.allow_pickle)
             args, kwargs, *extra = serializer.loads(ready.payload)
@@ -318,6 +329,15 @@ class WorkerRunner:
             return
         self._run_sync(ready.token, task, serializer, args, kwargs, slot, links)
 
+    def _span(self, token):
+        with self._spans_lock:
+            return self._spans.get(token)
+
+    def _end_span(self, token, error: BaseException | None = None) -> None:
+        with self._spans_lock:
+            span = self._spans.pop(token, None)
+        otel.end(span, error)
+
     def _run_sync(self, token, task, serializer, args, kwargs, slot: _Slot, links=()) -> None:
         """Exactly one outcome per task, and a soft-limit exception never leaves this method.
 
@@ -328,23 +348,26 @@ class WorkerRunner:
         """
         run = outcome = owned = None
         armed = settled = False
-        while not settled:
-            try:
-                if not armed:
-                    run = self._limits.arm(token, slot.ident, task.soft_time_limit, task.hard_time_limit,
-                                           context=(task, slot))
-                    armed = True
-                if outcome is None:
-                    try:
-                        outcome = (True, task.fn(*args, **kwargs))
-                    except BaseException as e:
-                        outcome = (False, e)
-                owned = run is None or self._limits.disarm(run)
-                settled = True
-            except SoftTimeLimitExceeded as e:
-                if outcome is None:
-                    outcome = (False, e)  # the limit fired before/around the task body
-                # otherwise it landed after the task finished: drop it and finish settling
+        # The span is attached before the run is armed and detached after it is disarmed, so the
+        # soft-limit exception (only delivered while armed) never lands inside attach/detach.
+        with otel.activate(self._span(token)):
+            while not settled:
+                try:
+                    if not armed:
+                        run = self._limits.arm(token, slot.ident, task.soft_time_limit, task.hard_time_limit,
+                                               context=(task, slot))
+                        armed = True
+                    if outcome is None:
+                        try:
+                            outcome = (True, task.fn(*args, **kwargs))
+                        except BaseException as e:
+                            outcome = (False, e)
+                    owned = run is None or self._limits.disarm(run)
+                    settled = True
+                except SoftTimeLimitExceeded as e:
+                    if outcome is None:
+                        outcome = (False, e)  # the limit fired before/around the task body
+                    # otherwise it landed after the task finished: drop it and finish settling
         if not owned:
             slot.zombie = True  # the hard limit already settled this task; this thread retires
             return
@@ -355,7 +378,8 @@ class WorkerRunner:
             self._report_error(token, task, value)
 
     def _submit_async(self, token, task, serializer, args, kwargs, links=()) -> None:
-        coro = _with_time_limits(task.fn(*args, **kwargs), task.soft_time_limit, task.hard_time_limit)
+        coro = _in_span(self._span(token),
+                        _with_time_limits(task.fn(*args, **kwargs), task.soft_time_limit, task.hard_time_limit))
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         with self._pending_lock:
             self._pending_async.add(fut)
@@ -375,6 +399,7 @@ class WorkerRunner:
         try:
             data = None if self.app.result_ttl is None else serializer.dumps(result)
         except BaseException as e:
+            self._end_span(token, e)
             self.native.complete_failure(token, f"result not serializable: {e!r}", traceback.format_exc())
             self._settled()
             return
@@ -382,13 +407,16 @@ class WorkerRunner:
             # link callbacks get the result first; Rust enqueues them atomically with the ack
             follow_ups = [self._follow_up(serializer, result, cb) for cb in links]
         except _BadLink as e:
+            self._end_span(token, e)
             self.native.complete_failure(token, f"bad link callback: {e.__cause__!r}", traceback.format_exc())
             self._settled()
             return
         except BaseException as e:
+            self._end_span(token, e)
             self.native.complete_failure(token, f"result not serializable: {e!r}", traceback.format_exc())
             self._settled()
             return
+        self._end_span(token)
         try:
             self.native.complete_success(token, data, follow_ups)
         except (TypeError, ValueError, OverflowError) as e:
@@ -411,6 +439,7 @@ class WorkerRunner:
         return (task, queue, payload, max_retries)
 
     def _report_error(self, token, task, e: BaseException) -> None:
+        self._end_span(token, e)
         if isinstance(e, Retry):
             ms = None if e.countdown is None else max(0, int(e.countdown * 1000))
             self.native.complete_retry(token, ms, repr(e.exc) if e.exc is not None else "Retry requested")

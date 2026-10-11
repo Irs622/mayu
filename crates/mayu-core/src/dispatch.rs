@@ -179,6 +179,7 @@ mod tests {
             max_retries: 0,
             content_type: "ct".into(),
             payload: vec![],
+            trace_ctx: None,
         }
     }
 

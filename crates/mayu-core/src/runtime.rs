@@ -77,6 +77,7 @@ pub struct ReadyTask {
     pub max_retries: u32,
     pub content_type: String,
     pub payload: Vec<u8>,
+    pub trace_ctx: Option<String>,
 }
 
 impl ReadyTask {
@@ -90,6 +91,7 @@ impl ReadyTask {
             max_retries: d.header.max_retries,
             content_type: d.header.content_type.clone(),
             payload: d.payload.clone(),
+            trace_ctx: d.header.trace_ctx.clone(),
         }
     }
 }

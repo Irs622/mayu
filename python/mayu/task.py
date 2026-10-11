@@ -4,6 +4,7 @@ import inspect
 import math
 import time
 
+from . import otel
 from .handle import TaskHandle
 
 RESERVED_OPTIONS = frozenset({"countdown", "eta", "queue", "link"})
@@ -131,9 +132,17 @@ class Task:
         if links:
             body.append({"links": [s._wire() for s in links]})
         payload = serializer.dumps(body)
-        task_id = self.app.client.enqueue(
-            self.name, queue or self.queue, payload, serializer.content_type, self.max_retries, eta_ms
-        )
+        q = queue or self.queue
+        span, traceparent = otel.start_send(self.name, q)
+        try:
+            task_id = self.app.client.enqueue(
+                self.name, q, payload, serializer.content_type, self.max_retries, eta_ms, trace_ctx=traceparent
+            )
+        except BaseException as e:
+            otel.end(span, e)
+            raise
+        otel.set_message_id(span, task_id)
+        otel.end(span)
         return TaskHandle(self.app, task_id)
 
     def s(self, *args, **kwargs) -> Signature:

@@ -185,13 +185,26 @@ concurrent replays never enqueue a task twice. A replay only takes the dead lett
 when it starts: tasks that fail again during the replay stay dead. Entries whose envelope could
 not be decoded are listed but never replayed.
 
+## Tracing
+
+```bash
+pip install "mayu[otel]"
+```
+
+With OpenTelemetry installed and a tracer provider configured, `send()` creates a `send <task>`
+producer span and stores its W3C `traceparent` in the task envelope. The worker runs the task inside a
+`process <task>` consumer span that is its child, so spans your task creates (HTTP calls, database
+queries) join the caller's trace. Retries, rate-limit deferrals and `link=` callbacks keep the original
+trace context. A failed attempt marks its span as an error. Without OpenTelemetry installed, nothing
+changes.
+
 ## Development
 
 ```bash
 scripts/redis-up.sh                                   # Redis on :6390 for tests
 cargo test --workspace                                # Rust tests (need Redis)
 uv venv --python 3.14t .venv
-uv pip install --python .venv/bin/python maturin pytest msgpack
+uv pip install --python .venv/bin/python maturin pytest msgpack opentelemetry-sdk
 VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop --uv
 .venv/bin/pytest
 uv venv --python 3.14+gil .venv-gil && uv pip install --python .venv-gil/bin/python maturin pytest msgpack
