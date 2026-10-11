@@ -128,14 +128,19 @@ impl RedisBroker {
             }
             Err(e) => return Err(be(e)),
         };
+        let (claimed, missing) = parse_fetch(v)?;
         let mut out = Vec::new();
-        for (i, id, mut fields) in parse_fetch(v)? {
-            let Some(queue) = queues.get(i) else { continue };
+        for (i, id, mut fields) in claimed {
+            let queue = queues.get(i).ok_or_else(|| be("fetch reply names an unknown queue"))?;
             let h = fields.remove("h");
             let p = fields.remove("p").unwrap_or_default();
             if let Some(d) = self.decode_or_bury(queue, id, h, p, 1).await? {
                 out.push(d);
             }
+        }
+        if !missing.is_empty() {
+            let gone = missing.iter().filter_map(|&i| queues.get(i).cloned()).collect::<Vec<_>>();
+            self.ensure_queues(&gone).await?;
         }
         Ok(out)
     }
@@ -270,27 +275,38 @@ fn is_nogroup(e: &redis::RedisError) -> bool {
 /// A claimed entry: (queue index, entry id, fields).
 type Claimed = (usize, String, HashMap<String, Vec<u8>>);
 
-/// `fetch.lua` reply -> claimed entries.
-fn parse_fetch(v: Value) -> Result<Vec<Claimed>> {
-    let Value::Array(entries) = v else { return Err(be("unexpected fetch reply")) };
+/// `fetch.lua` reply `{claimed, missing}` -> (claimed entries, indexes of streams without the group).
+///
+/// Every element of `claimed` is already claimed in Redis, so a malformed one is an error,
+/// never silently skipped.
+fn parse_fetch(v: Value) -> Result<(Vec<Claimed>, Vec<usize>)> {
+    let bad = || be("malformed fetch reply");
+    let Value::Array(top) = v else { return Err(bad()) };
+    let mut top = top.into_iter();
+    let (Some(Value::Array(entries)), Some(Value::Array(missing))) = (top.next(), top.next()) else {
+        return Err(bad());
+    };
+    let index = |v: Value| match v {
+        Value::Int(i) if i >= 1 => Ok(i as usize - 1),
+        _ => Err(bad()),
+    };
     let mut out = Vec::new();
     for e in entries {
-        let Value::Array(parts) = e else { continue };
+        let Value::Array(parts) = e else { return Err(bad()) };
         let mut parts = parts.into_iter();
-        let (Some(Value::Int(i)), Some(id), Some(Value::Array(flat))) = (parts.next(), parts.next(), parts.next())
-        else { continue };
-        let Some(id) = text(&id) else { continue };
+        let (Some(i), Some(id), Some(Value::Array(flat))) = (parts.next(), parts.next(), parts.next())
+        else { return Err(bad()) };
+        let i = index(i)?;
+        let id = text(&id).ok_or_else(bad)?;
         let mut fields = HashMap::new();
         for pair in flat.chunks(2) {
-            if let [k, v] = pair {
-                if let (Some(k), Some(v)) = (text(k), bulk(v)) {
-                    fields.insert(k, v);
-                }
-            }
+            let [k, v] = pair else { return Err(bad()) };
+            fields.insert(text(k).ok_or_else(bad)?, bulk(v).ok_or_else(bad)?);
         }
-        out.push(((i as usize).saturating_sub(1), id, fields));
+        out.push((i, id, fields));
     }
-    Ok(out)
+    let missing = missing.into_iter().map(index).collect::<Result<Vec<_>>>()?;
+    Ok((out, missing))
 }
 
 impl Broker for RedisBroker {
@@ -328,6 +344,9 @@ impl Broker for RedisBroker {
     }
 
     async fn fetch(&self, queues: &[String], count: usize, block_ms: u64) -> Result<Vec<Delivery>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
         let got = self.fetch_ordered(queues, count).await?;
         if !got.is_empty() || block_ms == 0 || queues.is_empty() {
             return Ok(got);

@@ -291,3 +291,33 @@ async fn blocking_fetch_across_queues_stays_within_count() {
     push.await.unwrap();
     assert!(!got.is_empty() && got.len() <= 2, "claimed {}", got.len());
 }
+
+#[tokio::test]
+async fn fetch_keeps_claimed_entries_when_a_later_queue_lost_its_group() {
+    let (b, q1) = setup().await;
+    let q2 = uniq("q");
+    b.ensure_queues(std::slice::from_ref(&q2)).await.unwrap();
+    for q in [&q1, &q2] {
+        b.enqueue(&Header::new("t", q, 0, "ct"), b"").await.unwrap();
+    }
+    // Deleting the stream drops its group; the next enqueue recreates the stream without one.
+    let mut c = redis::Client::open(url().as_str()).unwrap().get_multiplexed_async_connection().await.unwrap();
+    redis::cmd("DEL").arg(stream_key(&q2)).query_async::<i64>(&mut c).await.unwrap();
+    b.enqueue(&Header::new("t", &q2, 0, "ct"), b"").await.unwrap();
+
+    let got = b.fetch(&[q1.clone(), q2.clone()], 10, 100).await.unwrap();
+    assert_eq!(got.iter().filter(|d| d.queue == q1).count(), 1, "q1's claimed entry must be returned");
+    assert_eq!(b.stats(&q1).await.unwrap().pending, 1);
+
+    let got = b.fetch(std::slice::from_ref(&q2), 10, 100).await.unwrap();
+    assert_eq!(got.len(), 1, "the recreated group delivers q2's entry");
+    assert_eq!(got[0].queue, q2);
+}
+
+#[tokio::test]
+async fn fetch_with_zero_count_returns_nothing() {
+    let (b, q) = setup().await;
+    b.enqueue(&Header::new("t", &q, 0, "ct"), b"").await.unwrap();
+    assert!(b.fetch(std::slice::from_ref(&q), 0, 100).await.unwrap().is_empty());
+    assert_eq!(b.stats(&q).await.unwrap().pending, 0);
+}
