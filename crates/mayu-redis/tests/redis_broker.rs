@@ -1,5 +1,6 @@
-use mayu_core::{Broker, Header, StoredResult, now_ms};
-use mayu_redis::{RedisBroker, stream_key};
+use mayu_core::{Broker, Header, StoredResult, WorkerInfo, now_ms};
+use mayu_redis::{RedisBroker, stream_key, worker_key};
+use redis::Value;
 
 fn url() -> String {
     std::env::var("MAYU_TEST_REDIS").unwrap_or_else(|_| "redis://127.0.0.1:6390/0".into())
@@ -147,4 +148,112 @@ async fn concurrent_promote_never_duplicates() {
     while total < 50 { total += b1.promote(&q, later, 7).await.unwrap(); }
     let s = b1.stats(&q).await.unwrap();
     assert_eq!((s.stream, s.delayed, total), (50, 0, 50));
+}
+
+async fn raw() -> redis::aio::MultiplexedConnection {
+    redis::Client::open(url()).unwrap().get_multiplexed_async_connection().await.unwrap()
+}
+
+async fn consumer_count(q: &str) -> usize {
+    let v: Vec<Value> = redis::cmd("XINFO").arg("CONSUMERS").arg(stream_key(q)).arg("mayu")
+        .query_async(&mut raw().await).await.unwrap();
+    v.len()
+}
+
+#[tokio::test]
+async fn fresh_fetch_has_delivery_count_one() {
+    let (b, q) = setup().await;
+    b.enqueue(&Header::new("t", &q, 0, "ct"), b"").await.unwrap();
+    assert_eq!(b.fetch(&[q.clone()], 1, 100).await.unwrap()[0].delivery_count, 1);
+}
+
+#[tokio::test]
+async fn extend_keeps_ownership_and_reports_lost() {
+    let (a, q) = setup().await;
+    let b = RedisBroker::connect(&url(), uniq("c")).await.unwrap();
+    a.enqueue(&Header::new("t", &q, 0, "ct"), b"x").await.unwrap();
+    let d = a.fetch(&[q.clone()], 1, 100).await.unwrap().remove(0);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(a.extend(&q, &[d.stream_id.clone()]).await.unwrap().is_empty());
+    assert!(b.reclaim(&q, 100, "0-0", 10).await.unwrap().deliveries.is_empty(), "extend reset idle time");
+    let r = b.reclaim(&q, 0, "0-0", 10).await.unwrap();
+    assert_eq!(r.deliveries.len(), 1);
+    assert_eq!(r.deliveries[0].delivery_count, 2);
+    assert_eq!(r.deliveries[0].payload, b"x");
+    assert_eq!(a.extend(&q, &[d.stream_id.clone()]).await.unwrap(), vec![d.stream_id.clone()]);
+    assert!(a.extend(&q, &[]).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reclaim_pages_with_cursor() {
+    let (a, q) = setup().await;
+    let b = RedisBroker::connect(&url(), uniq("c")).await.unwrap();
+    for _ in 0..5 { a.enqueue(&Header::new("t", &q, 0, "ct"), b"").await.unwrap(); }
+    assert_eq!(a.fetch(&[q.clone()], 5, 100).await.unwrap().len(), 5);
+    let (mut cursor, mut total) = ("0-0".to_string(), 0);
+    for _ in 0..10 {
+        let r = b.reclaim(&q, 0, &cursor, 2).await.unwrap();
+        total += r.deliveries.len();
+        cursor = r.next_cursor;
+        if cursor == "0-0" { break; }
+    }
+    assert_eq!(total, 5);
+}
+
+#[tokio::test]
+async fn reclaim_dead_letters_corrupt_header() {
+    let (b, q) = setup().await;
+    let mut c = raw().await;
+    let _: String = redis::cmd("XADD").arg(stream_key(&q)).arg("*").arg("h").arg("garbage")
+        .query_async(&mut c).await.unwrap();
+    let _: Value = redis::cmd("XREADGROUP").arg("GROUP").arg("mayu").arg("someone-else")
+        .arg("COUNT").arg(1).arg("STREAMS").arg(stream_key(&q)).arg(">")
+        .query_async(&mut c).await.unwrap();
+    assert!(b.reclaim(&q, 0, "0-0", 10).await.unwrap().deliveries.is_empty());
+    let s = b.stats(&q).await.unwrap();
+    assert_eq!((s.dead, s.pending), (1, 0));
+}
+
+#[tokio::test]
+async fn heartbeat_roundtrip_ttl_and_unregister() {
+    let (b, _q) = setup().await;
+    let info = WorkerInfo {
+        worker_id: uniq("w"), hostname: "host-1".into(), pid: 42, queues: vec!["a".into(), "b".into()],
+        concurrency: 8, inflight: 3, started_at: 1_000, last_seen: 2_000,
+    };
+    b.heartbeat(&info, 300).await.unwrap();
+    assert_eq!(b.worker_info(&info.worker_id).await.unwrap(), Some(info.clone()));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(b.worker_info(&info.worker_id).await.unwrap(), None, "expired");
+    b.heartbeat(&info, 60_000).await.unwrap();
+    b.unregister(&info.worker_id).await.unwrap();
+    assert_eq!(b.worker_info(&info.worker_id).await.unwrap(), None);
+    assert!(worker_key("x").starts_with("mayu:workers:"));
+}
+
+#[tokio::test]
+async fn prune_removes_only_idle_consumers_without_heartbeat_or_pending() {
+    let q = uniq("q");
+    let ghost_name = uniq("ghost");
+    let live_name = uniq("live");
+    let busy_name = uniq("busy");
+    let ghost = RedisBroker::connect(&url(), ghost_name.clone()).await.unwrap();
+    let live = RedisBroker::connect(&url(), live_name.clone()).await.unwrap();
+    let busy = RedisBroker::connect(&url(), busy_name.clone()).await.unwrap();
+    ghost.ensure_queues(&[q.clone()]).await.unwrap();
+    for _ in 0..3 { ghost.enqueue(&Header::new("t", &q, 0, "ct"), b"").await.unwrap(); }
+    for b in [&ghost, &live] {
+        let d = b.fetch(&[q.clone()], 1, 100).await.unwrap().remove(0);
+        b.ack(&d, None).await.unwrap(); // consumer exists, 0 pending
+    }
+    busy.fetch(&[q.clone()], 1, 100).await.unwrap(); // 1 pending, no heartbeat
+    live.heartbeat(&WorkerInfo {
+        worker_id: live_name.clone(), hostname: "h".into(), pid: 1, queues: vec![q.clone()],
+        concurrency: 1, inflight: 0, started_at: 0, last_seen: 0,
+    }, 60_000).await.unwrap();
+    assert_eq!(consumer_count(&q).await, 3);
+    assert_eq!(ghost.prune_consumers(&q, 0).await.unwrap(), 1);
+    assert_eq!(consumer_count(&q).await, 2, "live (heartbeat) and busy (pending) are kept");
+    assert_eq!(ghost.prune_consumers(&q, 60_000).await.unwrap(), 0, "min idle respected");
+    assert_eq!(ghost.prune_consumers(&uniq("nope"), 0).await.unwrap(), 0, "missing stream is fine");
 }

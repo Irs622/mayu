@@ -10,6 +10,7 @@ pub struct Delivery {
     pub header: Header,
     pub raw_header: Vec<u8>,
     pub payload: Vec<u8>,
+    pub delivery_count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -17,6 +18,24 @@ pub struct StoredResult {
     pub id: String,
     pub record: Vec<u8>,
     pub ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerInfo {
+    pub worker_id: String,
+    pub hostname: String,
+    pub pid: u32,
+    pub queues: Vec<String>,
+    pub concurrency: usize,
+    pub inflight: usize,
+    pub started_at: u64,
+    pub last_seen: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Reclaimed {
+    pub next_cursor: String,
+    pub deliveries: Vec<Delivery>,
 }
 
 /// The only component aware of the broker. Every state transition must be atomic.
@@ -32,4 +51,13 @@ pub trait Broker: Send + Sync + 'static {
     fn requeue(&self, d: &Delivery) -> impl Future<Output = Result<()>> + Send;
     fn promote(&self, queue: &str, now_ms: u64, limit: usize) -> impl Future<Output = Result<usize>> + Send;
     fn get_result(&self, id: &str) -> impl Future<Output = Result<Option<Vec<u8>>>> + Send;
+    /// Resets idle time on entries this consumer still owns; returns the ids it no longer owns.
+    fn extend(&self, queue: &str, stream_ids: &[String]) -> impl Future<Output = Result<Vec<String>>> + Send;
+    /// Claims entries idle for at least `min_idle_ms` (their worker died).
+    fn reclaim(&self, queue: &str, min_idle_ms: u64, cursor: &str, count: usize)
+        -> impl Future<Output = Result<Reclaimed>> + Send;
+    fn heartbeat(&self, info: &WorkerInfo, ttl_ms: u64) -> impl Future<Output = Result<()>> + Send;
+    fn unregister(&self, worker_id: &str) -> impl Future<Output = Result<()>> + Send;
+    /// Removes consumers with no pending entries, idle at least `min_idle_ms`, and no heartbeat.
+    fn prune_consumers(&self, queue: &str, min_idle_ms: u64) -> impl Future<Output = Result<usize>> + Send;
 }

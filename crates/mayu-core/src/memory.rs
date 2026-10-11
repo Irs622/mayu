@@ -2,11 +2,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
-use crate::broker::{Broker, Delivery, StoredResult};
+use crate::broker::{Broker, Delivery, Reclaimed, StoredResult, WorkerInfo};
 use crate::envelope::{Header, decode_header, encode_header, now_ms};
 use crate::error::{Error, Result};
 
@@ -24,14 +24,26 @@ struct Entry {
     p: Vec<u8>,
 }
 
+struct Pending {
+    queue: String,
+    entry: Entry,
+    owner: String,
+    last_delivery: Instant,
+    count: u64,
+}
+
+/// (eta ms, header, payload)
+type DelayedEntry = (u64, Vec<u8>, Vec<u8>);
+
 #[derive(Default)]
 struct State {
     seq: u64,
     streams: HashMap<String, VecDeque<Entry>>,
-    pending: HashMap<String, Entry>,
-    delayed: HashMap<String, Vec<(u64, Vec<u8>, Vec<u8>)>>,
+    pending: HashMap<String, Pending>,
+    delayed: HashMap<String, Vec<DelayedEntry>>,
     dead: Vec<DeadEntry>,
     results: HashMap<String, Vec<u8>>,
+    workers: HashMap<String, (WorkerInfo, Instant)>,
 }
 
 impl State {
@@ -41,17 +53,34 @@ impl State {
         self.streams.entry(queue.to_string()).or_default().push_back(Entry { id, h, p });
     }
 
-    fn take(&mut self, queues: &[String], count: usize) -> Vec<Delivery> {
+    fn bury(&mut self, queue: &str, error: String) {
+        self.dead.push(DeadEntry { queue: queue.to_string(), header: None, error });
+    }
+
+    fn take(&mut self, queues: &[String], count: usize, consumer: &str) -> Vec<Delivery> {
         let mut out = Vec::new();
         for q in queues {
             while out.len() < count {
                 let Some(e) = self.streams.get_mut(q).and_then(|s| s.pop_front()) else { break };
                 match decode_header(&e.h) {
                     Ok(header) => {
-                        self.pending.insert(e.id.clone(), e.clone());
-                        out.push(Delivery { queue: q.clone(), stream_id: e.id, header, raw_header: e.h, payload: e.p });
+                        out.push(Delivery {
+                            queue: q.clone(),
+                            stream_id: e.id.clone(),
+                            header,
+                            raw_header: e.h.clone(),
+                            payload: e.p.clone(),
+                            delivery_count: 1,
+                        });
+                        self.pending.insert(e.id.clone(), Pending {
+                            queue: q.clone(),
+                            entry: e,
+                            owner: consumer.to_string(),
+                            last_delivery: Instant::now(),
+                            count: 1,
+                        });
                     }
-                    Err(err) => self.dead.push(DeadEntry { queue: q.clone(), header: None, error: err.to_string() }),
+                    Err(err) => self.bury(q, err.to_string()),
                 }
             }
         }
@@ -64,9 +93,15 @@ pub struct MemoryBroker {
     state: Arc<Mutex<State>>,
     notify: Arc<Notify>,
     failing: Arc<AtomicBool>,
+    consumer: String,
 }
 
 impl MemoryBroker {
+    /// A handle on the same state that acts as a different consumer (worker).
+    pub fn with_consumer(&self, consumer: &str) -> Self {
+        MemoryBroker { consumer: consumer.to_string(), ..self.clone() }
+    }
+
     /// While set, every `Broker` call fails, simulating an outage.
     pub fn set_failing(&self, on: bool) {
         self.failing.store(on, Ordering::SeqCst);
@@ -103,6 +138,14 @@ impl MemoryBroker {
     }
     pub fn dead(&self) -> Vec<DeadEntry> { self.state.lock().unwrap().dead.clone() }
     pub fn result(&self, id: &str) -> Option<Vec<u8>> { self.state.lock().unwrap().results.get(id).cloned() }
+    pub fn delivery_count(&self, stream_id: &str) -> Option<u64> {
+        self.state.lock().unwrap().pending.get(stream_id).map(|p| p.count)
+    }
+    /// The worker's heartbeat, if it has not expired.
+    pub fn worker(&self, id: &str) -> Option<WorkerInfo> {
+        let s = self.state.lock().unwrap();
+        s.workers.get(id).filter(|(_, expires)| *expires > Instant::now()).map(|(w, _)| w.clone())
+    }
 
     fn store(s: &mut State, r: Option<StoredResult>) {
         if let Some(r) = r { s.results.insert(r.id, r.record); }
@@ -110,9 +153,7 @@ impl MemoryBroker {
 }
 
 impl Broker for MemoryBroker {
-    async fn ensure_queues(&self, _queues: &[String]) -> Result<()> {
-        self.check()
-    }
+    async fn ensure_queues(&self, _queues: &[String]) -> Result<()> { self.check() }
 
     async fn enqueue(&self, header: &Header, payload: &[u8]) -> Result<()> {
         self.check()?;
@@ -127,7 +168,7 @@ impl Broker for MemoryBroker {
             let notified = self.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let got = self.state.lock().unwrap().take(queues, count);
+            let got = self.state.lock().unwrap().take(queues, count, &self.consumer);
             if !got.is_empty() { return Ok(got); }
             if tokio::time::timeout_at(deadline, notified).await.is_err() { return Ok(Vec::new()); }
         }
@@ -188,6 +229,75 @@ impl Broker for MemoryBroker {
     async fn get_result(&self, id: &str) -> Result<Option<Vec<u8>>> {
         self.check()?;
         Ok(self.result(id))
+    }
+
+    async fn extend(&self, _queue: &str, stream_ids: &[String]) -> Result<Vec<String>> {
+        self.check()?;
+        let mut s = self.state.lock().unwrap();
+        let now = Instant::now();
+        let mut lost = Vec::new();
+        for id in stream_ids {
+            match s.pending.get_mut(id) {
+                Some(p) if p.owner == self.consumer => p.last_delivery = now,
+                _ => lost.push(id.clone()),
+            }
+        }
+        Ok(lost)
+    }
+
+    async fn reclaim(&self, queue: &str, min_idle_ms: u64, _cursor: &str, count: usize) -> Result<Reclaimed> {
+        self.check()?;
+        let mut s = self.state.lock().unwrap();
+        let min_idle = Duration::from_millis(min_idle_ms);
+        let mut ids: Vec<String> = s.pending.iter()
+            .filter(|(_, p)| p.queue == queue && p.last_delivery.elapsed() >= min_idle)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort_by_key(|id| id.split('-').next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0));
+        ids.truncate(count);
+        let mut deliveries = Vec::new();
+        for id in ids {
+            let p = s.pending.get_mut(&id).expect("listed above");
+            p.owner = self.consumer.clone();
+            p.last_delivery = Instant::now();
+            p.count += 1;
+            let (entry, delivery_count) = (p.entry.clone(), p.count);
+            match decode_header(&entry.h) {
+                Ok(header) => deliveries.push(Delivery {
+                    queue: queue.to_string(),
+                    stream_id: id,
+                    header,
+                    raw_header: entry.h,
+                    payload: entry.p,
+                    delivery_count,
+                }),
+                Err(err) => {
+                    s.pending.remove(&id);
+                    s.bury(queue, err.to_string());
+                }
+            }
+        }
+        // The memory broker scans everything each call, so the cursor always wraps.
+        Ok(Reclaimed { next_cursor: "0-0".into(), deliveries })
+    }
+
+    async fn heartbeat(&self, info: &WorkerInfo, ttl_ms: u64) -> Result<()> {
+        self.check()?;
+        let expires = Instant::now() + Duration::from_millis(ttl_ms);
+        self.state.lock().unwrap().workers.insert(info.worker_id.clone(), (info.clone(), expires));
+        Ok(())
+    }
+
+    async fn unregister(&self, worker_id: &str) -> Result<()> {
+        self.check()?;
+        self.state.lock().unwrap().workers.remove(worker_id);
+        Ok(())
+    }
+
+    /// The memory broker keeps no consumer registry, so there is nothing to prune.
+    async fn prune_consumers(&self, _queue: &str, _min_idle_ms: u64) -> Result<usize> {
+        self.check()?;
+        Ok(0)
     }
 }
 
@@ -286,6 +396,55 @@ mod tests {
             b.set_failing(false);
             b.enqueue(&h, b"").await.unwrap();
             assert_eq!(b.fetch(&["q".into()], 1, 10).await.unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn extend_keeps_ownership_and_reports_lost() {
+        rt().block_on(async {
+            let a = MemoryBroker::default().with_consumer("a");
+            let b = a.with_consumer("b");
+            a.enqueue(&Header::new("t", "q", 0, "ct"), b"").await.unwrap();
+            let d = a.fetch(&["q".into()], 1, 10).await.unwrap().remove(0);
+            assert_eq!(d.delivery_count, 1);
+            assert!(a.extend("q", &[d.stream_id.clone()]).await.unwrap().is_empty());
+            let r = b.reclaim("q", 0, "0-0", 10).await.unwrap();
+            assert_eq!(r.deliveries.len(), 1);
+            assert_eq!(r.deliveries[0].delivery_count, 2);
+            assert_eq!(a.delivery_count(&d.stream_id), Some(2));
+            assert_eq!(a.extend("q", &[d.stream_id.clone()]).await.unwrap(), vec![d.stream_id.clone()]);
+        });
+    }
+
+    #[test]
+    fn reclaim_respects_min_idle_and_queue() {
+        rt().block_on(async {
+            let a = MemoryBroker::default().with_consumer("a");
+            let b = a.with_consumer("b");
+            a.enqueue(&Header::new("t", "q", 0, "ct"), b"").await.unwrap();
+            a.fetch(&["q".into()], 1, 10).await.unwrap();
+            assert!(b.reclaim("q", 60_000, "0-0", 10).await.unwrap().deliveries.is_empty());
+            assert!(b.reclaim("other", 0, "0-0", 10).await.unwrap().deliveries.is_empty());
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert_eq!(b.reclaim("q", 20, "0-0", 10).await.unwrap().deliveries.len(), 1);
+        });
+    }
+
+    #[test]
+    fn heartbeat_expires_and_unregisters() {
+        rt().block_on(async {
+            let b = MemoryBroker::default();
+            let info = WorkerInfo {
+                worker_id: "w1".into(), hostname: "h".into(), pid: 1, queues: vec!["q".into()],
+                concurrency: 2, inflight: 0, started_at: 0, last_seen: 0,
+            };
+            b.heartbeat(&info, 50).await.unwrap();
+            assert_eq!(b.worker("w1"), Some(info.clone()));
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            assert_eq!(b.worker("w1"), None);
+            b.heartbeat(&info, 60_000).await.unwrap();
+            b.unregister("w1").await.unwrap();
+            assert_eq!(b.worker("w1"), None);
         });
     }
 }

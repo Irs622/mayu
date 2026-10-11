@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use mayu_core::{
-    Broker, Delivery, Error, Header, Result, StoredResult, decode_header, encode_delayed_member,
-    encode_header, now_ms,
+    Broker, Delivery, Error, Header, Reclaimed, Result, StoredResult, WorkerInfo, decode_header,
+    encode_delayed_member, encode_header, now_ms,
 };
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::streams::StreamReadReply;
@@ -19,6 +19,8 @@ pub fn stream_key(q: &str) -> String { format!("mayu:{{{q}}}:stream") }
 pub fn delayed_key(q: &str) -> String { format!("mayu:{{{q}}}:delayed") }
 pub fn dead_key(q: &str) -> String { format!("mayu:{{{q}}}:dead") }
 pub fn result_key(id: &str) -> String { format!("mayu:result:{id}") }
+const WORKER_KEY_PREFIX: &str = "mayu:workers:";
+pub fn worker_key(id: &str) -> String { format!("{WORKER_KEY_PREFIX}{id}") }
 
 fn queue_from_stream_key(k: &str) -> &str {
     k.strip_prefix("mayu:{").and_then(|s| s.strip_suffix("}:stream")).unwrap_or(k)
@@ -40,6 +42,9 @@ struct Scripts {
     dead: Script,
     requeue: Script,
     promote: Script,
+    extend: Script,
+    reclaim: Script,
+    prune: Script,
 }
 
 async fn manager(client: &redis::Client, response_timeout: Duration) -> Result<ConnectionManager> {
@@ -74,6 +79,9 @@ impl RedisBroker {
                 dead: Script::new(include_str!("lua/dead.lua")),
                 requeue: Script::new(include_str!("lua/requeue.lua")),
                 promote: Script::new(include_str!("lua/promote.lua")),
+                extend: Script::new(include_str!("lua/extend.lua")),
+                reclaim: Script::new(include_str!("lua/reclaim.lua")),
+                prune: Script::new(include_str!("lua/prune.lua")),
             },
         })
     }
@@ -104,6 +112,43 @@ impl RedisBroker {
             .invoke_async::<i64>(&mut self.conn.clone()).await.map_err(be)?;
         Ok(())
     }
+
+    /// A stream entry as a `Delivery`, or dead-lettered if its header cannot be decoded.
+    async fn decode_or_bury(&self, queue: &str, stream_id: String, h: Option<Vec<u8>>, p: Vec<u8>,
+                            delivery_count: u64) -> Result<Option<Delivery>> {
+        let decoded = h.as_deref().map(decode_header);
+        match (h, decoded) {
+            (Some(raw_header), Some(Ok(header))) => Ok(Some(Delivery {
+                queue: queue.to_string(), stream_id, header, raw_header, payload: p, delivery_count,
+            })),
+            (h, _) => {
+                self.dead_raw(queue, &stream_id, &h.unwrap_or_default(), &p, "undecodable envelope header", None)
+                    .await?;
+                Ok(None)
+            }
+        }
+    }
+
+    pub async fn worker_info(&self, worker_id: &str) -> Result<Option<WorkerInfo>> {
+        let map: HashMap<String, String> = redis::cmd("HGETALL").arg(worker_key(worker_id))
+            .query_async(&mut self.conn.clone()).await.map_err(be)?;
+        if map.is_empty() {
+            return Ok(None);
+        }
+        let num = |k: &str| map.get(k).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        Ok(Some(WorkerInfo {
+            worker_id: worker_id.to_string(),
+            hostname: map.get("hostname").cloned().unwrap_or_default(),
+            pid: num("pid") as u32,
+            queues: map.get("queues")
+                .map(|q| q.split(',').filter(|s| !s.is_empty()).map(String::from).collect())
+                .unwrap_or_default(),
+            concurrency: num("concurrency") as usize,
+            inflight: num("inflight") as usize,
+            started_at: num("started_at"),
+            last_seen: num("last_seen"),
+        }))
+    }
 }
 
 fn take_bytes(map: &mut HashMap<String, Value>, k: &str) -> Option<Vec<u8>> {
@@ -111,6 +156,54 @@ fn take_bytes(map: &mut HashMap<String, Value>, k: &str) -> Option<Vec<u8>> {
         Value::BulkString(b) => Some(b),
         _ => None,
     }
+}
+
+fn bulk(v: &Value) -> Option<Vec<u8>> {
+    match v {
+        Value::BulkString(b) => Some(b.clone()),
+        Value::SimpleString(s) => Some(s.clone().into_bytes()),
+        _ => None,
+    }
+}
+
+fn text(v: &Value) -> Option<String> {
+    bulk(v).map(|b| String::from_utf8_lossy(&b).into_owned())
+}
+
+struct RawEntry {
+    id: String,
+    fields: HashMap<String, Vec<u8>>,
+    delivery_count: u64,
+}
+
+fn parse_reclaim(v: Value) -> Result<(String, Vec<RawEntry>)> {
+    let Value::Array(top) = v else { return Err(be("unexpected reclaim reply")) };
+    let mut top = top.into_iter();
+    let cursor = top.next().as_ref().and_then(text).ok_or_else(|| be("reclaim reply missing cursor"))?;
+    let entries = match top.next() {
+        Some(Value::Array(e)) => e,
+        _ => Vec::new(),
+    };
+    let mut out = Vec::new();
+    for e in entries {
+        let Value::Array(parts) = e else { continue };
+        let mut parts = parts.into_iter();
+        let (Some(id), Some(Value::Array(flat)), Some(count)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let Some(id) = text(&id) else { continue };
+        let delivery_count = match count { Value::Int(n) => n.max(1) as u64, _ => 1 };
+        let mut fields = HashMap::new();
+        for pair in flat.chunks(2) {
+            if let [k, v] = pair {
+                if let (Some(k), Some(v)) = (text(k), bulk(v)) {
+                    fields.insert(k, v);
+                }
+            }
+        }
+        out.push(RawEntry { id, fields, delivery_count });
+    }
+    Ok((cursor, out))
 }
 
 impl Broker for RedisBroker {
@@ -168,15 +261,8 @@ impl Broker for RedisBroker {
                 let mut map = entry.map;
                 let h = take_bytes(&mut map, "h");
                 let p = take_bytes(&mut map, "p").unwrap_or_default();
-                let decoded = h.as_deref().map(decode_header);
-                match (h, decoded) {
-                    (Some(raw_header), Some(Ok(header))) => out.push(Delivery {
-                        queue: queue.clone(), stream_id: entry.id, header, raw_header, payload: p,
-                    }),
-                    (h, _) => {
-                        self.dead_raw(&queue, &entry.id, &h.unwrap_or_default(), &p,
-                                      "undecodable envelope header", None).await?;
-                    }
+                if let Some(d) = self.decode_or_bury(&queue, entry.id, h, p, 1).await? {
+                    out.push(d);
                 }
             }
         }
@@ -226,5 +312,64 @@ impl Broker for RedisBroker {
     async fn get_result(&self, id: &str) -> Result<Option<Vec<u8>>> {
         redis::cmd("GET").arg(result_key(id))
             .query_async(&mut self.conn.clone()).await.map_err(be)
+    }
+
+    async fn extend(&self, queue: &str, stream_ids: &[String]) -> Result<Vec<String>> {
+        if stream_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut inv = self.scripts.extend.prepare_invoke();
+        inv.key(stream_key(queue)).arg(GROUP).arg(&self.consumer);
+        for id in stream_ids {
+            inv.arg(id);
+        }
+        inv.invoke_async(&mut self.conn.clone()).await.map_err(be)
+    }
+
+    async fn reclaim(&self, queue: &str, min_idle_ms: u64, cursor: &str, count: usize) -> Result<Reclaimed> {
+        let v: Value = self.scripts.reclaim
+            .key(stream_key(queue))
+            .arg(GROUP).arg(&self.consumer).arg(min_idle_ms).arg(cursor).arg(count.max(1))
+            .invoke_async(&mut self.conn.clone()).await.map_err(be)?;
+        let (next_cursor, entries) = parse_reclaim(v)?;
+        let mut deliveries = Vec::new();
+        for mut e in entries {
+            let h = e.fields.remove("h");
+            let p = e.fields.remove("p").unwrap_or_default();
+            if let Some(d) = self.decode_or_bury(queue, e.id, h, p, e.delivery_count).await? {
+                deliveries.push(d);
+            }
+        }
+        Ok(Reclaimed { next_cursor, deliveries })
+    }
+
+    async fn heartbeat(&self, info: &WorkerInfo, ttl_ms: u64) -> Result<()> {
+        let key = worker_key(&info.worker_id);
+        redis::pipe()
+            .atomic()
+            .cmd("HSET").arg(&key)
+                .arg("hostname").arg(&info.hostname)
+                .arg("pid").arg(info.pid)
+                .arg("queues").arg(info.queues.join(","))
+                .arg("concurrency").arg(info.concurrency)
+                .arg("inflight").arg(info.inflight)
+                .arg("started_at").arg(info.started_at)
+                .arg("last_seen").arg(info.last_seen)
+                .ignore()
+            .cmd("PEXPIRE").arg(&key).arg(ttl_ms).ignore()
+            .query_async::<()>(&mut self.conn.clone()).await.map_err(be)
+    }
+
+    async fn unregister(&self, worker_id: &str) -> Result<()> {
+        redis::cmd("DEL").arg(worker_key(worker_id))
+            .query_async::<i64>(&mut self.conn.clone()).await.map_err(be)?;
+        Ok(())
+    }
+
+    async fn prune_consumers(&self, queue: &str, min_idle_ms: u64) -> Result<usize> {
+        self.scripts.prune
+            .key(stream_key(queue))
+            .arg(GROUP).arg(min_idle_ms).arg(WORKER_KEY_PREFIX)
+            .invoke_async(&mut self.conn.clone()).await.map_err(be)
     }
 }
