@@ -1,5 +1,8 @@
+import sys
 import threading
 import time
+
+import pytest
 
 from mayu import _native
 
@@ -63,13 +66,11 @@ def test_get_result_timeout_returns_none(redis_url):
 
 
 def test_bad_url_raises():
-    import pytest
-
     with pytest.raises(RuntimeError):
         _native.Client("redis://127.0.0.1:1/0")
 
 
-def test_async_raise_interrupts_busy_thread():
+def _busy_until_raised(body):
     class Boom(Exception):
         pass
 
@@ -80,9 +81,7 @@ def test_async_raise_interrupts_busy_thread():
         idents.append(threading.get_ident())
         ready.set()
         try:
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                pass
+            body(time.monotonic() + 5)
         except Boom:
             caught.append(True)
 
@@ -91,7 +90,23 @@ def test_async_raise_interrupts_busy_thread():
     ready.wait()
     assert _native.async_raise(idents[0], Boom) == 1
     th.join(5)
-    assert caught == [True]
+    return caught
+
+
+def test_async_raise_interrupts_busy_thread():
+    def body(deadline):
+        while time.monotonic() < deadline:
+            x = sum((1, 2))  # noqa: F841
+    assert _busy_until_raised(body) == [True]
+
+
+@pytest.mark.skipif(sys.version_info < (3, 14), reason="CPython 3.13 can deliver an async exception "
+                    "outside the enclosing try when it lands in a while loop with an empty body")
+def test_async_raise_interrupts_empty_busy_loop():
+    def body(deadline):
+        while time.monotonic() < deadline:
+            pass
+    assert _busy_until_raised(body) == [True]
 
 
 def test_async_raise_unknown_thread_returns_zero():

@@ -67,6 +67,9 @@ def crunch(): ...
 - **Soft limit:** `mayu.SoftTimeLimitExceeded` is raised inside the task at its next Python
   bytecode, so it can be caught to clean up. It **cannot interrupt blocking C calls or socket
   reads**: set timeouts on network clients.
+- On Python 3.13 a soft limit that lands in a `while` loop with an empty body can escape the
+  task's `try`/`except` (a CPython 3.13 bug, fixed in 3.14). The task then fails with
+  `SoftTimeLimitExceeded` without running its cleanup.
 - **Hard limit:** Python threads cannot be killed. The task is recorded as failed with
   `mayu.TimeLimitExceeded` (retried if it is in `retry_on`), its thread is abandoned as a
   *zombie*, and a replacement thread takes over. Whatever the zombie produces later is discarded.
@@ -209,7 +212,11 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop --uv
 .venv/bin/pytest
 uv venv --python 3.14+gil .venv-gil && uv pip install --python .venv-gil/bin/python maturin pytest msgpack
 VIRTUAL_ENV=$PWD/.venv-gil .venv-gil/bin/maturin develop --uv
-scripts/test-all.sh                                   # everything, both builds
+scripts/matrix.sh                                     # CI matrix, Linux legs: ft (3.14t), gil (3.14), py313 (3.13)
+scripts/matrix.sh py313                               # one leg
+scripts/test-all.sh                                   # Rust + matrix + chaos
 ```
+
+macOS (in the spec's CI matrix) is not covered by the local matrix.
 
 Design: `docs/specs/2026-10-11-mayu-architecture-design.md`.
