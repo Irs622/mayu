@@ -274,3 +274,98 @@ fn rejects_zero_intervals() {
     let c = RuntimeConfig { visibility_timeout_ms: 0, ..cfg(1, 1) };
     assert!(Runtime::start(move || async move { Ok(m) }, c).is_err());
 }
+
+fn two_queues(strict: bool, concurrency: usize, prefetch: usize) -> RuntimeConfig {
+    RuntimeConfig { queues: vec!["hi".into(), "lo".into()], strict_priority: strict, ..cfg(concurrency, prefetch) }
+}
+
+fn limited(rate: f64, concurrency: usize, prefetch: usize) -> RuntimeConfig {
+    RuntimeConfig { rate_limits: [("slow".to_string(), rate)].into(), ..cfg(concurrency, prefetch) }
+}
+
+#[test]
+fn strict_priority_runs_a_later_claimed_higher_queue_first() {
+    let mem = MemoryBroker::default();
+    for _ in 0..3 { mem.push(&Header::new("t", "lo", 0, "ct"), b""); }
+    let rt = start(&mem, two_queues(true, 1, 8));
+    wait_until(|| mem.pending_len() == 3);
+    mem.push(&Header::new("t", "hi", 0, "ct"), b"");
+    wait_until(|| mem.pending_len() == 4);
+    assert_eq!(rt.recv_timeout(RECV).unwrap().queue, "hi");
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn equal_priority_takes_turns_between_queues() {
+    let mem = MemoryBroker::default();
+    for _ in 0..4 {
+        mem.push(&Header::new("t", "hi", 0, "ct"), b"");
+        mem.push(&Header::new("t", "lo", 0, "ct"), b"");
+    }
+    let rt = start(&mem, two_queues(false, 1, 1));
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        let t = rt.recv_timeout(RECV).unwrap();
+        seen.push(t.queue.clone());
+        rt.complete(t.token, Outcome::Success { result: None });
+    }
+    assert!(seen.iter().any(|q| q == "hi") && seen.iter().any(|q| q == "lo"), "{seen:?}");
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn rate_limit_spaces_task_starts() {
+    let mem = MemoryBroker::default();
+    for _ in 0..3 { mem.push(&Header::new("slow", "q", 0, "ct"), b""); }
+    let rt = start(&mem, limited(10.0, 4, 4));
+    let mut at = Vec::new();
+    for _ in 0..3 {
+        let t = rt.recv_timeout(RECV).unwrap();
+        at.push(Instant::now());
+        rt.complete(t.token, Outcome::Success { result: None });
+    }
+    for w in at.windows(2) {
+        assert!(w[1] - w[0] >= Duration::from_millis(80), "starts {:?} apart", w[1] - w[0]);
+    }
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn rate_limited_backlog_goes_back_to_the_broker_and_frees_prefetch() {
+    let mem = MemoryBroker::default();
+    for _ in 0..3 { mem.push(&Header::new("slow", "q", 0, "ct"), b""); }
+    mem.push(&Header::new("fast", "q", 0, "ct"), b"");
+    // one prefetch slot: without deferral the second "slow" would hold it for 2 s
+    let rt = start(&mem, limited(0.5, 1, 1));
+    let first = rt.recv_timeout(RECV).unwrap();
+    assert_eq!(first.task, "slow");
+    rt.complete(first.token, Outcome::Success { result: None });
+    let t = Instant::now();
+    let next = rt.recv_timeout(RECV).unwrap();
+    assert_eq!(next.task, "fast", "an unthrottled task must not wait behind the throttled backlog");
+    assert!(t.elapsed() < Duration::from_secs(1));
+    assert_eq!(mem.delayed_len("q"), 2);
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn shutdown_requeues_tasks_waiting_on_the_rate_limit() {
+    let mem = MemoryBroker::default();
+    for _ in 0..2 { mem.push(&Header::new("slow", "q", 0, "ct"), b""); }
+    let rt = start(&mem, limited(2.0, 2, 2));
+    let _running = rt.recv_timeout(RECV).unwrap();
+    wait_until(|| mem.pending_len() == 2); // the second is claimed and waiting for its slot
+    let t = Instant::now();
+    rt.shutdown(Duration::from_secs(1));
+    assert!(t.elapsed() < Duration::from_millis(900), "shutdown waited for the rate limit");
+    assert_eq!(mem.stream_len("q"), 1, "the waiting task went back to the queue");
+    assert_eq!(mem.pending_len(), 1, "the running one stays pending for reclaim");
+}
+
+#[test]
+fn rejects_unusable_rate_limits() {
+    let mem = MemoryBroker::default();
+    let m = mem.clone();
+    let r = Runtime::start(move || async move { Ok(m) }, limited(0.0, 1, 1));
+    assert!(matches!(r, Err(mayu_core::Error::Config(_))));
+}

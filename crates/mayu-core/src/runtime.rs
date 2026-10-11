@@ -3,11 +3,11 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender, bounded};
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
+use crate::dispatch::{Admit, Dispatcher, ReadyQueue};
 use crate::broker::{Broker, Delivery, StoredResult, WorkerInfo};
 use crate::envelope::{Header, now_ms};
 use crate::error::{Error, Result};
@@ -33,6 +33,10 @@ pub struct RuntimeConfig {
     pub reclaim_interval_ms: u64,
     pub heartbeat_interval_ms: u64,
     pub max_deliveries: u64,
+    /// Earlier `queues` run first (strict). Otherwise all queues rank equally.
+    pub strict_priority: bool,
+    /// Task name -> starts per second, per worker process.
+    pub rate_limits: HashMap<String, f64>,
 }
 
 impl Default for RuntimeConfig {
@@ -50,6 +54,8 @@ impl Default for RuntimeConfig {
             reclaim_interval_ms: 5_000,
             heartbeat_interval_ms: 5_000,
             max_deliveries: 5,
+            strict_priority: false,
+            rate_limits: HashMap::new(),
         }
     }
 }
@@ -103,7 +109,7 @@ pub struct Runtime<B: Broker> {
     rt: tokio::runtime::Runtime,
     broker: Arc<B>,
     worker_id: String,
-    ready_rx: Receiver<ReadyTask>,
+    ready: Arc<ReadyQueue>,
     complete_tx: RwLock<Option<mpsc::UnboundedSender<(u64, Outcome)>>>,
     stop_tx: watch::Sender<bool>,
     inflight: Inflight,
@@ -125,6 +131,7 @@ impl<B: Broker> Runtime<B> {
         if cfg.visibility_timeout_ms == 0 || cfg.reclaim_interval_ms == 0 || cfg.heartbeat_interval_ms == 0 {
             return Err(Error::Config("visibility, reclaim and heartbeat intervals must be > 0".into()));
         }
+        let dispatcher = Dispatcher::new(&cfg.queues, cfg.strict_priority, &cfg.rate_limits)?;
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("mayu-rt")
@@ -138,7 +145,7 @@ impl<B: Broker> Runtime<B> {
         })?);
 
         let cap = cfg.concurrency * cfg.prefetch_multiplier;
-        let (ready_tx, ready_rx) = bounded(cap);
+        let ready = Arc::new(ReadyQueue::new(dispatcher));
         let (complete_tx, complete_rx) = mpsc::unbounded_channel();
         let (stop_tx, stop_rx) = watch::channel(false);
         let sem = Arc::new(Semaphore::new(cap));
@@ -151,7 +158,8 @@ impl<B: Broker> Runtime<B> {
             batch: cap,
             block_ms: cfg.fetch_block_ms,
             inflight: inflight.clone(),
-            ready_tx,
+            ready: ready.clone(),
+            strict_priority: cfg.strict_priority,
             stop: stop_rx.clone(),
             visibility_ms: cfg.visibility_timeout_ms,
             reclaim_interval: Duration::from_millis(cfg.reclaim_interval_ms),
@@ -189,7 +197,7 @@ impl<B: Broker> Runtime<B> {
             rt,
             broker,
             worker_id: cfg.worker_id,
-            ready_rx,
+            ready,
             complete_tx: RwLock::new(Some(complete_tx)),
             stop_tx,
             inflight,
@@ -202,7 +210,7 @@ impl<B: Broker> Runtime<B> {
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> Option<ReadyTask> {
-        let task = self.ready_rx.recv_timeout(timeout).ok()?;
+        let task = self.ready.recv_timeout(timeout)?;
         if *self.stop_tx.borrow() {
             // Fetched by a read that was already in flight when fetching stopped: don't start new
             // work while stopping; give it back to the queue (as `shutdown` does for the rest).
@@ -237,7 +245,7 @@ impl<B: Broker> Runtime<B> {
         self.rt.block_on(async {
             let _ = h.fetch.await;
             let _ = h.promote.await;
-            let leftovers: Vec<ReadyTask> = self.ready_rx.try_iter().collect();
+            let leftovers = self.ready.drain();
             for t in leftovers {
                 let f = self.inflight.lock().unwrap().remove(&t.token);
                 if let Some(f) = f {
@@ -294,7 +302,8 @@ struct FetchCtx<B> {
     batch: usize,
     block_ms: u64,
     inflight: Inflight,
-    ready_tx: Sender<ReadyTask>,
+    ready: Arc<ReadyQueue>,
+    strict_priority: bool,
     stop: watch::Receiver<bool>,
     visibility_ms: u64,
     reclaim_interval: Duration,
@@ -306,6 +315,7 @@ async fn fetch_loop<B: Broker>(mut c: FetchCtx<B>) {
     let mut next_token: u64 = 1;
     let mut next_reclaim = Instant::now();
     let mut cursors: HashMap<String, String> = HashMap::new();
+    let mut order = c.queues.clone();
     loop {
         let permit = tokio::select! {
             p = c.sem.clone().acquire_owned() => match p { Ok(p) => p, Err(_) => return },
@@ -325,8 +335,11 @@ async fn fetch_loop<B: Broker>(mut c: FetchCtx<B>) {
             got = reclaim_due(&c, &mut cursors, n).await;
         }
         if got.is_empty() {
+            if !c.strict_priority {
+                order.rotate_left(1); // equal priority: queues take turns being claimed from first
+            }
             // Not cancelled on stop: a cancelled XREADGROUP could claim messages we never see.
-            match c.broker.fetch(&c.queues, n, c.block_ms).await {
+            match c.broker.fetch(&order, n, c.block_ms).await {
                 Ok(d) => got = d,
                 Err(e) => {
                     tracing::warn!(error = %e, "fetch failed; backing off");
@@ -340,15 +353,44 @@ async fn fetch_loop<B: Broker>(mut c: FetchCtx<B>) {
             }
         }
         c.sem.add_permits(n.saturating_sub(got.len()));
+        let overshoot = got.len().saturating_sub(n);
         for d in got {
             let token = next_token;
             next_token += 1;
             let task = ReadyTask::from_delivery(token, &d);
             c.inflight.lock().unwrap().insert(token, InFlight { delivery: d, last_claim: Instant::now(), lost: false });
-            // Never blocks: channel capacity equals the permit count.
-            if c.ready_tx.send(task).is_err() { return; }
+            if let Admit::Defer { task, delay } = c.ready.push(task, Instant::now()) {
+                defer(&c, task, delay).await;
+            }
+        }
+        if overshoot > 0 {
+            // A blocking read across queues may claim up to one entry per queue beyond `n`: take
+            // those permits back before claiming more, so in-flight work stays bounded.
+            tokio::select! {
+                p = c.sem.clone().acquire_many_owned(overshoot as u32) => match p {
+                    Ok(p) => p.forget(),
+                    Err(_) => return,
+                },
+                _ = c.stop.wait_for(|s| *s) => return,
+            }
         }
         if *c.stop.borrow() { return; }
+    }
+}
+
+/// Returns a throttled task to the broker's delayed set (attempt unchanged), freeing its slot.
+/// If the broker is unreachable it is held here until its slot instead.
+async fn defer<B: Broker>(c: &FetchCtx<B>, task: ReadyTask, delay: Duration) {
+    let Some(f) = c.inflight.lock().unwrap().remove(&task.token) else { return };
+    let mut header = f.delivery.header.clone();
+    header.eta = Some(now_ms().saturating_add(delay.as_millis() as u64));
+    match c.broker.retry(&f.delivery, &header).await {
+        Ok(()) => c.sem.add_permits(1),
+        Err(e) => {
+            tracing::warn!(error = %e, task_id = %header.id, "deferring a rate-limited task failed; holding it");
+            c.inflight.lock().unwrap().insert(task.token, f);
+            c.ready.hold(task, Instant::now() + delay);
+        }
     }
 }
 

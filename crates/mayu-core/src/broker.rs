@@ -42,6 +42,8 @@ pub struct Reclaimed {
 pub trait Broker: Send + Sync + 'static {
     fn ensure_queues(&self, queues: &[String]) -> impl Future<Output = Result<()>> + Send;
     fn enqueue(&self, header: &Header, payload: &[u8]) -> impl Future<Output = Result<()>> + Send;
+    /// Claims new entries: at most `count` in total when entries are ready, earlier `queues` first.
+    /// When none are ready it blocks up to `block_ms` and may return up to one entry per queue.
     fn fetch(&self, queues: &[String], count: usize, block_ms: u64)
         -> impl Future<Output = Result<Vec<Delivery>>> + Send;
     fn ack(&self, d: &Delivery, result: Option<StoredResult>) -> impl Future<Output = Result<()>> + Send;

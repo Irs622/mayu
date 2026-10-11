@@ -113,14 +113,11 @@ impl Dispatcher {
 }
 
 /// The dispatcher shared by the fetch loop (push) and the Python threads (blocking pop).
-// Task 2 wires this into the runtime; drop the allow then.
-#[allow(dead_code)]
 pub(crate) struct ReadyQueue {
     inner: Mutex<Dispatcher>,
     cv: Condvar,
 }
 
-#[allow(dead_code)]
 impl ReadyQueue {
     pub(crate) fn new(d: Dispatcher) -> Self {
         ReadyQueue { inner: Mutex::new(d), cv: Condvar::new() }
@@ -152,6 +149,9 @@ impl ReadyQueue {
                 return Some(t);
             }
             if now >= deadline {
+                if !d.is_empty() {
+                    self.cv.notify_one(); // we may have consumed a wake meant for a newly held task
+                }
                 return None;
             }
             let wake = d.next_due().map_or(deadline, |n| n.min(deadline));
