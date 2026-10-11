@@ -74,7 +74,7 @@ impl Client {
     }
 
     fn queue_stats<'py>(&self, py: Python<'py>, queue: &str) -> PyResult<Bound<'py, PyDict>> {
-        let s = py.detach(|| self.rt.block_on(self.broker.stats(queue))).map_err(rt_err)?;
+        let s = py.detach(|| self.rt.block_on(self.broker.queue_stats(queue))).map_err(rt_err)?;
         let d = PyDict::new(py);
         d.set_item("stream", s.stream)?;
         d.set_item("pending", s.pending)?;

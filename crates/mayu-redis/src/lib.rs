@@ -80,20 +80,6 @@ impl RedisBroker {
         })
     }
 
-    pub async fn stats(&self, queue: &str) -> Result<QueueStats> {
-        let mut c = self.conn.clone();
-        let stream: u64 = redis::cmd("XLEN").arg(stream_key(queue)).query_async(&mut c).await.map_err(be)?;
-        let delayed: u64 = redis::cmd("ZCARD").arg(delayed_key(queue)).query_async(&mut c).await.map_err(be)?;
-        let dead: u64 = redis::cmd("XLEN").arg(dead_key(queue)).query_async(&mut c).await.map_err(be)?;
-        let pending = match redis::cmd("XPENDING").arg(stream_key(queue)).arg(GROUP)
-            .query_async::<Value>(&mut c).await
-        {
-            Ok(Value::Array(v)) => match v.first() { Some(Value::Int(n)) => *n as u64, _ => 0 },
-            _ => 0, // no group yet
-        };
-        Ok(QueueStats { stream, pending, delayed, dead })
-    }
-
     async fn dead_raw(&self, queue: &str, stream_id: &str, h: &[u8], p: &[u8], error: &str,
                       result: Option<StoredResult>) -> Result<()> {
         let (flag, id, record, ttl) = match result {
@@ -392,6 +378,20 @@ impl Broker for RedisBroker {
     async fn get_result(&self, id: &str) -> Result<Option<Vec<u8>>> {
         redis::cmd("GET").arg(result_key(id))
             .query_async(&mut self.conn.clone()).await.map_err(be)
+    }
+
+    async fn queue_stats(&self, queue: &str) -> Result<QueueStats> {
+        let mut c = self.conn.clone();
+        let stream: u64 = redis::cmd("XLEN").arg(stream_key(queue)).query_async(&mut c).await.map_err(be)?;
+        let delayed: u64 = redis::cmd("ZCARD").arg(delayed_key(queue)).query_async(&mut c).await.map_err(be)?;
+        let dead: u64 = redis::cmd("XLEN").arg(dead_key(queue)).query_async(&mut c).await.map_err(be)?;
+        let pending = match redis::cmd("XPENDING").arg(stream_key(queue)).arg(GROUP)
+            .query_async::<Value>(&mut c).await
+        {
+            Ok(Value::Array(v)) => match v.first() { Some(Value::Int(n)) => *n as u64, _ => 0 },
+            _ => 0, // no group yet
+        };
+        Ok(QueueStats { stream, pending, delayed, dead })
     }
 
     async fn extend(&self, queue: &str, stream_ids: &[String]) -> Result<Vec<String>> {

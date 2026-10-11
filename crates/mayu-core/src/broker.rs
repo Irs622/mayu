@@ -72,6 +72,8 @@ pub trait Broker: Send + Sync + 'static {
     fn requeue(&self, d: &Delivery) -> impl Future<Output = Result<()>> + Send;
     fn promote(&self, queue: &str, now_ms: u64, limit: usize) -> impl Future<Output = Result<usize>> + Send;
     fn get_result(&self, id: &str) -> impl Future<Output = Result<Option<Vec<u8>>>> + Send;
+    /// Depth of `queue`: stream entries (unclaimed + claimed), claimed, delayed, dead.
+    fn queue_stats(&self, queue: &str) -> impl Future<Output = Result<QueueStats>> + Send;
     /// Resets idle time on entries this consumer still owns; returns the ids it no longer owns.
     fn extend(&self, queue: &str, stream_ids: &[String]) -> impl Future<Output = Result<Vec<String>>> + Send;
     /// Claims entries idle for at least `min_idle_ms` (their worker died).

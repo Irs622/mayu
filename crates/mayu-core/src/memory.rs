@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
-use crate::broker::{Broker, Delivery, Reclaimed, StoredResult, WorkerInfo};
+use crate::broker::{Broker, Delivery, QueueStats, Reclaimed, StoredResult, WorkerInfo};
 use crate::envelope::{Header, decode_header, encode_header, now_ms};
 use crate::error::{Error, Result};
 
@@ -261,6 +261,18 @@ impl Broker for MemoryBroker {
     async fn get_result(&self, id: &str) -> Result<Option<Vec<u8>>> {
         self.check()?;
         Ok(self.result(id))
+    }
+
+    async fn queue_stats(&self, queue: &str) -> Result<QueueStats> {
+        self.check()?;
+        let s = self.state.lock().unwrap();
+        let pending = s.pending.values().filter(|p| p.queue == queue).count() as u64;
+        Ok(QueueStats {
+            stream: s.streams.get(queue).map_or(0, |q| q.len() as u64) + pending,
+            pending,
+            delayed: s.delayed.get(queue).map_or(0, |d| d.len() as u64),
+            dead: s.dead.iter().filter(|d| d.queue == queue).count() as u64,
+        })
     }
 
     async fn extend(&self, _queue: &str, stream_ids: &[String]) -> Result<Vec<String>> {

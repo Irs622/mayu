@@ -2,6 +2,7 @@ pub mod broker;
 pub mod dispatch;
 pub mod envelope;
 pub mod error;
+mod http;
 pub mod memory;
 pub mod metrics;
 pub mod policy;

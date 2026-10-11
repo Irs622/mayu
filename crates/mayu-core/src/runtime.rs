@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,7 @@ use crate::dispatch::{Admit, Dispatcher, ReadyQueue};
 use crate::broker::{Broker, Delivery, StoredResult, WorkerInfo};
 use crate::envelope::{Header, now_ms};
 use crate::error::{Error, Result};
+use crate::metrics::{Gauges, Metrics, Settled};
 use crate::policy::{Action, Outcome, RetryPolicy, decide, full_jitter};
 use crate::result::ResultRecord;
 
@@ -18,6 +20,8 @@ use crate::result::ResultRecord;
 const PRUNE_EVERY_TICKS: u64 = 12;
 /// Exit code when a core loop panics (EX_SOFTWARE).
 const PANIC_EXIT_CODE: i32 = 70;
+/// Bound on reading queue depths for one scrape.
+const SCRAPE_BROKER_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -37,6 +41,8 @@ pub struct RuntimeConfig {
     pub strict_priority: bool,
     /// Task name -> starts per second, per worker process.
     pub rate_limits: HashMap<String, f64>,
+    /// Serve Prometheus metrics here (`GET /metrics`). Port 0 picks a free port.
+    pub metrics_addr: Option<SocketAddr>,
 }
 
 impl Default for RuntimeConfig {
@@ -56,6 +62,7 @@ impl Default for RuntimeConfig {
             max_deliveries: 5,
             strict_priority: false,
             rate_limits: HashMap::new(),
+            metrics_addr: None,
         }
     }
 }
@@ -93,6 +100,8 @@ struct InFlight {
     last_claim: Instant,
     /// Another worker reclaimed it; stop extending.
     lost: bool,
+    /// When a Python thread took it; None while it waits in the dispatcher.
+    started: Option<Instant>,
 }
 
 type Inflight = Arc<Mutex<HashMap<u64, InFlight>>>;
@@ -103,6 +112,7 @@ struct Handles {
     promote: JoinHandle<()>,
     keepalive: JoinHandle<()>,
     heartbeat: JoinHandle<()>,
+    metrics: Option<JoinHandle<()>>,
 }
 
 pub struct Runtime<B: Broker> {
@@ -113,6 +123,8 @@ pub struct Runtime<B: Broker> {
     complete_tx: RwLock<Option<mpsc::UnboundedSender<(u64, Outcome)>>>,
     stop_tx: watch::Sender<bool>,
     inflight: Inflight,
+    metrics: Arc<Metrics>,
+    metrics_addr: Option<SocketAddr>,
     handles: Mutex<Option<Handles>>,
 }
 
@@ -138,6 +150,15 @@ impl<B: Broker> Runtime<B> {
             .enable_all()
             .build()
             .map_err(|e| Error::Config(e.to_string()))?;
+        let listener = match cfg.metrics_addr {
+            None => None,
+            Some(addr) => {
+                let l = std::net::TcpListener::bind(addr)
+                    .map_err(|e| Error::Config(format!("cannot serve metrics on {addr}: {e}")))?;
+                l.set_nonblocking(true).map_err(|e| Error::Config(e.to_string()))?;
+                Some(l)
+            }
+        };
         let broker = Arc::new(rt.block_on(async {
             let b = connect().await?;
             b.ensure_queues(&cfg.queues).await?;
@@ -150,6 +171,7 @@ impl<B: Broker> Runtime<B> {
         let (stop_tx, stop_rx) = watch::channel(false);
         let sem = Arc::new(Semaphore::new(cap));
         let inflight: Inflight = Arc::default();
+        let metrics = Arc::new(Metrics::default());
 
         let fetch = rt.spawn(critical("fetch", fetch_loop(FetchCtx {
             broker: broker.clone(),
@@ -165,6 +187,7 @@ impl<B: Broker> Runtime<B> {
             reclaim_interval: Duration::from_millis(cfg.reclaim_interval_ms),
             max_deliveries: cfg.max_deliveries,
             result_ttl: cfg.result_ttl_secs,
+            metrics: metrics.clone(),
         })));
         let complete = rt.spawn(critical("completion", completion_loop(
             broker.clone(),
@@ -174,11 +197,12 @@ impl<B: Broker> Runtime<B> {
             cfg.retry.clone(),
             cfg.result_ttl_secs,
             Duration::from_millis(cfg.visibility_timeout_ms),
+            metrics.clone(),
         )));
         let promote = rt.spawn(critical("promote",
-            promote_loop(broker.clone(), cfg.queues.clone(), cfg.promote_interval_ms, stop_rx)));
+            promote_loop(broker.clone(), cfg.queues.clone(), cfg.promote_interval_ms, stop_rx, metrics.clone())));
         let keepalive = rt.spawn(critical("keepalive",
-            keepalive_loop(broker.clone(), inflight.clone(), cfg.visibility_timeout_ms)));
+            keepalive_loop(broker.clone(), inflight.clone(), cfg.visibility_timeout_ms, metrics.clone())));
         let info = WorkerInfo {
             worker_id: cfg.worker_id.clone(),
             hostname: hostname(),
@@ -191,7 +215,25 @@ impl<B: Broker> Runtime<B> {
         };
         let prune_idle_ms = cfg.visibility_timeout_ms.max(cfg.heartbeat_interval_ms.saturating_mul(3)).saturating_mul(2);
         let heartbeat = rt.spawn(critical("heartbeat",
-            heartbeat_loop(broker.clone(), info, inflight.clone(), cfg.heartbeat_interval_ms, prune_idle_ms)));
+            heartbeat_loop(broker.clone(), info, inflight.clone(), cfg.heartbeat_interval_ms, prune_idle_ms, metrics.clone())));
+        let (metrics_task, metrics_addr) = match listener {
+            None => (None, None),
+            Some(l) => {
+                let addr = l.local_addr().map_err(|e| Error::Config(e.to_string()))?;
+                let l = {
+                    let _guard = rt.enter();
+                    tokio::net::TcpListener::from_std(l).map_err(|e| Error::Config(e.to_string()))?
+                };
+                let (b, m, inf, queues, concurrency) =
+                    (broker.clone(), metrics.clone(), inflight.clone(), cfg.queues.clone(), cfg.concurrency);
+                let render: crate::http::Render = Arc::new(move || {
+                    let (b, m, inf, queues) = (b.clone(), m.clone(), inf.clone(), queues.clone());
+                    Box::pin(async move { scrape(&*b, &m, &inf, &queues, concurrency).await })
+                });
+                // Not `critical`: a broken metrics endpoint must not take the worker down.
+                (Some(rt.spawn(crate::http::serve(l, render))), Some(addr))
+            }
+        };
 
         Ok(Runtime {
             rt,
@@ -201,12 +243,19 @@ impl<B: Broker> Runtime<B> {
             complete_tx: RwLock::new(Some(complete_tx)),
             stop_tx,
             inflight,
-            handles: Mutex::new(Some(Handles { fetch, complete, promote, keepalive, heartbeat })),
+            metrics,
+            metrics_addr,
+            handles: Mutex::new(Some(Handles { fetch, complete, promote, keepalive, heartbeat, metrics: metrics_task })),
         })
     }
 
     pub fn worker_id(&self) -> &str {
         &self.worker_id
+    }
+
+    /// Where `/metrics` is served (the bound port, also when configured with port 0).
+    pub fn metrics_addr(&self) -> Option<SocketAddr> {
+        self.metrics_addr
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> Option<ReadyTask> {
@@ -217,10 +266,14 @@ impl<B: Broker> Runtime<B> {
             let f = self.inflight.lock().unwrap().remove(&task.token);
             if let Some(f) = f {
                 if let Err(e) = self.rt.block_on(self.broker.requeue(&f.delivery)) {
+                    self.metrics.broker_error("requeue");
                     tracing::warn!(error = %e, task_id = %f.delivery.header.id, "requeue after stop failed");
                 }
             }
             return None;
+        }
+        if let Some(f) = self.inflight.lock().unwrap().get_mut(&task.token) {
+            f.started = Some(Instant::now());
         }
         Some(task)
     }
@@ -250,6 +303,7 @@ impl<B: Broker> Runtime<B> {
                 let f = self.inflight.lock().unwrap().remove(&t.token);
                 if let Some(f) = f {
                     if let Err(e) = self.broker.requeue(&f.delivery).await {
+                        self.metrics.broker_error("requeue");
                         tracing::warn!(error = %e, task_id = %f.delivery.header.id, "requeue on shutdown failed");
                     }
                 }
@@ -263,6 +317,10 @@ impl<B: Broker> Runtime<B> {
             h.heartbeat.abort();
             let _ = h.keepalive.await;
             let _ = h.heartbeat.await;
+            if let Some(m) = h.metrics {
+                m.abort();
+                let _ = m.await;
+            }
             if let Err(e) = self.broker.unregister(&self.worker_id).await {
                 tracing::warn!(error = %e, "unregistering worker failed");
             }
@@ -309,6 +367,7 @@ struct FetchCtx<B> {
     reclaim_interval: Duration,
     max_deliveries: u64,
     result_ttl: Option<u64>,
+    metrics: Arc<Metrics>,
 }
 
 async fn fetch_loop<B: Broker>(mut c: FetchCtx<B>) {
@@ -342,6 +401,7 @@ async fn fetch_loop<B: Broker>(mut c: FetchCtx<B>) {
             match c.broker.fetch(&order, n, c.block_ms).await {
                 Ok(d) => got = d,
                 Err(e) => {
+                    c.metrics.broker_error("fetch");
                     tracing::warn!(error = %e, "fetch failed; backing off");
                     c.sem.add_permits(n);
                     tokio::select! {
@@ -355,10 +415,11 @@ async fn fetch_loop<B: Broker>(mut c: FetchCtx<B>) {
         c.sem.add_permits(n.saturating_sub(got.len()));
         let overshoot = got.len().saturating_sub(n);
         for d in got {
+            c.metrics.received(&d.queue, &d.header.task);
             let token = next_token;
             next_token += 1;
             let task = ReadyTask::from_delivery(token, &d);
-            c.inflight.lock().unwrap().insert(token, InFlight { delivery: d, last_claim: Instant::now(), lost: false });
+            c.inflight.lock().unwrap().insert(token, InFlight { delivery: d, last_claim: Instant::now(), lost: false, started: None });
             if let Admit::Defer { task, delay } = c.ready.push(task, Instant::now()) {
                 defer(&c, task, delay).await;
             }
@@ -385,8 +446,12 @@ async fn defer<B: Broker>(c: &FetchCtx<B>, task: ReadyTask, delay: Duration) {
     let mut header = f.delivery.header.clone();
     header.eta = Some(now_ms().saturating_add(delay.as_millis() as u64));
     match c.broker.retry(&f.delivery, &header).await {
-        Ok(()) => c.sem.add_permits(1),
+        Ok(()) => {
+            c.metrics.deferred(&task.queue, &task.task);
+            c.sem.add_permits(1)
+        }
         Err(e) => {
+            c.metrics.broker_error("defer");
             tracing::warn!(error = %e, task_id = %header.id, "deferring a rate-limited task failed; holding it");
             c.inflight.lock().unwrap().insert(task.token, f);
             c.ready.hold(task, Instant::now() + delay);
@@ -409,11 +474,15 @@ async fn reclaim_due<B: Broker>(c: &FetchCtx<B>, cursors: &mut HashMap<String, S
                         bury_poison(c, &d).await;
                     } else {
                         tracing::info!(task_id = %d.header.id, deliveries = d.delivery_count, "reclaimed abandoned task");
+                        c.metrics.reclaimed(q);
                         got.push(d);
                     }
                 }
             }
-            Err(e) => tracing::warn!(error = %e, queue = %q, "reclaim failed"),
+            Err(e) => {
+                c.metrics.broker_error("reclaim");
+                tracing::warn!(error = %e, queue = %q, "reclaim failed");
+            }
         }
     }
     got
@@ -426,8 +495,12 @@ async fn bury_poison<B: Broker>(c: &FetchCtx<B>, d: &Delivery) {
         record: ResultRecord::failure(&error, "", &d.header.content_type).encode(),
         ttl_secs,
     });
-    if let Err(e) = c.broker.dead_letter(d, &error, stored).await {
-        tracing::error!(error = %e, task_id = %d.header.id, "failed to dead-letter poison message");
+    match c.broker.dead_letter(d, &error, stored).await {
+        Ok(()) => c.metrics.settled(&d.queue, &d.header.task, Settled::Dead, None),
+        Err(e) => {
+            c.metrics.broker_error("dead_letter");
+            tracing::error!(error = %e, task_id = %d.header.id, "failed to dead-letter poison message");
+        }
     }
 }
 
@@ -446,6 +519,7 @@ async fn record<B: Broker>(broker: &B, d: &Delivery, r: &Record) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn completion_loop<B: Broker>(
     broker: Arc<B>,
     mut rx: mpsc::UnboundedReceiver<(u64, Outcome)>,
@@ -454,10 +528,12 @@ async fn completion_loop<B: Broker>(
     retry: RetryPolicy,
     ttl: Option<u64>,
     record_deadline: Duration,
+    metrics: Arc<Metrics>,
 ) {
     while let Some((token, outcome)) = rx.recv().await {
         // Unknown token: a zombie finished after its message was settled. Drop it.
         let Some(f) = inflight.lock().unwrap().remove(&token) else { continue };
+        let started = f.started;
         let d = f.delivery;
         let ct = d.header.content_type.clone();
         let rec = match decide(&d.header, outcome, &retry, now_ms(), full_jitter) {
@@ -488,18 +564,29 @@ async fn completion_loop<B: Broker>(
                 Record::Dead(error, stored)
             }
         };
+        let how = match &rec {
+            Record::Ack(..) => Settled::Success,
+            Record::Retry(_) => Settled::Retry,
+            Record::Dead(..) => Settled::Dead,
+        };
         // Buffer through broker outages (bounded by the prefetch permits this message holds).
-        let started = Instant::now();
+        let began = Instant::now();
         let mut delay = Duration::from_millis(100);
         loop {
             match record(&*broker, &d, &rec).await {
-                Ok(()) => break,
-                Err(e) if started.elapsed() + delay < record_deadline => {
+                Ok(()) => {
+                    metrics.settled(&d.queue, &d.header.task, how, started.map(|s| s.elapsed()));
+                    log_settled(&d, &rec);
+                    break;
+                }
+                Err(e) if began.elapsed() + delay < record_deadline => {
+                    metrics.broker_error("record");
                     tracing::warn!(error = %e, task_id = %d.header.id, "recording outcome failed; retrying");
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(Duration::from_secs(5));
                 }
                 Err(e) => {
+                    metrics.broker_error("record");
                     tracing::error!(error = %e, task_id = %d.header.id,
                         "giving up recording outcome; the message will be reclaimed and run again");
                     break;
@@ -510,11 +597,21 @@ async fn completion_loop<B: Broker>(
     }
 }
 
+fn log_settled(d: &Delivery, rec: &Record) {
+    let (id, task, queue) = (&d.header.id, &d.header.task, &d.queue);
+    match rec {
+        Record::Ack(..) => tracing::debug!(task_id = %id, task = %task, queue = %queue, "task succeeded"),
+        Record::Retry(h) => tracing::info!(task_id = %id, task = %task, queue = %queue, attempt = h.attempt, "task will retry"),
+        Record::Dead(error, _) => tracing::warn!(task_id = %id, task = %task, queue = %queue, error = %error, "task failed; dead-lettered"),
+    }
+}
+
 async fn promote_loop<B: Broker>(
     broker: Arc<B>,
     queues: Vec<String>,
     interval_ms: u64,
     mut stop: watch::Receiver<bool>,
+    metrics: Arc<Metrics>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(interval_ms.max(1)));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -525,6 +622,7 @@ async fn promote_loop<B: Broker>(
         }
         for q in &queues {
             if let Err(e) = broker.promote(q, now_ms(), 1_000).await {
+                metrics.broker_error("promote");
                 tracing::warn!(error = %e, queue = %q, "promote failed");
             }
         }
@@ -532,7 +630,7 @@ async fn promote_loop<B: Broker>(
 }
 
 /// Re-claims messages this worker holds before they look abandoned (spec §4.4 step 4).
-async fn keepalive_loop<B: Broker>(broker: Arc<B>, inflight: Inflight, visibility_ms: u64) {
+async fn keepalive_loop<B: Broker>(broker: Arc<B>, inflight: Inflight, visibility_ms: u64, metrics: Arc<Metrics>) {
     let threshold = Duration::from_millis(visibility_ms / 2);
     let mut tick = tokio::time::interval(Duration::from_millis((visibility_ms / 4).max(10)));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -565,7 +663,10 @@ async fn keepalive_loop<B: Broker>(broker: Arc<B>, inflight: Inflight, visibilit
                         }
                     }
                 }
-                Err(e) => tracing::warn!(error = %e, queue = %queue, "extending ownership failed"),
+                Err(e) => {
+                    metrics.broker_error("extend");
+                    tracing::warn!(error = %e, queue = %queue, "extending ownership failed");
+                }
             }
         }
     }
@@ -577,6 +678,7 @@ async fn heartbeat_loop<B: Broker>(
     inflight: Inflight,
     interval_ms: u64,
     prune_idle_ms: u64,
+    metrics: Arc<Metrics>,
 ) {
     let ttl_ms = interval_ms.saturating_mul(3);
     let mut tick = tokio::time::interval(Duration::from_millis(interval_ms.max(10)));
@@ -588,15 +690,41 @@ async fn heartbeat_loop<B: Broker>(
         info.inflight = inflight.lock().unwrap().len();
         info.last_seen = now_ms();
         if let Err(e) = broker.heartbeat(&info, ttl_ms).await {
+            metrics.broker_error("heartbeat");
             tracing::warn!(error = %e, "heartbeat failed");
         }
         if beats % PRUNE_EVERY_TICKS == 0 {
             for q in &info.queues {
                 if let Err(e) = broker.prune_consumers(q, prune_idle_ms).await {
+                    metrics.broker_error("prune");
                     tracing::warn!(error = %e, queue = %q, "pruning consumers failed");
                 }
             }
         }
         beats += 1;
     }
+}
+
+/// One `/metrics` body: counters, process gauges, and queue depths if the broker answers in time.
+async fn scrape<B: Broker>(broker: &B, metrics: &Metrics, inflight: &Inflight, queues: &[String], concurrency: usize) -> String {
+    let (n, running) = {
+        let m = inflight.lock().unwrap();
+        (m.len(), m.values().filter(|f| f.started.is_some()).count())
+    };
+    let mut stats = Vec::with_capacity(queues.len());
+    for q in queues {
+        match tokio::time::timeout(SCRAPE_BROKER_TIMEOUT, broker.queue_stats(q)).await {
+            Ok(Ok(s)) => stats.push((q.clone(), s)),
+            failed => {
+                metrics.broker_error("stats");
+                match failed {
+                    Ok(Err(e)) => tracing::warn!(error = %e, queue = %q, "reading queue depth for metrics failed"),
+                    _ => tracing::warn!(queue = %q, "reading queue depth for metrics timed out"),
+                }
+                stats.clear(); // all or nothing: a partial set of queues would mislead
+                break;
+            }
+        }
+    }
+    metrics.render(&Gauges { concurrency, inflight: n, running, queues: stats })
 }

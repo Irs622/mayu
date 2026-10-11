@@ -26,7 +26,7 @@ async fn enqueue_fetch_roundtrip() {
     assert_eq!(ds[0].header, h);
     assert_eq!(ds[0].payload, b"payload");
     assert_eq!(ds[0].queue, q);
-    assert_eq!(b.stats(&q).await.unwrap().pending, 1);
+    assert_eq!(b.queue_stats(&q).await.unwrap().pending, 1);
 }
 
 #[tokio::test]
@@ -59,7 +59,7 @@ async fn ack_removes_entry_and_stores_result() {
     b.enqueue(&h, b"").await.unwrap();
     let d = b.fetch(&[q.clone()], 1, 100).await.unwrap().remove(0);
     b.ack(&d, Some(StoredResult { id: h.id.clone(), record: b"rec".to_vec(), ttl_secs: 60 }), &[]).await.unwrap();
-    let s = b.stats(&q).await.unwrap();
+    let s = b.queue_stats(&q).await.unwrap();
     assert_eq!((s.stream, s.pending), (0, 0));
     assert_eq!(b.get_result(&h.id).await.unwrap(), Some(b"rec".to_vec()));
 }
@@ -70,7 +70,7 @@ async fn delayed_enqueue_and_promote() {
     let mut h = Header::new("t", &q, 0, "ct");
     h.eta = Some(now_ms() + 60_000);
     b.enqueue(&h, b"p:with:colons").await.unwrap();
-    assert_eq!(b.stats(&q).await.unwrap().delayed, 1);
+    assert_eq!(b.queue_stats(&q).await.unwrap().delayed, 1);
     assert_eq!(b.promote(&q, now_ms(), 100).await.unwrap(), 0);
     assert_eq!(b.promote(&q, now_ms() + 120_000, 100).await.unwrap(), 1);
     let d = b.fetch(&[q.clone()], 1, 100).await.unwrap().remove(0);
@@ -87,7 +87,7 @@ async fn retry_moves_to_delayed_with_new_attempt() {
     next.attempt = 1;
     next.eta = Some(now_ms());
     b.retry(&d, &next).await.unwrap();
-    let s = b.stats(&q).await.unwrap();
+    let s = b.queue_stats(&q).await.unwrap();
     assert_eq!((s.stream, s.pending, s.delayed), (0, 0, 1));
     b.promote(&q, now_ms() + 1, 10).await.unwrap();
     let d2 = b.fetch(&[q.clone()], 1, 100).await.unwrap().remove(0);
@@ -105,7 +105,7 @@ async fn dead_letter_and_requeue() {
     b.dead_letter(&ds[0], "boom", Some(StoredResult { id: h.id.clone(), record: b"f".to_vec(), ttl_secs: 60 }))
         .await.unwrap();
     b.requeue(&ds[1]).await.unwrap();
-    let s = b.stats(&q).await.unwrap();
+    let s = b.queue_stats(&q).await.unwrap();
     assert_eq!((s.dead, s.pending, s.stream), (1, 0, 1));
     assert_eq!(b.get_result(&h.id).await.unwrap(), Some(b"f".to_vec()));
     assert_eq!(b.fetch(&[q], 1, 100).await.unwrap()[0].header, ds[1].header);
@@ -119,7 +119,7 @@ async fn corrupt_header_is_dead_lettered() {
     let _: String = redis::cmd("XADD").arg(stream_key(&q)).arg("*").arg("h").arg("garbage").arg("p").arg("x")
         .query_async(&mut c).await.unwrap();
     assert!(b.fetch(&[q.clone()], 10, 100).await.unwrap().is_empty());
-    let s = b.stats(&q).await.unwrap();
+    let s = b.queue_stats(&q).await.unwrap();
     assert_eq!((s.dead, s.pending, s.stream), (1, 0, 0));
 }
 
@@ -147,7 +147,7 @@ async fn concurrent_promote_never_duplicates() {
     let (a, c) = tokio::join!(b1.promote(&q, later, 7), b2.promote(&q, later, 7));
     let mut total = a.unwrap() + c.unwrap();
     while total < 50 { total += b1.promote(&q, later, 7).await.unwrap(); }
-    let s = b1.stats(&q).await.unwrap();
+    let s = b1.queue_stats(&q).await.unwrap();
     assert_eq!((s.stream, s.delayed, total), (50, 0, 50));
 }
 
@@ -211,7 +211,7 @@ async fn reclaim_dead_letters_corrupt_header() {
         .arg("COUNT").arg(1).arg("STREAMS").arg(stream_key(&q)).arg(">")
         .query_async(&mut c).await.unwrap();
     assert!(b.reclaim(&q, 0, "0-0", 10).await.unwrap().deliveries.is_empty());
-    let s = b.stats(&q).await.unwrap();
+    let s = b.queue_stats(&q).await.unwrap();
     assert_eq!((s.dead, s.pending), (1, 0));
 }
 
@@ -270,8 +270,8 @@ async fn fetch_takes_queues_in_order_and_caps_the_total() {
     let got = b.fetch(&[q2.clone(), q1.clone()], 4, 100).await.unwrap();
     let queues: Vec<&str> = got.iter().map(|d| d.queue.as_str()).collect();
     assert_eq!(queues, vec![q2.as_str(), q2.as_str(), q2.as_str(), q1.as_str()]);
-    assert_eq!(b.stats(&q1).await.unwrap().pending, 1);
-    assert_eq!(b.stats(&q2).await.unwrap().pending, 3);
+    assert_eq!(b.queue_stats(&q1).await.unwrap().pending, 1);
+    assert_eq!(b.queue_stats(&q2).await.unwrap().pending, 3);
 }
 
 #[tokio::test]
@@ -307,7 +307,7 @@ async fn fetch_keeps_claimed_entries_when_a_later_queue_lost_its_group() {
 
     let got = b.fetch(&[q1.clone(), q2.clone()], 10, 100).await.unwrap();
     assert_eq!(got.iter().filter(|d| d.queue == q1).count(), 1, "q1's claimed entry must be returned");
-    assert_eq!(b.stats(&q1).await.unwrap().pending, 1);
+    assert_eq!(b.queue_stats(&q1).await.unwrap().pending, 1);
 
     let got = b.fetch(std::slice::from_ref(&q2), 10, 100).await.unwrap();
     assert_eq!(got.len(), 1, "the recreated group delivers q2's entry");
@@ -319,7 +319,7 @@ async fn fetch_with_zero_count_returns_nothing() {
     let (b, q) = setup().await;
     b.enqueue(&Header::new("t", &q, 0, "ct"), b"").await.unwrap();
     assert!(b.fetch(std::slice::from_ref(&q), 0, 100).await.unwrap().is_empty());
-    assert_eq!(b.stats(&q).await.unwrap().pending, 0);
+    assert_eq!(b.queue_stats(&q).await.unwrap().pending, 0);
 }
 
 #[tokio::test]
