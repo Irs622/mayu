@@ -99,7 +99,11 @@ impl Worker {
         consumer: Option<String>,
     ) -> PyResult<Self> {
         let consumer = consumer.unwrap_or_else(|| format!("w-{}-{}", std::process::id(), ulid::Ulid::generate()));
-        let cfg = RuntimeConfig { queues, concurrency, prefetch_multiplier, result_ttl_secs, ..RuntimeConfig::default() };
+        let cfg = RuntimeConfig {
+            queues, concurrency, prefetch_multiplier, result_ttl_secs,
+            worker_id: consumer.clone(),
+            ..RuntimeConfig::default()
+        };
         let inner = py
             .detach(move || Runtime::start(move || async move { RedisBroker::connect(&url, consumer).await }, cfg))
             .map_err(rt_err)?;
