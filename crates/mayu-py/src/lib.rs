@@ -18,6 +18,19 @@ struct Client {
     broker: RedisBroker,
 }
 
+fn worker_dict<'py>(py: Python<'py>, w: mayu_core::WorkerInfo) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("worker_id", w.worker_id)?;
+    d.set_item("hostname", w.hostname)?;
+    d.set_item("pid", w.pid)?;
+    d.set_item("queues", w.queues)?;
+    d.set_item("concurrency", w.concurrency)?;
+    d.set_item("inflight", w.inflight)?;
+    d.set_item("started_at", w.started_at)?;
+    d.set_item("last_seen", w.last_seen)?;
+    Ok(d)
+}
+
 #[pymethods]
 impl Client {
     #[new]
@@ -60,17 +73,46 @@ impl Client {
 
     fn worker_info<'py>(&self, py: Python<'py>, worker_id: &str) -> PyResult<Option<Bound<'py, PyDict>>> {
         let info = py.detach(|| self.rt.block_on(self.broker.worker_info(worker_id))).map_err(rt_err)?;
-        let Some(w) = info else { return Ok(None) };
-        let d = PyDict::new(py);
-        d.set_item("worker_id", w.worker_id)?;
-        d.set_item("hostname", w.hostname)?;
-        d.set_item("pid", w.pid)?;
-        d.set_item("queues", w.queues)?;
-        d.set_item("concurrency", w.concurrency)?;
-        d.set_item("inflight", w.inflight)?;
-        d.set_item("started_at", w.started_at)?;
-        d.set_item("last_seen", w.last_seen)?;
-        Ok(Some(d))
+        info.map(|w| worker_dict(py, w)).transpose()
+    }
+
+    fn workers<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let ws = py.detach(|| self.rt.block_on(self.broker.workers())).map_err(rt_err)?;
+        ws.into_iter().map(|w| worker_dict(py, w)).collect()
+    }
+
+    fn known_queues(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        py.detach(|| self.rt.block_on(self.broker.known_queues())).map_err(rt_err)
+    }
+
+    #[pyo3(signature = (queue, after=None, until=None, count=100))]
+    fn dead_letters<'py>(&self, py: Python<'py>, queue: &str, after: Option<String>, until: Option<String>,
+                         count: usize) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let items = py.detach(|| self.rt.block_on(
+            self.broker.dead_letters(queue, after.as_deref(), until.as_deref(), count))).map_err(rt_err)?;
+        items.into_iter().map(|e| {
+            let d = PyDict::new(py);
+            d.set_item("entry_id", &e.entry_id)?;
+            d.set_item("dead_at_ms", e.dead_at_ms())?;
+            d.set_item("error", &e.error)?;
+            d.set_item("payload", PyBytes::new(py, &e.payload))?;
+            let h = e.header.as_ref();
+            d.set_item("id", h.map(|h| h.id.clone()))?;
+            d.set_item("task", h.map(|h| h.task.clone()))?;
+            d.set_item("attempt", h.map(|h| h.attempt))?;
+            d.set_item("max_retries", h.map(|h| h.max_retries))?;
+            d.set_item("content_type", h.map(|h| h.content_type.clone()))?;
+            d.set_item("created_at", h.map(|h| h.created_at))?;
+            Ok(d)
+        }).collect()
+    }
+
+    fn last_dead_id(&self, py: Python<'_>, queue: &str) -> PyResult<Option<String>> {
+        py.detach(|| self.rt.block_on(self.broker.last_dead_id(queue))).map_err(rt_err)
+    }
+
+    fn replay_dead(&self, py: Python<'_>, queue: &str, entry_ids: Vec<String>) -> PyResult<usize> {
+        py.detach(|| self.rt.block_on(self.broker.replay_dead(queue, &entry_ids))).map_err(rt_err)
     }
 
     fn queue_stats<'py>(&self, py: Python<'py>, queue: &str) -> PyResult<Bound<'py, PyDict>> {

@@ -45,3 +45,11 @@ def whoami():
 @app.task(name="sample.fail", max_retries=0)
 def fail():
     raise ValueError("sample failure")
+
+
+@app.task(name="sample.flaky_file", max_retries=0)
+def flaky_file(path):
+    """Fails until `path` exists."""
+    if not os.path.exists(path):
+        raise RuntimeError("flag file missing")
+    return "ok"

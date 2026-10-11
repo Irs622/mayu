@@ -1,8 +1,10 @@
 import argparse
 import importlib
+import json
 import logging
 import os
 import sys
+import time
 
 from .app import App
 
@@ -131,6 +133,57 @@ def _cmd_worker(args) -> int:
                              per_child_args=per_child).run()
 
 
+def _load_or_exit(path: str):
+    try:
+        return load_app(path)
+    except (ImportError, AttributeError, ValueError, TypeError) as e:
+        print(f"mayu: cannot load app {path!r}: {e}", file=sys.stderr)
+        return None
+
+
+def _cmd_inspect(args) -> int:
+    from . import admin
+
+    app = _load_or_exit(args.app)
+    if app is None:
+        return 2
+    queues = [q for q in args.queues.split(",") if q] if args.queues else None
+    try:
+        data = admin.inspect(app, queues)
+    except RuntimeError as e:
+        print(f"mayu: {e}", file=sys.stderr)
+        return 1
+    print(json.dumps(data, indent=2) if args.json else admin.format_inspect(data, int(time.time() * 1000)))
+    return 0
+
+
+def _cmd_dead(args) -> int:
+    from . import admin
+
+    if args.limit is not None and args.limit < 1:
+        print("mayu: --limit must be >= 1", file=sys.stderr)
+        return 2
+    app = _load_or_exit(args.app)
+    if app is None:
+        return 2
+    queue = args.queue or app.default_queue
+    try:
+        if args.dead_cmd == "list":
+            entries = admin.dead_list(app, queue, args.limit)
+            if args.json:
+                print(json.dumps([{k: v for k, v in e.items() if k != "payload"} for e in entries], indent=2))
+            else:
+                print(admin.format_dead(entries))
+            return 0
+        replayed, skipped = admin.dead_replay(app, queue, limit=args.limit, ids=args.ids)
+    except RuntimeError as e:
+        print(f"mayu: {e}", file=sys.stderr)
+        return 1
+    note = f" ({skipped} undecodable left in place)" if skipped else ""
+    print(f"replayed {replayed} task(s) from the dead letters of {queue!r}{note}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="mayu")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -162,6 +215,27 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"),
                    type=str.upper, default=(os.environ.get("MAYU_LOG_LEVEL") or "INFO").upper())
     w.set_defaults(func=_cmd_worker)
+
+    i = sub.add_parser("inspect", help="show queue depths and live workers")
+    i.add_argument("app")
+    i.add_argument("--queues", default=None, help="comma-separated; default: the app's queues and any found in Redis")
+    i.add_argument("--json", action="store_true")
+    i.set_defaults(func=_cmd_inspect)
+
+    d = sub.add_parser("dead", help="list or replay dead-lettered tasks")
+    dsub = d.add_subparsers(dest="dead_cmd", required=True)
+    dl = dsub.add_parser("list", help="show dead letters, oldest first")
+    dl.add_argument("app")
+    dl.add_argument("--queue", default=None, help="default: the app's default queue")
+    dl.add_argument("--limit", type=int, default=20)
+    dl.add_argument("--json", action="store_true")
+    dr = dsub.add_parser("replay", help="run dead-lettered tasks again (attempts reset)")
+    dr.add_argument("app")
+    dr.add_argument("--queue", default=None, help="default: the app's default queue")
+    dr.add_argument("--limit", type=int, default=None)
+    dr.add_argument("--id", action="append", dest="ids", metavar="TASK_ID", help="only this task (repeatable)")
+    for p in (dl, dr):
+        p.set_defaults(func=_cmd_dead)
     argv = sys.argv[1:] if argv is None else list(argv)
     args = parser.parse_args(argv)
     args.argv = argv

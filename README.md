@@ -169,6 +169,22 @@ Rust core and Python, with `timestamp`, `level`, `message`, `target` and event f
 tasks are logged at `WARN`, retries at `INFO`, successes at `DEBUG`. When you run `WorkerRunner`
 from your own code, call `mayu.configure_logging("json")` first.
 
+## Inspecting and dead letters
+
+```bash
+mayu inspect tasks:app                      # queue depths (ready, claimed, delayed, dead) and live workers
+mayu inspect tasks:app --json
+mayu dead list tasks:app --queue emails     # oldest first: when, task id, task, attempt, error
+mayu dead replay tasks:app --queue emails   # run them again
+mayu dead replay tasks:app --queue emails --id 01J... --limit 10
+```
+
+A replayed task keeps its id, starts again at attempt 0, and its stored failure is cleared, so
+`handle.result()` waits for the new outcome. Each dead letter is moved back atomically, so
+concurrent replays never enqueue a task twice. A replay only takes the dead letters that exist
+when it starts: tasks that fail again during the replay stay dead. Entries whose envelope could
+not be decoded are listed but never replayed.
+
 ## Development
 
 ```bash
