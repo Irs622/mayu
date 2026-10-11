@@ -39,7 +39,8 @@ class App:
 
     def task(self, fn=None, /, *, name: str | None = None, queue: str | None = None,
              max_retries: int | None = None, retry_on=(),
-             soft_time_limit: float | None = None, hard_time_limit: float | None = None, threadsafe: bool = True):
+             soft_time_limit: float | None = None, hard_time_limit: float | None = None, threadsafe: bool = True,
+             rate_limit=None):
         def register(f):
             t = Task(
                 self, f,
@@ -50,6 +51,7 @@ class App:
                 soft_time_limit=soft_time_limit,
                 hard_time_limit=hard_time_limit,
                 threadsafe=threadsafe,
+                rate_limit=rate_limit,
             )
             if t.name in self.registry:
                 raise ValueError(f"task {t.name!r} is already registered")

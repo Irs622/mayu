@@ -113,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--processes", type=int, default=None,
                    help="worker processes (default: 1 in thread mode, CPU count in process mode)")
     w.add_argument("--_child", action="store_true", help=argparse.SUPPRESS)
-    w.add_argument("--queues", default=None, help="comma-separated; default: every queue the app's tasks use")
+    w.add_argument("--queues", default=None, help="comma-separated, highest priority first; default: every queue the app's tasks use, at equal priority")
     w.add_argument("--prefetch-multiplier", type=int, default=2)
     w.add_argument("--shutdown-grace", type=float, default=30.0)
     w.add_argument("--visibility-timeout", type=float, default=30.0,

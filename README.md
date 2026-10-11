@@ -78,6 +78,28 @@ The worker recycles itself (graceful stop, then a fresh interpreter in the same 
 zombies exceed `--max-zombie-threads` (default 4), after `--max-tasks-per-process` tasks, or
 above `--max-memory-per-process` MB of RSS.
 
+## Rate limits
+
+```python
+@app.task(rate_limit="100/s")   # also "10/m", "5/h"; a bare number means per second
+def call_api(): ...
+```
+
+Starts are spaced evenly (no bursts). The limit is **per worker process**: with
+`--processes 4`, a `10/s` task can start 40 times a second across them. Tasks that would wait
+more than a second for their turn go back to Redis until then, so a rate-limited backlog never
+fills a worker's prefetch buffer or delays other tasks.
+
+## Queue priority
+
+```bash
+mayu worker tasks:app --queues high,default,low
+```
+
+The order of `--queues` is a strict priority: a worker starts a `default` task only when no
+`high` task is waiting, so a constantly busy high queue starves the ones after it. Without
+`--queues`, a worker consumes every queue your app uses, at equal priority.
+
 ## Modes
 
 ```bash

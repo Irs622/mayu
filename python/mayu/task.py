@@ -1,11 +1,34 @@
 import datetime as dt
 import functools
 import inspect
+import math
 import time
 
 from .handle import TaskHandle
 
 RESERVED_OPTIONS = frozenset({"countdown", "eta", "queue"})
+
+
+_RATE_UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0}
+
+
+def parse_rate(rate) -> float:
+    """'100/s', '10/m', '5/h' or a bare number (per second) -> task starts per second."""
+    if isinstance(rate, bool):
+        raise ValueError(f"bad rate_limit {rate!r}")
+    if isinstance(rate, (int, float)):
+        n, per = float(rate), 1.0
+    elif isinstance(rate, str):
+        num, _, unit = rate.strip().partition("/")
+        try:
+            n, per = float(num), _RATE_UNITS[unit.strip() or "s"]
+        except (ValueError, KeyError):
+            raise ValueError(f"bad rate_limit {rate!r}: use '<number>/s', '<number>/m' or '<number>/h'") from None
+    else:
+        raise TypeError(f"rate_limit must be a string or number, got {type(rate).__name__}")
+    if not (math.isfinite(n) and n > 0):
+        raise ValueError(f"bad rate_limit {rate!r}: must be a positive number")
+    return n / per
 
 
 def _eta_ms(countdown: float | None, eta: dt.datetime | None) -> int | None:
@@ -22,7 +45,8 @@ def _eta_ms(countdown: float | None, eta: dt.datetime | None) -> int | None:
 
 class Task:
     def __init__(self, app, fn, *, name: str, queue: str, max_retries: int, retry_on: tuple,
-                 soft_time_limit: float | None = None, hard_time_limit: float | None = None, threadsafe: bool = True):
+                 soft_time_limit: float | None = None, hard_time_limit: float | None = None, threadsafe: bool = True,
+                 rate_limit=None):
         self.app = app
         self.fn = fn
         self.name = name
@@ -44,6 +68,8 @@ class Task:
         if not threadsafe and self.is_async:
             raise ValueError("threadsafe=False is for sync tasks; async tasks already run on one event-loop thread")
         self.threadsafe = threadsafe
+        self.rate_limit = rate_limit
+        self.rate_per_sec = None if rate_limit is None else parse_rate(rate_limit)
         functools.update_wrapper(self, fn)
 
     def __repr__(self) -> str:

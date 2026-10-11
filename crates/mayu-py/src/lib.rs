@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use mayu_core::{Broker, Header, Outcome, ReadyTask, Runtime, RuntimeConfig};
@@ -92,7 +93,7 @@ struct Worker {
 #[pymethods]
 impl Worker {
     #[new]
-    #[pyo3(signature = (url, queues, concurrency, prefetch_multiplier=2, result_ttl_secs=None, consumer=None, visibility_timeout_ms=None, reclaim_interval_ms=None, heartbeat_interval_ms=None, max_deliveries=None))]
+    #[pyo3(signature = (url, queues, concurrency, prefetch_multiplier=2, result_ttl_secs=None, consumer=None, visibility_timeout_ms=None, reclaim_interval_ms=None, heartbeat_interval_ms=None, max_deliveries=None, strict_priority=false, rate_limits=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -106,11 +107,15 @@ impl Worker {
         reclaim_interval_ms: Option<u64>,
         heartbeat_interval_ms: Option<u64>,
         max_deliveries: Option<u64>,
+        strict_priority: bool,
+        rate_limits: Option<HashMap<String, f64>>,
     ) -> PyResult<Self> {
         let consumer = consumer.unwrap_or_else(|| format!("w-{}-{}", std::process::id(), ulid::Ulid::generate()));
         let mut cfg = RuntimeConfig {
             queues, concurrency, prefetch_multiplier, result_ttl_secs,
             worker_id: consumer.clone(),
+            strict_priority,
+            rate_limits: rate_limits.unwrap_or_default(),
             ..RuntimeConfig::default()
         };
         if let Some(v) = visibility_timeout_ms { cfg.visibility_timeout_ms = v; }

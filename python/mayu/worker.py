@@ -70,6 +70,7 @@ class WorkerRunner:
         self.app = app
         self.threads = threads
         self.queues = list(queues or app.queues())
+        self.strict_priority = queues is not None  # an explicit queue list is a priority order
         self.prefetch_multiplier = prefetch_multiplier
         self.shutdown_grace = shutdown_grace
         self.visibility_timeout = visibility_timeout
@@ -104,12 +105,15 @@ class WorkerRunner:
         return None if self.native is None else self.native.worker_id
 
     def start(self) -> None:
+        rate_limits = {t.name: t.rate_per_sec for t in self.app.registry.values() if t.rate_per_sec is not None}
         self.native = _native.Worker(
             self.app.broker_url, self.queues, self.threads, self.prefetch_multiplier, self.app.result_ttl,
             visibility_timeout_ms=_ms(self.visibility_timeout),
             reclaim_interval_ms=_ms(min(5.0, self.visibility_timeout / 2)),
             heartbeat_interval_ms=_ms(self.heartbeat_interval),
             max_deliveries=self.max_deliveries,
+            strict_priority=self.strict_priority,
+            rate_limits=rate_limits,
         )
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(target=self._loop.run_forever, name="mayu-async", daemon=True)
