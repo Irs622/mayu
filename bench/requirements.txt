@@ -1,0 +1,8 @@
+celery[redis]==5.6.3
+rq==2.12.0
+dramatiq[redis]==2.2.1
+streaq==7.2.0
+redis==6.4.0
+psutil==7.2.2
+pytest>=8
+maturin>=1.9,<2

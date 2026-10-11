@@ -8,3 +8,5 @@ dist/
 .superpowers/
 /.venv-gil
 /.venv-313
+/.venv-bench
+bench/results/
