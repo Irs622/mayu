@@ -1,0 +1,41 @@
+name: Bug report
+description: Something in mayu doesn't work as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead. Include logs or tracebacks.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: The smallest app and commands that show the problem.
+      render: python
+  - type: input
+    id: mayu
+    attributes:
+      label: mayu version
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python build
+      description: Output of `python -VV`. Say whether it's free-threaded (3.14t).
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: OS and Redis version
+      placeholder: "Ubuntu 24.04, Redis 8.0"
+  - type: input
+    id: cmd
+    attributes:
+      label: Worker command
+      placeholder: "mayu worker tasks:app --threads 32 --processes 2"

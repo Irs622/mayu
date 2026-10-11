@@ -5,10 +5,39 @@ build-backend = "maturin"
 [project]
 name = "mayu"
 version = "0.1.0"
-description = "A Python task queue with a Rust core, built for free-threaded Python"
+description = "Fast Python task queue with a Rust core, built for free-threaded Python (no-GIL). A Redis-backed Celery alternative."
+readme = "README.md"
 requires-python = ">=3.13"
 license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+authors = [{ name = "Siddid Soni", email = "siddidsoni@gmail.com" }]
+keywords = [
+    "task queue", "job queue", "background jobs", "celery alternative", "redis",
+    "free-threaded", "nogil", "rust", "pyo3", "async", "worker", "distributed",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Free Threading :: 2 - Beta",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Distributed Computing",
+]
 dependencies = ["msgpack>=1.1"]
+
+[project.urls]
+Homepage = "https://github.com/Siddid-Soni/mayu"
+Repository = "https://github.com/Siddid-Soni/mayu"
+Issues = "https://github.com/Siddid-Soni/mayu/issues"
+Changelog = "https://github.com/Siddid-Soni/mayu/blob/main/CHANGELOG.md"
+Benchmarks = "https://github.com/Siddid-Soni/mayu/blob/main/bench/RESULTS.md"
 
 [project.optional-dependencies]
 otel = ["opentelemetry-api>=1.30"]

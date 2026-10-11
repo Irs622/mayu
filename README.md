@@ -1,9 +1,35 @@
 # mayu
 
-A Python task queue whose runtime is written in Rust and whose workers run tasks
-on real parallel OS threads under free-threaded CPython (3.14t+).
+[![PyPI](https://img.shields.io/pypi/v/mayu.svg)](https://pypi.org/project/mayu/)
+[![Python versions](https://img.shields.io/pypi/pyversions/mayu.svg)](https://pypi.org/project/mayu/)
+[![CI](https://github.com/Siddid-Soni/mayu/actions/workflows/ci.yml/badge.svg)](https://github.com/Siddid-Soni/mayu/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-> Status: early development. Delivery is at-least-once: **tasks must be idempotent.**
+**mayu is a fast, Redis-backed Python task queue with a Rust core, built for free-threaded
+(no-GIL) Python.** Its workers run tasks on real parallel OS threads under CPython 3.14t, so a
+few processes can do the work that Celery needs dozens of forked processes for.
+
+> Status: alpha. Delivery is at-least-once: **tasks must be idempotent.**
+
+- **Fast:** about 18× Celery's no-op throughput and 5× on a realistic task, with a fraction of the
+  memory ([benchmarks](https://github.com/Siddid-Soni/mayu/blob/main/bench/RESULTS.md)).
+- **Free-threaded first:** thread mode on Python 3.14t, with automatic fallback to process mode on
+  GIL builds (3.13, 3.14).
+- **Reliable:** acks after the task finishes, crash recovery, poison-task detection, dead letters
+  and replay, and it survives Redis restarts.
+- **Familiar API:** `@app.task`, `.delay()`, `.send()`, retries, countdown/ETA, rate limits, time
+  limits, queue priority, `link=` callbacks, sync and `async def` tasks.
+- **Operable:** Prometheus metrics, JSON logs, OpenTelemetry tracing, and an `inspect` CLI.
+
+## Install
+
+```bash
+pip install mayu            # or: uv add mayu
+pip install "mayu[otel]"    # with OpenTelemetry tracing
+```
+
+Requires Python 3.13+ and Redis. Use a free-threaded build (`python3.14t`, e.g.
+`uv venv --python 3.14t`) to get thread mode.
 
 ## Quickstart
 
@@ -205,24 +231,17 @@ changes.
 
 mayu vs Celery, RQ, Dramatiq and streaQ at 64 concurrent tasks: no-op throughput, a realistic task
 (JSON decode + 5 ms I/O + 1 ms CPU), and memory at equal concurrency. Results and method:
-[`bench/RESULTS.md`](bench/RESULTS.md). Reproduce with `bench/setup.sh && bench/all.sh` (needs Docker and uv).
+[`bench/RESULTS.md`](https://github.com/Siddid-Soni/mayu/blob/main/bench/RESULTS.md). Reproduce with `bench/setup.sh && bench/all.sh` (needs Docker and uv).
 
 ## Development
 
-```bash
-scripts/redis-up.sh                                   # Redis on :6390 for tests
-cargo test --workspace                                # Rust tests (need Redis)
-uv venv --python 3.14t .venv
-uv pip install --python .venv/bin/python maturin pytest msgpack opentelemetry-sdk pytest-run-parallel
-VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop --uv
-.venv/bin/pytest
-uv venv --python 3.14+gil .venv-gil && uv pip install --python .venv-gil/bin/python maturin pytest msgpack
-VIRTUAL_ENV=$PWD/.venv-gil .venv-gil/bin/maturin develop --uv
-scripts/matrix.sh                                     # CI matrix, Linux legs: ft (3.14t), ft-stress (3.14t, PYTHON_GIL=0, 4 threads per test), gil (3.14), py313 (3.13)
-scripts/matrix.sh py313                               # one leg
-scripts/test-all.sh                                   # Rust + matrix + chaos
-```
+See [CONTRIBUTING.md](https://github.com/Siddid-Soni/mayu/blob/main/CONTRIBUTING.md) for setup, the test matrix and the pull request checklist.
+Coding agents should also read [AGENTS.md](https://github.com/Siddid-Soni/mayu/blob/main/AGENTS.md). The design is in
+[`docs/specs/2026-10-11-mayu-architecture-design.md`](https://github.com/Siddid-Soni/mayu/blob/main/docs/specs/2026-10-11-mayu-architecture-design.md).
 
-macOS (in the spec's CI matrix) is not covered by the local matrix.
+## License
 
-Design: `docs/specs/2026-10-11-mayu-architecture-design.md`.
+Licensed under either of [Apache License, Version 2.0](https://github.com/Siddid-Soni/mayu/blob/main/LICENSE-APACHE) or [MIT license](https://github.com/Siddid-Soni/mayu/blob/main/LICENSE-MIT)
+at your option. Unless you explicitly state otherwise, any contribution intentionally submitted for
+inclusion in mayu by you, as defined in the Apache-2.0 license, shall be dual licensed as above,
+without any additional terms or conditions.

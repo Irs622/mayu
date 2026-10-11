@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/Siddid-Soni/mayu/discussions
+    about: Ask how to use mayu or discuss ideas before opening an issue.
+  - name: Security vulnerability
+    url: https://github.com/Siddid-Soni/mayu/security/advisories/new
+    about: Report security issues privately.

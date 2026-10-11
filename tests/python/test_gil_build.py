@@ -13,7 +13,7 @@ ROOT = HERE.parent.parent
 GIL_PYTHON = os.environ.get("MAYU_GIL_PYTHON", str(ROOT / ".venv-gil" / "bin" / "python"))
 
 pytestmark = pytest.mark.skipif(not os.path.exists(GIL_PYTHON),
-                                reason=f"GIL interpreter not found at {GIL_PYTHON} (see plan 4, Task 3)")
+                                reason=f"GIL interpreter not found at {GIL_PYTHON}; set MAYU_GIL_PYTHON or see README Development")
 
 
 def test_auto_mode_on_gil_build_uses_process_mode(redis_url, queue):

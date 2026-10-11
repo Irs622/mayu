@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  MAYU_TEST_REDIS: redis://127.0.0.1:6390/0
+
+jobs:
+  rust:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:8
+        ports: ["6390:6379"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  python:
+    name: Python ${{ matrix.leg }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { leg: ft, python: "3.14t" }
+          - { leg: ft-stress, python: "3.14t" }
+          - { leg: gil, python: "3.14" }
+          - { leg: py313, python: "3.13" }
+    services:
+      redis:
+        image: redis:8
+        ports: ["6390:6379"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - name: Build
+        run: |
+          uv venv --python ${{ matrix.python }} .venv
+          uv pip install --python .venv/bin/python maturin pytest msgpack opentelemetry-sdk pytest-run-parallel
+          VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop --uv
+      - name: Test
+        run: |
+          case "${{ matrix.leg }}" in
+            ft-stress) PYTHON_GIL=0 .venv/bin/pytest tests/python -q --parallel-threads=4 ;;
+            gil) MAYU_GIL_PYTHON=$PWD/.venv/bin/python .venv/bin/pytest tests/python -q ;;
+            *) .venv/bin/pytest tests/python -q ;;
+          esac

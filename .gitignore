@@ -10,3 +10,4 @@ dist/
 /.venv-313
 /.venv-bench
 bench/results/
+docs/superpowers/
