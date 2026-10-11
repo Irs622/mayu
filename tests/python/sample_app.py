@@ -34,3 +34,9 @@ def boot():
 @app.task(name="sample.sleepy", hard_time_limit=0.5)
 def sleepy():
     time.sleep(30)
+
+
+@app.task(name="sample.whoami")
+def whoami():
+    time.sleep(0.2)
+    return [BOOT, os.getpid()]

@@ -18,37 +18,87 @@ def load_app(path: str) -> App:
     return obj
 
 
-def _cmd_worker(args) -> int:
+def _build_runner(app, args, threads: int):
     from .worker import WorkerRunner
 
+    queues = [q for q in args.queues.split(",") if q] if args.queues else None
+    return WorkerRunner(app, threads=threads, queues=queues,
+                        prefetch_multiplier=args.prefetch_multiplier,
+                        shutdown_grace=args.shutdown_grace,
+                        visibility_timeout=args.visibility_timeout,
+                        heartbeat_interval=args.heartbeat_interval,
+                        max_deliveries=args.max_deliveries,
+                        max_zombie_threads=args.max_zombie_threads,
+                        max_tasks_per_process=args.max_tasks_per_process,
+                        max_memory_per_process=args.max_memory_per_process)
+
+
+def _cmd_worker(args) -> int:
+    from .modes import gil_enabled, import_app_detecting_gil, resolve_mode
+    from .supervisor import RESTART_EXIT_CODE, ProcessSupervisor, watch_parent
+
     try:
-        app = load_app(args.app)
+        app, offenders = import_app_detecting_gil(args.app)
     except (ImportError, AttributeError, ValueError, TypeError) as e:
         print(f"mayu: cannot load app {args.app!r}: {e}", file=sys.stderr)
         return 2
-    if getattr(sys, "_is_gil_enabled", lambda: True)():
+    gil = gil_enabled()
+    mode = resolve_mode(args.mode, gil)
+    if mode == "process" and args.threads not in (None, 1):
+        print("mayu: --threads applies to thread mode; process mode runs one task per process "
+              "(use --processes)", file=sys.stderr)
+        return 2
+    threads = 1 if mode == "process" else (args.threads or os.cpu_count() or 4)
+    processes = args.processes or ((os.cpu_count() or 2) if mode == "process" else 1)
+    if processes < 1:
+        print("mayu: --processes must be >= 1", file=sys.stderr)
+        return 2
+
+    if args._child:
+        try:
+            runner = _build_runner(app, args, threads)
+        except ValueError as e:
+            print(f"mayu: {e}", file=sys.stderr)
+            return 2
+        watch_parent(runner.stop)
+        reason = runner.run()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        if reason is not None:
+            os._exit(RESTART_EXIT_CODE)  # the supervisor replaces us; skip waiting on zombie threads
+        return 0
+
+    if args.mode == "auto" and mode == "process":
+        why = (f"re-enabled by importing {', '.join(offenders)}" if offenders
+               else "this Python build has a GIL")
+        print(f"mayu: the GIL is enabled ({why}); using process mode with {processes} processes",
+              file=sys.stderr, flush=True)
+    elif mode == "thread" and gil:
         print("mayu: warning: the GIL is enabled; threads will not run Python code in parallel. "
-              "Use a free-threaded build (python3.14t).", file=sys.stderr)
-    queues = [q for q in args.queues.split(",") if q] if args.queues else None
+              "Use a free-threaded build (python3.14t) or --mode process.", file=sys.stderr)
+
+    if mode == "thread" and processes == 1:
+        try:
+            runner = _build_runner(app, args, threads)
+        except ValueError as e:
+            print(f"mayu: {e}", file=sys.stderr)
+            return 2
+        reason = runner.run()
+        if reason is not None:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.execv(sys.executable, [sys.executable, "-m", "mayu", *args.argv])
+        return 0
+
     try:
-        runner = WorkerRunner(app, threads=args.threads, queues=queues,
-                              prefetch_multiplier=args.prefetch_multiplier,
-                              shutdown_grace=args.shutdown_grace,
-                              visibility_timeout=args.visibility_timeout,
-                              heartbeat_interval=args.heartbeat_interval,
-                              max_deliveries=args.max_deliveries,
-                              max_zombie_threads=args.max_zombie_threads,
-                              max_tasks_per_process=args.max_tasks_per_process,
-                              max_memory_per_process=args.max_memory_per_process)
+        _build_runner(app, args, threads)  # validate runner options; does not connect to Redis
     except ValueError as e:
         print(f"mayu: {e}", file=sys.stderr)
         return 2
-    reason = runner.run()
-    if reason is not None:
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os.execv(sys.executable, [sys.executable, "-m", "mayu", *args.argv])
-    return 0
+    child = [sys.executable, "-m", "mayu", *args.argv, "--mode", mode, "--processes", "1", "--_child"]
+    if mode == "process":
+        child += ["--threads", "1", "--max-zombie-threads", "0"]
+    return ProcessSupervisor(child, processes, shutdown_grace=args.shutdown_grace).run()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -56,7 +106,13 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     w = sub.add_parser("worker", help="run a worker process")
     w.add_argument("app", help="import path of the App, e.g. myproject.tasks:app")
-    w.add_argument("--threads", type=int, default=os.cpu_count() or 4)
+    w.add_argument("--threads", type=int, default=None,
+                   help="threads per process (thread mode; default: CPU count)")
+    w.add_argument("--mode", choices=("auto", "thread", "process"), default="auto",
+                   help="auto: thread mode if the GIL is off after importing the app, else process mode")
+    w.add_argument("--processes", type=int, default=None,
+                   help="worker processes (default: 1 in thread mode, CPU count in process mode)")
+    w.add_argument("--_child", action="store_true", help=argparse.SUPPRESS)
     w.add_argument("--queues", default=None, help="comma-separated; default: every queue the app's tasks use")
     w.add_argument("--prefetch-multiplier", type=int, default=2)
     w.add_argument("--shutdown-grace", type=float, default=30.0)
