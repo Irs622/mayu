@@ -100,3 +100,13 @@ def test_configure_logging_validates():
         configure_logging("xml")
     with pytest.raises(ValueError):
         configure_logging("text", "LOUD")
+
+
+@pytest.mark.parametrize("var, value, needle", [("MAYU_LOG_FORMAT", "xml", "log format"),
+                                                ("MAYU_LOG_LEVEL", "LOUD", "log level")])
+def test_bad_log_env_is_a_usage_error(redis_url, queue, var, value, needle):
+    env = {**os.environ, "MAYU_BROKER": redis_url, "MAYU_DEFAULT_QUEUE": queue, "PYTHONPATH": str(HERE), var: value}
+    r = subprocess.run([sys.executable, "-m", "mayu", "worker", "sample_app:app", "--mode", "thread"],
+                       env=env, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 2, r.stderr
+    assert needle in r.stderr and "Traceback" not in r.stderr

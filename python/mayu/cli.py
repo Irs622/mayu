@@ -39,7 +39,11 @@ def _build_runner(app, args, threads: int):
 
 def _cmd_worker(args) -> int:
     from .log import configure_logging
-    configure_logging(args.log_format, args.log_level)
+    try:
+        configure_logging(args.log_format, args.log_level)
+    except ValueError as e:  # argparse does not check `choices` against env-provided defaults
+        print(f"mayu: {e}", file=sys.stderr)
+        return 2
     from .modes import gil_enabled, import_app_detecting_gil, resolve_mode
     from .supervisor import RESTART_EXIT_CODE, ProcessSupervisor, watch_parent
 
