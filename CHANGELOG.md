@@ -17,6 +17,7 @@ All notable changes to mayu are documented here. The format follows
 
 - `Signature` arguments are checked when used (at `send()` for `link=`, at `wf.add()` for workflows), not in `task.s()`.
 - The envelope header gains optional `workflow_id` and `node` fields. Old workers ignore them but can't release workflow children: upgrade workers before submitting workflows.
+- Free-threaded workers no longer use about 4x the memory on Linux when transparent huge pages are `always`: `--thp python` (default, `MAYU_THP`) opts only Python's own heap out of huge pages, `keep` changes nothing and `off` disables them for the whole process. Measured at 2 × 32 threads: 525 MB down to 135 MB PSS, same throughput.
 
 ## [0.1.0] - 2026-10-12
 

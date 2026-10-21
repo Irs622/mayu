@@ -312,6 +312,30 @@ limit takes its process down with it, and the process is replaced.
 Prefer **a few processes × many threads**: a segfault in a C extension takes down every task in
 its process.
 
+## Memory and huge pages
+
+On Linux with transparent huge pages set to `always` (the default on Arch, Fedora and RHEL), a
+free-threaded worker can use about 4x the memory it needs: every thread's slice of CPython's
+object heap is backed by a 2 MB huge page. Measured with 2 processes × 32 threads, that was
+525 MB PSS against 135 MB with huge pages off, at the same throughput. Process mode on a GIL
+build is not affected.
+
+```bash
+mayu worker tasks:app --thp python    # default; or MAYU_THP=python
+```
+
+- `python` (default): on a free-threaded build, opt only Python's own object heap out of huge
+  pages, before your app is imported. Memory your tasks allocate themselves (numpy, torch and
+  other `malloc`/`mmap` buffers) keeps the system setting.
+- `keep`: change nothing.
+- `off`: disable huge pages for the whole process, which child processes inherit, including
+  tasks that start subprocesses and, under the supervisor, the worker processes.
+
+`WorkerRunner(..., thp="keep")` takes the same modes. A failed system call is logged as a
+warning and the worker starts anyway. Linux only; elsewhere every mode does nothing. Limitation:
+CPython reserves further heap arenas only after about 1 GB of live Python objects, and those
+keep the system setting.
+
 ## Metrics
 
 ```bash
