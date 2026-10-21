@@ -173,7 +173,41 @@ A `link=` callback runs only after its parent **succeeds**, with the parent's re
 argument (even when results are disabled). The callback is enqueued in the same atomic step
 that acks the parent, so it is enqueued exactly once per successful parent. Like every task, it
 can still run more than once if a worker crashes. Callbacks run on the callback task's queue
-and do not chain further (no canvas).
+and do not chain further; for a DAG of tasks see [Workflows](#workflows).
+
+## Workflows
+
+A DAG of tasks, submitted as one unit. A node runs once all its parents have succeeded.
+
+```python
+wf = app.workflow(name="video:42")
+plan = wf.add(plan_run.s(prompt, run))
+voice = wf.add(voice_lines.s(run), after=[plan])
+scenes = [wf.add(render_scene.s(run, s), after=[voice]) for s in ("S1", "S2", "S3")]
+wf.add(finalize.s(run), after=scenes)
+handle = wf.send()            # WorkflowHandle
+handle.status()               # {"state": "running", "waiting": 4, "queued": 1, "done": 1, "dead": 0, ...}
+handle.nodes[-1].result(60)   # a TaskHandle per node, in add order
+handle.wait(timeout=600)      # "done", "failed", "cancelled" or "expired"
+handle.cancel()
+```
+
+`wf.add` takes a task or `task.s(...)` with exactly the arguments the task needs; `after=` takes a node
+or a list of nodes. `send()` writes the whole DAG and enqueues the nodes with no parents in one atomic
+step. When a node succeeds, the step that acks it also enqueues each child whose parents are now all
+done, so each child is released exactly once. Nodes still run at least once, like any task.
+
+- Nodes do not receive their parents' results; pass data through your own storage. Nodes can't use
+  `link=`, `countdown` or `eta`.
+- A node that fails for good (dead-lettered) blocks its descendants and the workflow reports `failed`.
+  `mayu dead replay` the node and, once it succeeds, the rest of the DAG continues.
+- `handle.cancel()` stops waiting nodes from being released and skips nodes that are queued but not yet
+  started (they are acked with a "workflow cancelled" failure). A node already running finishes.
+- `app.workflow(name, ttl=7 * 86400)` sets how long Redis keeps the workflow after its last progress.
+  If it expires, running nodes still finish but release nothing.
+- Release computes stream keys at run time, so workflows, like acks with results, are not
+  Redis-Cluster-safe.
+- Upgrade workers before submitting workflows: an older worker acks a node but never releases its children.
 
 ## Declaring tasks without their code
 
@@ -232,7 +266,7 @@ processes listen on 9100–9103, so scrape all four. `MAYU_METRICS_PORT` sets th
 | Metric | Type | Labels |
 |---|---|---|
 | `mayu_tasks_received_total` | counter | `queue`, `task` |
-| `mayu_tasks_settled_total` | counter | `queue`, `task`, `outcome` (`success`, `retry`, `dead`) |
+| `mayu_tasks_settled_total` | counter | `queue`, `task`, `outcome` (`success`, `retry`, `dead`, `cancelled`) |
 | `mayu_task_duration_seconds` | histogram | `queue`, `task` |
 | `mayu_tasks_deferred_total` | counter | `queue`, `task` (rate-limited tasks sent back to Redis) |
 | `mayu_tasks_reclaimed_total` | counter | `queue` (taken over from a dead worker) |
@@ -259,12 +293,15 @@ from your own code, call `mayu.configure_logging("json")` first.
 ## Inspecting and dead letters
 
 ```bash
-mayu inspect tasks:app                      # queue depths (ready, claimed, delayed, dead) and live workers
+mayu inspect tasks:app                      # queue depths (ready, claimed, delayed, dead), live workers, unfinished workflows
 mayu inspect tasks:app --json
 mayu dead list tasks:app --queue emails     # oldest first: when, task id, task, attempt, error
 mayu dead replay tasks:app --queue emails   # run them again
 mayu dead replay tasks:app --queue emails --id 01J... --limit 10
 ```
+
+The workflows table lists those not yet done (id, name, state, node counts, age); finished ones are left
+out and expire on their `ttl`.
 
 A replayed task keeps its id, starts again at attempt 0, and its stored failure is cleared, so
 `handle.result()` waits for the new outcome. Each dead letter is moved back atomically, so

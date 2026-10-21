@@ -30,6 +30,42 @@ fn queue_from_stream_key(k: &str) -> &str {
 
 fn be(e: impl std::fmt::Display) -> Error { Error::Broker(e.to_string()) }
 
+/// Splits the metadata `HMGET` of a workflow hash into (node count, name, created_at, status).
+fn parse_workflow_meta(id: &str, meta: Vec<Option<String>>) -> Result<(usize, String, u64, String)> {
+    let [Some(nodes), Some(name), Some(created_at), Some(status)] = <[Option<String>; 4]>::try_from(meta)
+        .map_err(|_| be("malformed HMGET reply"))?
+    else {
+        return Err(be(format!("workflow {id} is missing its metadata")));
+    };
+    let bad = |what: &str| be(format!("workflow {id} has a malformed {what}"));
+    let count: usize = nodes.parse().map_err(|_| bad("node count"))?;
+    let created_at: u64 = created_at.parse().map_err(|_| bad("created_at"))?;
+    Ok((count, name, created_at, status))
+}
+
+/// Builds a `WorkflowState` from the per-node `HMGET` (id, task, queue, state for each of `count` nodes).
+fn parse_workflow_nodes(
+    id: &str, name: String, created_at: u64, cancelled: bool, count: usize, vals: &[Option<String>],
+) -> Result<WorkflowState> {
+    if vals.len() != count * 4 {
+        return Err(be(format!("workflow {id} has a malformed node list")));
+    }
+    let mut nodes = Vec::with_capacity(count);
+    for (i, f) in vals.chunks(4).enumerate() {
+        let [Some(task_id), Some(task), Some(queue), Some(state)] = f else {
+            return Err(be(format!("workflow {id} node {i} is missing fields")));
+        };
+        nodes.push(NodeInfo {
+            node: i.to_string(),
+            task_id: task_id.clone(),
+            task: task.clone(),
+            queue: queue.clone(),
+            state: NodeState::parse(state)?,
+        });
+    }
+    Ok(WorkflowState { id: id.to_string(), name, created_at, cancelled, nodes })
+}
+
 struct Scripts {
     ack: Script,
     retry: Script,
@@ -331,17 +367,46 @@ impl RedisBroker {
         Ok(out)
     }
 
-    /// Workflows that have a hash in Redis, oldest first (skips ones that expire mid-scan).
+    /// Workflows that have a hash in Redis, oldest first. Skips ones that expire mid-scan and ones whose hash
+    /// is malformed (with a warning), so one bad key can't break the listing.
     pub async fn workflows(&self) -> Result<Vec<WorkflowState>> {
         let mut out = Vec::new();
         for key in self.scan_keys(&format!("{WORKFLOW_KEY_PREFIX}*")).await? {
             let id = key.strip_prefix(WORKFLOW_KEY_PREFIX).unwrap_or(&key);
-            if let Some(w) = self.workflow(id).await? {
-                out.push(w);
+            match self.read_workflow(id).await? {
+                Some(Ok(w)) => out.push(w),
+                Some(Err(e)) => tracing::warn!(key = %key, error = %e, "skipping a malformed workflow hash"),
+                None => {}
             }
         }
         out.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
         Ok(out)
+    }
+
+    /// Reads one workflow. The outer error is a Redis failure; the inner one means the hash is malformed.
+    async fn read_workflow(&self, id: &str) -> Result<Option<Result<WorkflowState>>> {
+        let key = workflow_key(id);
+        let mut c = self.conn.clone();
+        let meta: Vec<Option<String>> = redis::cmd("HMGET").arg(&key)
+            .arg("nodes").arg("name").arg("created_at").arg("status")
+            .query_async(&mut c).await.map_err(be)?;
+        if meta.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        let (count, name, created_at, status) = match parse_workflow_meta(id, meta) {
+            Ok(m) => m,
+            Err(e) => return Ok(Some(Err(e))),
+        };
+        let mut cmd = redis::cmd("HMGET");
+        cmd.arg(&key);
+        for i in 0..count {
+            cmd.arg(format!("n:{i}:id")).arg(format!("n:{i}:t")).arg(format!("n:{i}:q")).arg(format!("n:{i}:s"));
+        }
+        let vals: Vec<Option<String>> = cmd.query_async(&mut c).await.map_err(be)?;
+        if vals.len() == count * 4 && vals.iter().all(Option::is_none) {
+            return Ok(None); // expired between the two reads
+        }
+        Ok(Some(parse_workflow_nodes(id, name, created_at, status == "cancelled", count, &vals)))
     }
 
     /// Queues that have a stream, delayed set or dead stream in Redis, sorted.
@@ -686,48 +751,7 @@ impl Broker for RedisBroker {
     }
 
     async fn workflow(&self, id: &str) -> Result<Option<WorkflowState>> {
-        let key = workflow_key(id);
-        let mut c = self.conn.clone();
-        let meta: Vec<Option<String>> = redis::cmd("HMGET").arg(&key)
-            .arg("nodes").arg("name").arg("created_at").arg("status")
-            .query_async(&mut c).await.map_err(be)?;
-        if meta.iter().all(Option::is_none) {
-            return Ok(None);
-        }
-        let [Some(nodes), Some(name), Some(created_at), Some(status)] = <[Option<String>; 4]>::try_from(meta)
-            .map_err(|_| be("malformed HMGET reply"))?
-        else {
-            return Err(be(format!("workflow {id} is missing its metadata")));
-        };
-        let bad = |what: &str| be(format!("workflow {id} has a malformed {what}"));
-        let count: usize = nodes.parse().map_err(|_| bad("node count"))?;
-        let created_at: u64 = created_at.parse().map_err(|_| bad("created_at"))?;
-        let mut cmd = redis::cmd("HMGET");
-        cmd.arg(&key);
-        for i in 0..count {
-            cmd.arg(format!("n:{i}:id")).arg(format!("n:{i}:t")).arg(format!("n:{i}:q")).arg(format!("n:{i}:s"));
-        }
-        let vals: Vec<Option<String>> = cmd.query_async(&mut c).await.map_err(be)?;
-        if vals.len() != count * 4 {
-            return Err(bad("node list"));
-        }
-        if vals.iter().all(Option::is_none) {
-            return Ok(None); // expired between the two reads
-        }
-        let mut infos = Vec::with_capacity(count);
-        for (i, f) in vals.chunks(4).enumerate() {
-            let [Some(task_id), Some(task), Some(queue), Some(state)] = f else {
-                return Err(be(format!("workflow {id} node {i} is missing fields")));
-            };
-            infos.push(NodeInfo {
-                node: i.to_string(),
-                task_id: task_id.clone(),
-                task: task.clone(),
-                queue: queue.clone(),
-                state: NodeState::parse(state)?,
-            });
-        }
-        Ok(Some(WorkflowState { id: id.to_string(), name, created_at, cancelled: status == "cancelled", nodes: infos }))
+        self.read_workflow(id).await?.transpose()
     }
 
     async fn cancel_workflow(&self, id: &str) -> Result<bool> {

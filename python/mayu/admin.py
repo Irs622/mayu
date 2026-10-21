@@ -11,9 +11,15 @@ def _queues(app, explicit) -> list[str]:
     return sorted(set(app.queues()) | set(app.client.known_queues()))
 
 
+def _workflows(client) -> list[dict]:
+    """Workflows that haven't finished (done ones expire on their TTL), without the per-node detail."""
+    keep = ("id", "name", "state", "created_at", "waiting", "queued", "done", "dead", "cancelled_nodes")
+    return [{k: w[k] for k in keep} for w in client.workflows() if w["state"] != "done"]
+
+
 def inspect(app, queues: list[str] | None = None) -> dict:
     client = app.client
-    out = {"queues": {}, "workers": client.workers()}
+    out = {"queues": {}, "workers": client.workers(), "workflows": _workflows(client)}
     for q in _queues(app, queues):
         s = client.queue_stats(q)
         out["queues"][q] = {"ready": max(0, s["stream"] - s["pending"]), "claimed": s["pending"],
@@ -47,6 +53,15 @@ def format_inspect(data: dict, now_ms: int) -> str:
                           f"{w['inflight']}/{w['concurrency']}", _ago(now_ms - w["started_at"]),
                           _ago(now_ms - w["last_seen"]) + " ago"])
         parts.append(_table(wrows))
+    else:
+        parts.append("(none)")
+    parts += ["", f"WORKFLOWS ({len(data['workflows'])})"]
+    if data["workflows"]:
+        frows = [["ID", "NAME", "STATE", "WAITING", "QUEUED", "DONE", "DEAD", "AGE"]]
+        for w in data["workflows"]:
+            frows.append([w["id"], w["name"], w["state"], str(w["waiting"]), str(w["queued"]), str(w["done"]),
+                          str(w["dead"]), _ago(now_ms - w["created_at"])])
+        parts.append(_table(frows))
     else:
         parts.append("(none)")
     return "\n".join(parts)

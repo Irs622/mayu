@@ -51,16 +51,60 @@ def test_inspect_reports_depths_and_workers(app, running, queue):
     assert queue in admin.inspect(app, queues=[queue])["queues"]
 
 
+def test_inspect_lists_workflows_that_are_not_done(app, running):
+    @app.task
+    def step():
+        pass
+
+    unfinished = app.workflow("unfinished")
+    unfinished.add(step)
+    stuck = unfinished.send()
+    cancelled = app.workflow("cancelled")
+    cancelled.add(step)
+    gone = cancelled.send()
+    assert gone.cancel() is True
+
+    def ours(data):
+        return {w["id"]: w for w in data["workflows"] if w["id"] in (stuck.id, gone.id)}
+
+    found = ours(admin.inspect(app))
+    assert set(found) == {stuck.id, gone.id}
+    s = found[stuck.id]
+    assert (s["name"], s["state"], s["queued"]) == ("unfinished", "running", 1)
+    assert found[gone.id]["state"] == "cancelled"
+    assert "nodes" not in s
+    text = admin.format_inspect(admin.inspect(app), int(time.time() * 1000))
+    assert "WORKFLOWS (" in text and stuck.id in text and "unfinished" in text
+
+    with running(app):
+        assert stuck.wait(timeout=10) == "done"
+    assert stuck.id not in ours(admin.inspect(app))  # done workflows are left to expire
+
+
+def test_format_inspect_workflows_table():
+    wf = {"id": "01ABC", "name": "video:42", "state": "failed", "created_at": 1_000, "waiting": 3, "queued": 0,
+          "done": 2, "dead": 1, "cancelled_nodes": 0}
+    data = {"queues": {}, "workers": [], "workflows": [wf]}
+    text = admin.format_inspect(data, 126_000)
+    lines = text.splitlines()
+    i = lines.index("WORKFLOWS (1)")
+    assert lines[i + 1].split() == ["ID", "NAME", "STATE", "WAITING", "QUEUED", "DONE", "DEAD", "AGE"]
+    assert lines[i + 2].split() == ["01ABC", "video:42", "failed", "3", "0", "2", "1", "2m5s"]
+    empty = admin.format_inspect({"queues": {}, "workers": [], "workflows": []}, 0)
+    assert empty.splitlines()[-2:] == ["WORKFLOWS (0)", "(none)"]
+
+
 def test_inspect_cli_json(redis_url, queue):
     r = _cli(redis_url, queue, "inspect", "sample_app:app", "--json")
     assert r.returncode == 0, r.stderr
     data = json.loads(r.stdout)
     assert data["queues"][queue] == {"ready": 0, "claimed": 0, "delayed": 0, "dead": 0}
     assert isinstance(data["workers"], list)
+    assert isinstance(data["workflows"], list)
 
 
 def test_format_inspect_without_workers():
-    data = {"queues": {"q": {"ready": 1, "claimed": 2, "delayed": 3, "dead": 4}}, "workers": []}
+    data = {"queues": {"q": {"ready": 1, "claimed": 2, "delayed": 3, "dead": 4}}, "workers": [], "workflows": []}
     text = admin.format_inspect(data, 0)
     assert "QUEUE" in text and "READY" in text and "(none)" in text
 

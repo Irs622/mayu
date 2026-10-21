@@ -346,6 +346,24 @@ async fn malformed_hash_data_is_a_broker_error() {
 }
 
 #[tokio::test]
+async fn listing_skips_a_malformed_workflow() {
+    let _scan = SCAN.lock().await;
+    let (b, q) = setup().await;
+    let good = diamond(&q);
+    let bad = diamond(&q);
+    b.submit_workflow(&good).await.unwrap();
+    b.submit_workflow(&bad).await.unwrap();
+    let mut c = raw().await;
+    let key = workflow_key(&bad.id);
+    let _: i64 = redis::cmd("HSET").arg(&key).arg("n:1:s").arg("bogus").query_async(&mut c).await.unwrap();
+    assert!(matches!(b.workflow(&bad.id).await, Err(Error::Broker(_))));
+    let all = b.workflows().await.unwrap();
+    assert!(all.iter().any(|w| w.id == good.id));
+    assert!(all.iter().all(|w| w.id != bad.id));
+    let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut c).await.unwrap();
+}
+
+#[tokio::test]
 async fn submit_sets_a_ttl_and_a_release_refreshes_it() {
     let (b, q) = setup().await;
     let wf = WorkflowSpec::new("ttl", 1000, vec![node("a", &q, &[]), node("b", &q, &[0])]);

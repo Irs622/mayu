@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from mayu import App, Retry, TaskFailed, Workflow, WorkflowHandle
+from mayu import App, Retry, TaskFailed, Workflow, WorkflowHandle, admin
 from mayu.worker import WorkerRunner
 
 
@@ -383,3 +383,32 @@ def test_nodes_pass_args_and_kwargs_exactly(app, running):
         assert handle.nodes[1].result(timeout=10) == [[], {}]
 
 
+
+
+def test_replaying_a_dead_node_resumes_the_workflow(app, running, queue):
+    fixed = threading.Event()
+    ran = []
+
+    @app.task(max_retries=0)
+    def flaky():
+        if not fixed.is_set():
+            raise ValueError("not yet")
+        ran.append("flaky")
+
+    @app.task
+    def after_flaky():
+        ran.append("after")
+
+    wf = app.workflow("replayed")
+    a = wf.add(flaky)
+    wf.add(after_flaky, after=a)
+    with running(app):
+        handle = wf.send()
+        assert handle.wait(timeout=10) == "failed"
+        assert ran == []
+        fixed.set()
+        assert admin.dead_replay(app, queue) == (1, 0)
+        assert handle.wait(timeout=10) == "done"
+        handle.nodes[1].result(timeout=10)
+    assert ran == ["flaky", "after"]
+    assert [n["state"] for n in handle.status()["nodes"]] == ["done", "done"]
