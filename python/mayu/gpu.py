@@ -28,6 +28,7 @@ TUNE_WINDOW = 5  # ticks per tuning decision (10 s at the default interval)
 TUNE_HIGH = 0.90  # mean utilization at or above which the GPU is saturated: more concurrency only adds latency
 TUNE_LOW = 0.70  # mean utilization below which the GPU has room, if tasks are waiting for it
 TUNE_COOLDOWN = 6  # windows after a shrink before the tuner may grow again, so it can't flap between two steps
+TUNE_MEMORY = 300.0  # seconds a level's measured utilization stays trusted; the workload may change after that
 VRAM_PRESSURE = 0.95  # share of the cards' memory in use above which the tuner won't add concurrency
 
 
@@ -300,10 +301,12 @@ class Tuner:
 
     `ceiling` is the configured capacity (where it starts), `step` the smallest task request and `floor` the largest
     (the biggest task must still fit). Capacity is tracked in thousandths, like the dispatcher's, so repeated steps
-    can't drift. After a shrink it waits `cooldown` windows before growing: one task fewer can move the GPU from
-    above TUNE_HIGH to below TUNE_LOW, and without the wait it would shrink and grow on alternate windows."""
+    can't drift. A saturated GPU shrinks only if one step less was also seen saturated (or never measured): bursty
+    tasks can leave the GPU 60% busy one at a time and 100% two at a time, and two then get more done. After a
+    shrink it waits `cooldown` windows before growing, so a shrink to a level not measured yet can't flap."""
 
-    def __init__(self, ceiling: float, floor: float, step: float, cooldown: int = TUNE_COOLDOWN):
+    def __init__(self, ceiling: float, floor: float, step: float, cooldown: int = TUNE_COOLDOWN,
+                 clock: Callable[[], float] = time.monotonic):
         self._ceiling, self._floor, self._step = round(ceiling * 1000), round(floor * 1000), round(step * 1000)
         if self._step < 1 or self._floor < 1 or self._floor > self._ceiling:
             raise ValueError(f"tuner needs 0 < step, 0 < floor <= ceiling, got ceiling={ceiling} floor={floor} "
@@ -311,6 +314,8 @@ class Tuner:
         self._cap = self._ceiling
         self._cooldown = cooldown
         self._wait = 0  # windows left before growth is allowed again
+        self._clock = clock
+        self._seen: dict[int, tuple[float, float]] = {}  # level -> (window mean, when) while tasks were waiting
         self._utils: list[float] = []
         self._pressure = False
         self.window_mean = 0.0  # the mean utilization the last decision was based on
@@ -336,7 +341,12 @@ class Tuner:
         self._utils.clear()  # one decision per window, whether or not it changes anything
         self._pressure = False
         cooling, self._wait = self._wait > 0, max(0, self._wait - 1)
-        if mean >= TUNE_HIGH and self._cap - self._step >= self._floor:
+        now = self._clock()
+        if blocked > 0:  # the level was used in full, so its mean says what it can do
+            self._seen[self._cap] = (mean, now)
+        below = self._seen.get(self._cap - self._step)
+        below_idle = below is not None and below[0] < TUNE_HIGH and now - below[1] <= TUNE_MEMORY
+        if mean >= TUNE_HIGH and self._cap - self._step >= self._floor and not below_idle:
             delta = -self._step
             self._wait = self._cooldown
         elif (mean < TUNE_LOW and blocked > 0 and not pressure and not cooling

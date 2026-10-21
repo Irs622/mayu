@@ -313,9 +313,11 @@ nothing changes.
   the ceiling, the smallest `gpu` request among the tasks the worker serves is the step, and the largest is
   the floor, so the biggest task always fits. Every 5 samples (10 seconds by default) the tuner takes the
   mean GPU utilization. At 90% or more it removes a step of `gpu`, since more concurrency on a saturated GPU
-  only adds latency. Below 70%, with tasks waiting for `gpu` and neither the guard nor the cards' memory
-  (95% in use) under pressure, it adds a step back. After a shrink it waits 6 windows before it grows
-  again. Each change is logged. It suits work that gets faster with concurrency until the GPU saturates.
+  only adds latency, unless it saw the GPU below 90% one step lower (with tasks waiting, in the last 5
+  minutes): then this level gets more done, and it stays. Below 70%, with tasks waiting for `gpu` and
+  neither the guard nor the cards' memory (95% in use) under pressure, it adds a step back. After a shrink
+  it waits 6 windows before it grows again. Each change is logged. So it settles on the fewest GPU tasks
+  that keep the GPU busy.
   It needs a `gpu` capacity, a served task that requests `gpu`, and monitoring.
 
 The GPU metrics are labelled `gpu` (NVML index) and `uuid`. With several GPUs they are per GPU, and the
