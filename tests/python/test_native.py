@@ -140,3 +140,29 @@ def test_async_raise_none_clears_pending():
     gate.set()
     th.join(5)
     assert errors == []
+
+
+def _lazy_worker(redis_url, queue, linger=None, **kw):
+    return _native.Worker(
+        redis_url, [queue], 1,
+        resources={"vram_gb": 7.5, "pool:tts": 1.0}, task_resources={"t": {"pool:tts": 1.0}},
+        lazy_pools={"tts": ({"vram_gb": 7.2}, 0, linger)}, schedule="oldest", **kw,
+    )
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+def test_lazy_pool_linger_must_be_finite_and_positive(redis_url, queue, bad):
+    with pytest.raises(ValueError, match="linger for pool 'tts'"):
+        _lazy_worker(redis_url, queue, linger=bad)
+
+
+def test_lookahead_and_gpu_bindings(redis_url, queue):
+    worker = _lazy_worker(redis_url, queue, linger=30.0, lookahead=True)
+    assert worker.lookahead_begin() is None  # no workflow demand yet
+    with pytest.raises(ValueError):
+        worker.lookahead_done("tts", True)  # nothing is loading
+    assert worker.blocked("vram_gb") == 0
+    assert ("vram_gb", 7.5, 0.0) in worker.resource_usage()
+    worker.pool_lookahead_loaded("tts")
+    worker.set_gpu_stats([(0, "GPU-x", 0.5, 1 << 30, 8 << 30, None, 70.0, None)])
+    worker.shutdown(1000)

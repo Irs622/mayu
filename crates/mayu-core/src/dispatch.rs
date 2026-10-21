@@ -24,6 +24,9 @@ pub const THROUGHPUT_BONUS: Duration = Duration::from_secs(60);
 /// model load.
 pub const OLDEST_BONUS: Duration = Duration::from_secs(10);
 
+/// After a failed lookahead load of a pool, no new one is granted for it for this long.
+pub const LOOKAHEAD_BACKOFF: Duration = Duration::from_secs(60);
+
 /// A workflow is never counted as older than this, so a bogus id cannot rank a task ahead of everything.
 const MAX_ORIGIN_AGE: Duration = Duration::from_secs(24 * 3600);
 
@@ -63,6 +66,9 @@ pub struct LazyPool {
     pub claim: HashMap<String, f64>,
     /// Instances already loaded when the dispatcher starts (preloaded).
     pub loaded: u32,
+    /// Keep an idle instance loaded up to this long after its last use while its workflows still have work
+    /// for it. None: it may be evicted as soon as it is idle.
+    pub linger: Option<Duration>,
 }
 
 fn milli(amount: f64) -> Option<u64> {
@@ -96,12 +102,24 @@ struct LazyState {
     res: usize,
     /// What one loaded instance holds in the ledger.
     claim: Claim,
-    /// Instances loaded or being loaded (idle or busy).
+    /// Instances loaded or being loaded (idle, busy or loading).
     loaded: u32,
+    /// Instances a lookahead is building: counted in `loaded` and in the ledger, but not usable yet.
+    loading: u32,
     /// Unloads begun and not done: the memory is still in `in_use`.
     unloading: u32,
     /// When a task for this pool was last popped; None until then.
     last_used: Option<Instant>,
+    /// When the pool last had no task running on it (its last task was released, or a lookahead instance
+    /// was built); None until then. `linger` counts from here, not from `last_used`, so a long task doesn't
+    /// use up the idle time.
+    idle_since: Option<Instant>,
+    /// Keep an idle instance this long after `idle_since` while `demand > 0`.
+    linger: Option<Duration>,
+    /// Tasks of this pool still to come in the workflows this worker has seen, as last reported.
+    demand: u32,
+    /// When a lookahead load of this pool last failed.
+    lookahead_failed: Option<Instant>,
 }
 
 /// The lazy pools, sorted by name. Empty for eager and non-pool workers, which never look at it.
@@ -122,7 +140,16 @@ struct Plan {
 impl Lazy {
     fn idle(&self, p: usize, in_use: &[u64]) -> u32 {
         let busy = (in_use[self.pools[p].res] / MILLI as u64) as u32;
-        self.pools[p].loaded.saturating_sub(busy)
+        self.pools[p].loaded.saturating_sub(busy).saturating_sub(self.pools[p].loading)
+    }
+
+    /// Whether `p`'s idle instances are off limits as victims at `now`: its workflows still want it.
+    fn lingering(&self, p: usize, now: Instant) -> bool {
+        let pool = &self.pools[p];
+        match (pool.linger, pool.idle_since) {
+            (Some(linger), Some(since)) => pool.demand > 0 && now < since + linger,
+            _ => false,
+        }
     }
 
     /// How many instances `m` milli-units of `pool:<name>` asks for.
@@ -144,9 +171,20 @@ impl Lazy {
     }
 
     /// Whether `claim` can start now, loading what is missing and evicting idle instances (least recently
-    /// used pool first) for the room; the plan says how. None if it cannot, even with every idle instance gone.
-    fn plan(&self, claim: &Claim, in_use: &[u64], capacity: &[u64]) -> Option<Plan> {
+    /// used pool first, and never one that is lingering) for the room; the plan says how. None if it cannot, even
+    /// with every idle instance gone.
+    fn plan(&self, claim: &Claim, in_use: &[u64], capacity: &[u64], now: Instant) -> Option<Plan> {
         let loads = self.loads_for(claim, in_use, capacity);
+        // An instance that is still loading fits the ledger but cannot run the task, and the pool may allow
+        // no other: wait for it.
+        for &(r, m) in claim {
+            if let Some(p) = self.of_res[r] {
+                let coming = loads.iter().filter(|&&l| l == p).count() as u32;
+                if self.idle(p, in_use) + coming < Self::instances(m) {
+                    return None;
+                }
+            }
+        }
         if loads.is_empty() && claim.iter().all(|&(r, m)| in_use[r] + m <= capacity[r]) {
             return Some(Plan::default());
         }
@@ -170,7 +208,9 @@ impl Lazy {
                 avail[p] = avail[p].saturating_sub(Self::instances(m));
             }
         }
-        let mut order: Vec<usize> = (0..self.pools.len()).filter(|&p| avail[p] > 0).collect();
+        let mut order: Vec<usize> = (0..self.pools.len())
+            .filter(|&p| avail[p] > 0 && !self.lingering(p, now))
+            .collect();
         order.sort_by_key(|&p| (self.pools[p].last_used, p));
         let mut evicts = Vec::new();
         while short.iter().any(|&s| s > 0) {
@@ -358,6 +398,9 @@ impl Dispatcher {
                     pool.loaded, capacity[res] as f64 / MILLI
                 )));
             }
+            if pool.linger == Some(Duration::ZERO) {
+                return Err(Error::Config(format!("lazy pool {name:?} has a linger of zero; use None for no linger")));
+            }
             let mut claim: Claim = Vec::with_capacity(pool.claim.len());
             for (rname, &amount) in &pool.claim {
                 let i = resource_names.binary_search(rname).map_err(|_| {
@@ -378,7 +421,8 @@ impl Dispatcher {
             claim.sort_unstable();
             lazy.of_res[res] = Some(lazy.pools.len());
             lazy.pools.push(LazyState {
-                name: name.clone(), res, claim, loaded: pool.loaded, unloading: 0, last_used: None,
+                name: name.clone(), res, claim, loaded: pool.loaded, loading: 0, unloading: 0, last_used: None,
+                idle_since: None, linger: pool.linger, demand: 0, lookahead_failed: None,
             });
         }
         Ok(Dispatcher {
@@ -474,7 +518,7 @@ impl Dispatcher {
                 let claim = self.requests.get(&h.task.task);
                 let plan = match claim {
                     None => Some(Plan::default()),
-                    Some(c) => self.lazy.plan(c, &self.in_use, &self.capacity),
+                    Some(c) => self.lazy.plan(c, &self.in_use, &self.capacity, now),
                 };
                 let resident = plan.as_ref().is_some_and(|p| p.loads.is_empty() && p.evicts.is_empty());
                 let mut age = now.saturating_duration_since(basis(h));
@@ -523,9 +567,25 @@ impl Dispatcher {
     /// Returns what the task `token` was holding. A no-op for tasks that held nothing or were released.
     /// Returns whether anything was freed.
     pub fn release(&mut self, token: u64) -> bool {
+        if self.lazy.pools.is_empty() {
+            // Nothing lingers, so the release path stays free of a clock read.
+            let Some(claim) = self.held_by.remove(&token) else { return false };
+            for (r, m) in claim {
+                self.in_use[r] -= m;
+            }
+            return true;
+        }
+        self.release_at(token, Instant::now())
+    }
+
+    /// `release` at `now`, which is when the lazy pools the task held start to count as idle (for linger).
+    pub fn release_at(&mut self, token: u64, now: Instant) -> bool {
         let Some(claim) = self.held_by.remove(&token) else { return false };
         for (r, m) in claim {
             self.in_use[r] -= m;
+            if let Some(p) = self.lazy.of_res[r] {
+                self.lazy.pools[p].idle_since = Some(now);
+            }
         }
         true
     }
@@ -582,6 +642,82 @@ impl Dispatcher {
         Ok(())
     }
 
+    /// Sets the demand of the lazy pools named (tasks their workflows still have pending); other pools keep
+    /// theirs and unknown names are ignored. Returns whether a pool's demand dropped to zero, when a lingering
+    /// idle instance may become a victim.
+    pub fn set_demand(&mut self, demand: &[(String, u32)]) -> bool {
+        let mut dropped = false;
+        for (name, n) in demand {
+            if let Some(p) = self.lazy.pools.iter_mut().find(|p| &p.name == name) {
+                dropped |= p.demand > 0 && *n == 0;
+                p.demand = *n;
+            }
+        }
+        dropped
+    }
+
+    /// (pool, demand) for each lazy pool, for metrics.
+    pub fn demand(&self) -> Vec<(String, u32)> {
+        self.lazy.pools.iter().map(|p| (p.name.clone(), p.demand)).collect()
+    }
+
+    /// Grants a speculative load: the first lazy pool (by name) whose workflows want it, that has no idle or
+    /// loading instance, may have another and has room for one without evicting anything. Only a worker with
+    /// nothing due does this, and not again for a pool soon after a failed load. The caller builds the instance
+    /// and calls `lookahead_done`; until then the ledger counts it as loaded but not idle.
+    pub fn lookahead_begin(&mut self, now: Instant) -> Option<String> {
+        if self.held.iter().any(|h| h.at <= now) {
+            return None;
+        }
+        let p = (0..self.lazy.pools.len()).find(|&p| {
+            let pool = &self.lazy.pools[p];
+            pool.demand > 0
+                && pool.loading == 0
+                && self.lazy.idle(p, &self.in_use) == 0
+                && pool.loaded < (self.capacity[pool.res] / MILLI as u64) as u32
+                && self.fits(&pool.claim)
+                && pool.lookahead_failed.is_none_or(|f| now.saturating_duration_since(f) >= LOOKAHEAD_BACKOFF)
+        })?;
+        let pool = &mut self.lazy.pools[p];
+        pool.loaded += 1;
+        pool.loading += 1;
+        // So it isn't the least recently used pool, and the next victim, as soon as it exists.
+        pool.last_used = Some(now);
+        for &(r, m) in &pool.claim {
+            self.in_use[r] += m;
+        }
+        Some(pool.name.clone())
+    }
+
+    /// The instance from `lookahead_begin` is built (`ok`) and idle, or failed and gives its room back.
+    pub fn lookahead_done(&mut self, pool: &str, ok: bool, now: Instant) -> Result<()> {
+        let p = self.lazy.pool_mut(pool)?;
+        if p.loading == 0 {
+            return Err(Error::Config(format!("pool {pool:?} has no lookahead load in progress")));
+        }
+        p.loading -= 1;
+        if ok {
+            p.idle_since = Some(now);
+        } else {
+            p.loaded = p.loaded.saturating_sub(1);
+            p.lookahead_failed = Some(now);
+            for &(r, m) in &p.claim {
+                self.in_use[r] = self.in_use[r].saturating_sub(m);
+            }
+        }
+        Ok(())
+    }
+
+    /// How many tasks due at `now` request `resource` and don't fit now. 0 for a resource not declared.
+    pub fn blocked(&self, resource: &str, now: Instant) -> usize {
+        let Ok(i) = self.resource_names.binary_search_by(|n| n.as_str().cmp(resource)) else { return 0 };
+        self.held.iter()
+            .filter(|h| h.at <= now)
+            .filter_map(|h| self.requests.get(&h.task.task))
+            .filter(|c| c.iter().any(|&(r, _)| r == i) && !self.fits(c))
+            .count()
+    }
+
     /// (pool, instances loaded or being loaded) for each lazy pool, for metrics.
     pub fn lazy_usage(&self) -> Vec<(String, u32)> {
         self.lazy.pools.iter().map(|p| (p.name.clone(), p.loaded)).collect()
@@ -594,10 +730,14 @@ impl Dispatcher {
             .collect()
     }
 
-    /// The earliest time after `now` that a held task comes due. A task already due but waiting for
-    /// resources is not counted: `release` wakes it, and counting it would make waiters spin.
+    /// The earliest time after `now` that a held task comes due, or that an idle instance stops lingering
+    /// (that may let a waiter evict it). A task already due but waiting for resources is not counted:
+    /// `release` wakes it, and counting it would make waiters spin.
     pub fn next_due(&self, now: Instant) -> Option<Instant> {
-        self.held.iter().map(|h| h.at).filter(|&at| at > now).min()
+        let lingers = self.lazy.pools.iter().enumerate()
+            .filter(|(p, pool)| pool.demand > 0 && self.lazy.idle(*p, &self.in_use) > 0)
+            .filter_map(|(_, pool)| Some(pool.idle_since? + pool.linger?));
+        self.held.iter().map(|h| h.at).chain(lingers).filter(|&at| at > now).min()
     }
 
     pub fn drain(&mut self) -> Vec<ReadyTask> {
@@ -661,6 +801,34 @@ impl ReadyQueue {
         self.inner.lock().unwrap().unload_done(pool)?;
         self.cv.notify_all();
         Ok(())
+    }
+
+    /// See `Dispatcher::set_demand`. A pool whose demand ended may now be evicted, which waiters may need.
+    pub(crate) fn set_demand(&self, demand: &[(String, u32)]) {
+        if self.inner.lock().unwrap().set_demand(demand) {
+            self.cv.notify_all();
+        }
+    }
+
+    pub(crate) fn demand(&self) -> Vec<(String, u32)> {
+        self.inner.lock().unwrap().demand()
+    }
+
+    /// See `Dispatcher::lookahead_begin`.
+    pub(crate) fn lookahead_begin(&self) -> Option<String> {
+        self.inner.lock().unwrap().lookahead_begin(Instant::now())
+    }
+
+    /// See `Dispatcher::lookahead_done`. The instance may be what a waiter needs, or its room is free again.
+    pub(crate) fn lookahead_done(&self, pool: &str, ok: bool) -> Result<()> {
+        self.inner.lock().unwrap().lookahead_done(pool, ok, Instant::now())?;
+        self.cv.notify_all();
+        Ok(())
+    }
+
+    /// See `Dispatcher::blocked`.
+    pub(crate) fn blocked(&self, resource: &str) -> usize {
+        self.inner.lock().unwrap().blocked(resource, Instant::now())
     }
 
     pub(crate) fn lazy_usage(&self) -> Vec<(String, u32)> {
@@ -1237,7 +1405,7 @@ mod tests {
     fn lazy_res(caps: &[(&str, f64)], reqs: &[(&str, &[(&str, f64)])], pools: &[PoolSpec]) -> Resources {
         Resources {
             lazy: pools.iter()
-                .map(|(n, c, loaded)| (n.to_string(), LazyPool { claim: limits(c), loaded: *loaded }))
+                .map(|(n, c, loaded)| (n.to_string(), LazyPool { claim: limits(c), loaded: *loaded, ..Default::default() }))
                 .collect(),
             ..res(caps, reqs)
         }
@@ -1730,5 +1898,373 @@ mod tests {
         let at = Instant::now();
         let origin = origin_of(at, 0, 3_600_000);
         assert!(origin == at || at - origin == Duration::from_secs(3600));
+    }
+
+    // ---- linger, lookahead, demand ----
+
+    const LINGER: Duration = Duration::from_secs(30);
+
+    /// two_models(0, 1) where tts has `linger` and was last used at `t0` (its task has finished); gemma's task
+    /// `g` is the one that would have to evict it.
+    fn lingering_tts(linger: Option<Duration>, t0: Instant) -> Dispatcher {
+        let mut r = lazy_res(
+            &[("vram_gb", 7.5), ("pool:gemma", 1.0), ("pool:tts", 1.0)],
+            &[("g", &[("pool:gemma", 1.0)]), ("t", &[("pool:tts", 1.0)])],
+            &[("gemma", &[("vram_gb", 7.4)], 0), ("tts", &[("vram_gb", 7.2)], 1)],
+        );
+        r.lazy.get_mut("tts").unwrap().linger = linger;
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r, Schedule::Oldest).unwrap();
+        d.push(task(1, "t", "q"), t0);
+        assert!(d.pop(t0).is_some());
+        d.release_at(1, t0);
+        d
+    }
+
+    #[test]
+    fn a_lingering_idle_model_is_not_evicted_while_its_workflow_has_demand() {
+        let t0 = Instant::now();
+        let mut d = lingering_tts(Some(LINGER), t0);
+        d.set_demand(&[("tts".to_string(), 1)]);
+        d.push(task(2, "g", "q"), t0 + 10 * Duration::from_secs(1));
+        assert!(d.pop(t0 + Duration::from_secs(10)).is_none(), "tts is lingering");
+        assert!(d.pop(t0 + LINGER - MS).is_none());
+        let t = d.pop(t0 + LINGER + Duration::from_secs(1)).unwrap();
+        assert_eq!((t.loads, t.evicts), (vec!["gemma".to_string()], vec!["tts".to_string()]));
+    }
+
+    #[test]
+    fn linger_counts_from_when_the_model_went_idle_not_from_when_its_task_started() {
+        let t0 = Instant::now();
+        let secs = Duration::from_secs;
+        let mut r = lazy_res(
+            &[("vram_gb", 7.5), ("pool:gemma", 1.0), ("pool:tts", 1.0)],
+            &[("g", &[("pool:gemma", 1.0)]), ("t", &[("pool:tts", 1.0)])],
+            &[("gemma", &[("vram_gb", 7.4)], 0), ("tts", &[("vram_gb", 7.2)], 1)],
+        );
+        r.lazy.get_mut("tts").unwrap().linger = Some(LINGER);
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r, Schedule::Oldest).unwrap();
+        d.push(task(1, "t", "q"), t0);
+        assert!(d.pop(t0).is_some());
+        d.set_demand(&[("tts".to_string(), 1)]);
+        d.push(task(2, "g", "q"), t0 + secs(1));
+        assert!(d.pop(t0 + secs(10)).is_none(), "tts is busy");
+        d.release_at(1, t0 + secs(20));
+        assert!(d.pop(t0 + secs(45)).is_none(), "idle for 25 s of 30");
+        assert_eq!(d.next_due(t0 + secs(45)), Some(t0 + secs(50)));
+        assert_eq!(d.pop(t0 + secs(51)).unwrap().evicts, vec!["tts".to_string()]);
+    }
+
+    #[test]
+    fn a_built_lookahead_instance_lingers_from_when_it_was_built() {
+        let t0 = Instant::now();
+        let mut r = lazy_res(
+            &[("vram_gb", 7.5), ("pool:gemma", 1.0), ("pool:tts", 1.0)],
+            &[("g", &[("pool:gemma", 1.0)])],
+            &[("gemma", &[("vram_gb", 7.4)], 0), ("tts", &[("vram_gb", 7.2)], 0)],
+        );
+        r.lazy.get_mut("tts").unwrap().linger = Some(LINGER);
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r, Schedule::Oldest).unwrap();
+        d.set_demand(&[("tts".to_string(), 1)]);
+        assert_eq!(d.lookahead_begin(t0).as_deref(), Some("tts"));
+        let built = t0 + Duration::from_secs(8);
+        d.lookahead_done("tts", true, built).unwrap();
+        d.push(task(1, "g", "q"), built);
+        assert!(d.pop(built + LINGER - MS).is_none());
+        assert_eq!(d.pop(built + LINGER).unwrap().evicts, vec!["tts".to_string()]);
+    }
+
+    #[test]
+    fn linger_does_not_protect_without_demand_or_without_linger() {
+        let t0 = Instant::now();
+        let at = t0 + Duration::from_secs(10);
+        let mut no_demand = lingering_tts(Some(LINGER), t0);
+        no_demand.push(task(2, "g", "q"), at);
+        assert_eq!(no_demand.pop(at).unwrap().evicts, vec!["tts".to_string()]);
+
+        let mut dropped = lingering_tts(Some(LINGER), t0);
+        dropped.set_demand(&[("tts".to_string(), 2)]);
+        dropped.set_demand(&[("tts".to_string(), 0)]);
+        dropped.push(task(2, "g", "q"), at);
+        assert_eq!(dropped.pop(at).unwrap().evicts, vec!["tts".to_string()]);
+
+        let mut no_linger = lingering_tts(None, t0);
+        no_linger.set_demand(&[("tts".to_string(), 1)]);
+        no_linger.push(task(2, "g", "q"), at);
+        assert_eq!(no_linger.pop(at).unwrap().evicts, vec!["tts".to_string()]);
+    }
+
+    #[test]
+    fn a_model_never_used_is_not_protected_by_linger() {
+        let mut r = lazy_res(
+            &[("vram_gb", 7.5), ("pool:gemma", 1.0), ("pool:tts", 1.0)],
+            &[("g", &[("pool:gemma", 1.0)])],
+            &[("gemma", &[("vram_gb", 7.4)], 0), ("tts", &[("vram_gb", 7.2)], 1)],
+        );
+        r.lazy.get_mut("tts").unwrap().linger = Some(LINGER);
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r, Schedule::Oldest).unwrap();
+        d.set_demand(&[("tts".to_string(), 1)]);
+        let t0 = Instant::now();
+        d.push(task(1, "g", "q"), t0);
+        assert_eq!(d.pop(t0).unwrap().evicts, vec!["tts".to_string()]);
+    }
+
+    #[test]
+    fn next_due_includes_the_linger_expiry_only_while_it_matters() {
+        let t0 = Instant::now();
+        let mut d = lingering_tts(Some(LINGER), t0);
+        d.set_demand(&[("tts".to_string(), 1)]);
+        let at = t0 + Duration::from_secs(10);
+        d.push(task(2, "g", "q"), at);
+        assert!(d.pop(at).is_none());
+        assert_eq!(d.next_due(at), Some(t0 + LINGER));
+        assert_eq!(d.next_due(t0 + LINGER), None, "only instants after now");
+        d.set_demand(&[("tts".to_string(), 0)]);
+        assert_eq!(d.next_due(at), None);
+
+        let mut busy = lingering_tts(Some(LINGER), t0);
+        busy.set_demand(&[("tts".to_string(), 1)]);
+        busy.push(task(3, "t", "q"), t0);
+        assert!(busy.pop(t0).is_some());
+        assert_eq!(busy.next_due(t0), None, "no idle instance: nothing is waiting on the linger");
+    }
+
+    #[test]
+    fn set_demand_ignores_unknown_pools_and_reports_a_drop_to_zero() {
+        let mut d = two_models(0, 0);
+        assert_eq!(d.demand(), vec![("gemma".to_string(), 0), ("tts".to_string(), 0)]);
+        assert!(!d.set_demand(&[("nope".to_string(), 3), ("gemma".to_string(), 2)]));
+        assert_eq!(d.demand(), vec![("gemma".to_string(), 2), ("tts".to_string(), 0)]);
+        assert!(!d.set_demand(&[("gemma".to_string(), 1)]), "lower but not zero");
+        assert!(!d.set_demand(&[("tts".to_string(), 0)]), "already zero");
+        assert!(d.set_demand(&[("gemma".to_string(), 0)]));
+        let mut eager = with_res(&res(&[("gpu", 1.0)], &[]));
+        assert!(!eager.set_demand(&[("gpu".to_string(), 1)]));
+        assert!(eager.demand().is_empty());
+    }
+
+    #[test]
+    fn lookahead_loads_a_model_with_demand_and_counts_it_as_loading() {
+        let mut d = two_models(0, 0);
+        let t0 = Instant::now();
+        assert_eq!(d.lookahead_begin(t0), None, "no demand");
+        d.set_demand(&[("gemma".to_string(), 1)]);
+        assert_eq!(d.lookahead_begin(t0).as_deref(), Some("gemma"));
+        assert_eq!(in_use(&d, "vram_gb"), 7.4);
+        assert_eq!(in_use(&d, "pool:gemma"), 0.0);
+        assert_eq!(loaded(&d), vec![("gemma".to_string(), 1), ("tts".to_string(), 0)]);
+        assert_eq!(d.lookahead_begin(t0), None, "one is already loading");
+
+        // The instance is not built yet, so the task cannot use it, and pool:gemma allows no second one.
+        d.push(task(1, "g", "q"), t0);
+        assert!(d.pop(t0).is_none());
+        d.lookahead_done("gemma", true, t0).unwrap();
+        let t = d.pop(t0).unwrap();
+        assert!(t.loads.is_empty() && t.evicts.is_empty(), "the lookahead instance is reused");
+        assert_eq!(in_use(&d, "vram_gb"), 7.4);
+    }
+
+    #[test]
+    fn a_task_may_load_another_instance_while_one_is_loading_if_the_pool_allows() {
+        let mut d = lazy(
+            &[("vram_gb", 20.0), ("pool:gemma", 2.0)],
+            &[("g", &[("pool:gemma", 1.0)])],
+            &[("gemma", &[("vram_gb", 7.4)], 0)],
+        );
+        let t0 = Instant::now();
+        d.set_demand(&[("gemma".to_string(), 1)]);
+        assert!(d.lookahead_begin(t0).is_some());
+        d.push(task(1, "g", "q"), t0);
+        assert_eq!(d.pop(t0).unwrap().loads, vec!["gemma".to_string()]);
+        assert_eq!(loaded(&d), vec![("gemma".to_string(), 2)]);
+    }
+
+    #[test]
+    fn a_failed_lookahead_gives_the_room_back_and_backs_off() {
+        let mut d = two_models(0, 0);
+        let t0 = Instant::now();
+        d.set_demand(&[("gemma".to_string(), 1)]);
+        assert!(d.lookahead_begin(t0).is_some());
+        d.lookahead_done("gemma", false, t0).unwrap();
+        assert_eq!(in_use(&d, "vram_gb"), 0.0);
+        assert_eq!(loaded(&d), vec![("gemma".to_string(), 0), ("tts".to_string(), 0)]);
+        assert_eq!(d.lookahead_begin(t0 + LOOKAHEAD_BACKOFF - MS), None);
+        assert_eq!(d.lookahead_begin(t0 + LOOKAHEAD_BACKOFF).as_deref(), Some("gemma"));
+        // A task can still load the model itself during the backoff.
+        d.lookahead_done("gemma", true, t0 + LOOKAHEAD_BACKOFF).unwrap();
+        assert_eq!(in_use(&d, "vram_gb"), 7.4);
+    }
+
+    #[test]
+    fn lookahead_grants_nothing_unless_every_condition_holds() {
+        let t0 = Instant::now();
+        let demand = |d: &mut Dispatcher| {
+            d.set_demand(&[("gemma".to_string(), 1), ("tts".to_string(), 1)]);
+        };
+        // An idle instance exists (gemma); tts would need the room gemma holds.
+        let mut d = two_models(1, 0);
+        demand(&mut d);
+        assert_eq!(d.lookahead_begin(t0), None, "gemma is idle and tts needs an eviction");
+        // Only an eviction would make room.
+        let mut d = two_models(0, 1);
+        d.set_demand(&[("gemma".to_string(), 1)]);
+        assert_eq!(d.lookahead_begin(t0), None);
+        // A due held task: busy workers don't speculate; one that is not due yet does not count.
+        let mut d = two_models(0, 0);
+        demand(&mut d);
+        d.hold(task(1, "g", "q"), t0 + Duration::from_secs(5));
+        assert_eq!(d.lookahead_begin(t0).as_deref(), Some("gemma"));
+        let mut d = two_models(0, 0);
+        demand(&mut d);
+        d.push(task(1, "g", "q"), t0);
+        assert_eq!(d.lookahead_begin(t0), None);
+        // pool:gemma is at its limit (one busy instance), even though the room is there.
+        let mk = |instances: f64| lazy(
+            &[("vram_gb", 20.0), ("pool:gemma", instances)],
+            &[("g", &[("pool:gemma", 1.0)])],
+            &[("gemma", &[("vram_gb", 7.4)], 0)],
+        );
+        let mut d = mk(1.0);
+        d.push(task(1, "g", "q"), t0);
+        assert!(d.pop(t0).is_some());
+        d.set_demand(&[("gemma".to_string(), 1)]);
+        assert_eq!(d.lookahead_begin(t0), None);
+        let mut d = mk(2.0);
+        d.push(task(1, "g", "q"), t0);
+        assert!(d.pop(t0).is_some());
+        d.set_demand(&[("gemma".to_string(), 1)]);
+        assert_eq!(d.lookahead_begin(t0).as_deref(), Some("gemma"), "a second instance is allowed");
+    }
+
+    #[test]
+    fn lookahead_grants_one_pool_per_call_in_name_order() {
+        let mut d = lazy(
+            &[("vram_gb", 20.0), ("pool:gemma", 1.0), ("pool:tts", 1.0)],
+            &[],
+            &[("gemma", &[("vram_gb", 7.4)], 0), ("tts", &[("vram_gb", 7.2)], 0)],
+        );
+        let t0 = Instant::now();
+        d.set_demand(&[("tts".to_string(), 1), ("gemma".to_string(), 1)]);
+        assert_eq!(d.lookahead_begin(t0).as_deref(), Some("gemma"));
+        assert_eq!(d.lookahead_begin(t0).as_deref(), Some("tts"));
+        assert_eq!(d.lookahead_begin(t0), None);
+        assert_eq!(in_use(&d, "vram_gb"), 14.6);
+    }
+
+    #[test]
+    fn a_lookahead_model_is_not_the_next_victim() {
+        // Granted at t0 it counts as used at t0, so an older idle model is evicted before it.
+        let mut d = lazy(
+            &[("vram_gb", 15.0), ("pool:a", 1.0), ("pool:b", 1.0), ("pool:c", 1.0)],
+            &[("ta", &[("pool:a", 1.0)]), ("tc", &[("pool:c", 1.0)])],
+            &[("a", &[("vram_gb", 5.0)], 1), ("b", &[("vram_gb", 5.0)], 0), ("c", &[("vram_gb", 8.0)], 0)],
+        );
+        let t0 = far();
+        d.push(task(1, "ta", "q"), t0 - 10 * Duration::from_secs(1));
+        assert!(d.pop(t0 - 10 * Duration::from_secs(1)).is_some());
+        d.release(1);
+        d.set_demand(&[("b".to_string(), 1)]);
+        assert_eq!(d.lookahead_begin(t0).as_deref(), Some("b"));
+        d.lookahead_done("b", true, t0).unwrap();
+        d.push(task(2, "tc", "q"), t0);
+        assert_eq!(d.pop(t0).unwrap().evicts, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn blocked_counts_due_tasks_that_do_not_fit_and_use_the_resource() {
+        let mut d = with_res(&res(
+            &[("gpu", 1.0), ("cpu", 4.0)],
+            &[("half", &[("gpu", 0.5)]), ("big", &[("gpu", 1.0)]), ("small", &[("cpu", 0.5)])],
+        ));
+        let t0 = Instant::now();
+        d.push(task(1, "half", "q"), t0);
+        assert_eq!(tokens(&mut d, t0), vec![1]);
+        d.push(task(2, "big", "q"), t0);
+        d.push(task(3, "half", "q"), t0 + 10 * MS); // not due
+        d.push(task(4, "small", "q"), t0); // fits
+        d.push(task(5, "big", "q"), t0);
+        assert_eq!(d.blocked("gpu", t0), 2);
+        assert_eq!(d.blocked("cpu", t0), 0);
+        assert_eq!(d.blocked("nope", t0), 0);
+        assert_eq!(d.blocked("gpu", t0 + 10 * MS), 2, "the half task fits and is not counted");
+        d.release(1);
+        assert_eq!(d.blocked("gpu", t0), 0, "everything fits again");
+    }
+
+    #[test]
+    fn lookahead_and_unload_calls_reject_unknown_pools() {
+        let mut d = two_models(0, 0);
+        let t0 = Instant::now();
+        let bad = |r: Result<()>| matches!(r, Err(Error::Config(_)));
+        assert!(bad(d.lookahead_done("nope", true, t0)));
+        assert!(bad(d.lookahead_done("gemma", true, t0)), "nothing is loading");
+        assert!(bad(d.lookahead_done("gemma", false, t0)));
+        assert_eq!(loaded(&d), vec![("gemma".to_string(), 0), ("tts".to_string(), 0)]);
+        d.set_demand(&[("gemma".to_string(), 1)]);
+        assert!(d.lookahead_begin(t0).is_some());
+        d.lookahead_done("gemma", true, t0).unwrap();
+        assert!(bad(d.lookahead_done("gemma", true, t0)), "finished once");
+        let mut eager = with_res(&res(&[("gpu", 1.0), ("pool:m", 1.0)], &[]));
+        assert!(bad(eager.lookahead_done("m", true, t0)), "not a lazy pool");
+        assert_eq!(eager.lookahead_begin(t0), None);
+    }
+
+    #[test]
+    fn a_zero_linger_is_rejected() {
+        let mk = |linger| {
+            let mut r = lazy_res(
+                &[("vram_gb", 7.5), ("pool:gemma", 1.0)], &[], &[("gemma", &[("vram_gb", 7.4)], 0)],
+            );
+            r.lazy.get_mut("gemma").unwrap().linger = linger;
+            Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r, Schedule::Oldest).map(|_| ())
+        };
+        assert!(matches!(mk(Some(Duration::ZERO)), Err(Error::Config(_))));
+        assert!(mk(Some(MS)).is_ok() && mk(None).is_ok());
+    }
+
+    #[test]
+    fn ready_queue_set_demand_dropping_to_zero_wakes_a_waiter() {
+        let mut r = lazy_res(
+            &[("vram_gb", 7.5), ("pool:gemma", 1.0), ("pool:tts", 1.0)],
+            &[("g", &[("pool:gemma", 1.0)]), ("t", &[("pool:tts", 1.0)])],
+            &[("gemma", &[("vram_gb", 7.4)], 0), ("tts", &[("vram_gb", 7.2)], 1)],
+        );
+        r.lazy.get_mut("tts").unwrap().linger = Some(Duration::from_secs(60));
+        let q = Arc::new(ReadyQueue::new(
+            Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r, Schedule::Oldest).unwrap(),
+        ));
+        q.push(task(1, "t", "q"), Instant::now());
+        assert_eq!(q.recv_timeout(Duration::from_secs(1)).map(|t| t.token), Some(1));
+        q.release(1);
+        q.set_demand(&[("tts".to_string(), 1)]);
+        assert_eq!(q.demand(), vec![("gemma".to_string(), 0), ("tts".to_string(), 1)]);
+        q.push(task(2, "g", "q"), Instant::now());
+        assert!(q.recv_timeout(100 * MS).is_none(), "tts lingers");
+
+        let q2 = q.clone();
+        let h = std::thread::spawn(move || q2.recv_timeout(Duration::from_secs(5)).map(|t| t.token));
+        std::thread::sleep(50 * MS);
+        let t = Instant::now();
+        q.set_demand(&[("tts".to_string(), 0)]);
+        assert_eq!(h.join().unwrap(), Some(2));
+        assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn ready_queue_lookahead_done_wakes_a_waiter_and_blocked_counts_now() {
+        let q = Arc::new(ReadyQueue::new(two_models(0, 0)));
+        q.set_demand(&[("gemma".to_string(), 1)]);
+        assert_eq!(q.lookahead_begin().as_deref(), Some("gemma"));
+        q.push(task(1, "g", "q"), Instant::now());
+        assert!(q.recv_timeout(100 * MS).is_none(), "the instance is still loading");
+        assert_eq!(q.blocked("pool:gemma"), 0, "pool:gemma is free; the task waits for the load, not the pool");
+
+        let q2 = q.clone();
+        let h = std::thread::spawn(move || q2.recv_timeout(Duration::from_secs(5)).map(|t| t.token));
+        std::thread::sleep(50 * MS);
+        let t = Instant::now();
+        q.lookahead_done("gemma", true).unwrap();
+        assert_eq!(h.join().unwrap(), Some(1));
+        assert!(t.elapsed() < Duration::from_secs(1));
+        assert!(matches!(q.lookahead_done("gemma", true), Err(Error::Config(_))));
     }
 }

@@ -3,7 +3,10 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use mayu_core::{Error, Header, MemoryBroker, Outcome, Resources, RetryPolicy, Runtime, RuntimeConfig, Schedule};
+use mayu_core::{
+    Broker, Error, GpuStat, Header, MemoryBroker, Outcome, Resources, RetryPolicy, Runtime, RuntimeConfig, Schedule,
+    WorkflowNode, WorkflowSpec,
+};
 
 fn cfg(concurrency: usize, prefetch: usize) -> RuntimeConfig {
     RuntimeConfig {
@@ -228,8 +231,8 @@ fn lazy_cfg() -> RuntimeConfig {
                 ("t".to_string(), [("pool:tts".to_string(), 1.0)].into()),
             ].into(),
             lazy: [
-                ("gemma".to_string(), LazyPool { claim: [("vram_gb".to_string(), 7.4)].into(), loaded: 1 }),
-                ("tts".to_string(), LazyPool { claim: [("vram_gb".to_string(), 7.2)].into(), loaded: 0 }),
+                ("gemma".to_string(), LazyPool { claim: [("vram_gb".to_string(), 7.4)].into(), loaded: 1, ..Default::default() }),
+                ("tts".to_string(), LazyPool { claim: [("vram_gb".to_string(), 7.2)].into(), loaded: 0, ..Default::default() }),
             ].into(),
         },
         schedule: Schedule::Oldest,
@@ -269,5 +272,114 @@ fn eager_workers_have_no_lazy_pool_families() {
     let mem = MemoryBroker::default();
     let rt = start(&mem, gpu_cfg());
     assert!(!scrape(&rt).contains("mayu_pool_loaded"));
+    rt.shutdown(Duration::from_secs(1));
+}
+
+fn wf_node(task: &str, parents: &[usize]) -> WorkflowNode {
+    WorkflowNode { header: Header::new(task, "q", 0, "ct"), payload: Vec::new(), parents: parents.to_vec() }
+}
+
+fn submit(mem: &MemoryBroker, wf: &WorkflowSpec) {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(mem.submit_workflow(wf)).unwrap();
+}
+
+fn workflow_state(mem: &MemoryBroker, id: &str) -> &'static str {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(mem.workflow(id)).unwrap().unwrap().summary().state
+}
+
+#[test]
+fn lookahead_demand_counts_the_pending_pool_nodes_of_workflows_this_worker_runs() {
+    let mem = MemoryBroker::default();
+    let wf = WorkflowSpec::new("w", 3600, vec![wf_node("a", &[]), wf_node("t", &[0])]);
+    submit(&mem, &wf);
+    let rt = start(&mem, RuntimeConfig { lookahead: true, ..lazy_cfg() });
+    let a = rt.recv_timeout(RECV).expect("node a");
+    assert_eq!(a.task, "a");
+    // `t` is still waiting on `a`, and `a` is not done: the workflow's tts work counts as demand.
+    wait_until(|| value(&scrape(&rt), r#"mayu_pool_demand{pool="tts"}"#) == Some(1.0));
+    assert_eq!(value(&scrape(&rt), r#"mayu_pool_demand{pool="gemma"}"#), Some(0.0));
+    rt.complete(a.token, Outcome::Success { result: None, links: vec![] });
+    let t = rt.recv_timeout(RECV).expect("node t, released by a's ack");
+    assert_eq!(t.task, "t");
+    assert_eq!(value(&scrape(&rt), r#"mayu_pool_demand{pool="tts"}"#), Some(1.0), "queued still counts");
+    rt.complete(t.token, Outcome::Success { result: None, links: vec![] });
+    wait_until(|| workflow_state(&mem, &wf.id) == "done");
+    wait_until(|| value(&scrape(&rt), r#"mayu_pool_demand{pool="tts"}"#) == Some(0.0));
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn lookahead_demand_of_a_cancelled_workflow_returns_to_zero() {
+    let mem = MemoryBroker::default();
+    let wf = WorkflowSpec::new("w", 3600, vec![wf_node("a", &[]), wf_node("t", &[0])]);
+    submit(&mem, &wf);
+    let rt = start(&mem, RuntimeConfig { lookahead: true, ..lazy_cfg() });
+    let a = rt.recv_timeout(RECV).expect("node a");
+    wait_until(|| value(&scrape(&rt), r#"mayu_pool_demand{pool="tts"}"#) == Some(1.0));
+    let tokio_rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    assert!(tokio_rt.block_on(mem.cancel_workflow(&wf.id)).unwrap());
+    rt.complete(a.token, Outcome::Success { result: None, links: vec![] });
+    wait_until(|| value(&scrape(&rt), r#"mayu_pool_demand{pool="tts"}"#) == Some(0.0));
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn the_lookahead_loop_runs_only_with_lazy_pools_and_lookahead_or_linger() {
+    use mayu_core::dispatch::LazyPool;
+    let demand_family = |c: RuntimeConfig| {
+        let rt = start(&MemoryBroker::default(), c);
+        let body = scrape(&rt);
+        rt.shutdown(Duration::from_secs(1));
+        body.contains("mayu_pool_demand")
+    };
+    assert!(!demand_family(lazy_cfg()), "lazy pools alone don't need demand");
+    assert!(demand_family(RuntimeConfig { lookahead: true, ..lazy_cfg() }));
+    assert!(!demand_family(RuntimeConfig { lookahead: true, ..gpu_cfg() }), "no lazy pools, nothing to look ahead for");
+    let mut lingering = lazy_cfg();
+    lingering.resources.lazy.insert(
+        "tts".into(),
+        LazyPool { claim: [("vram_gb".to_string(), 7.2)].into(), linger: Some(Duration::from_secs(30)), ..Default::default() },
+    );
+    assert!(demand_family(lingering), "a lingering pool needs demand too");
+}
+
+#[test]
+fn gpu_stats_are_rendered_from_the_last_push() {
+    let mem = MemoryBroker::default();
+    let rt = start(&mem, cfg(1, 1));
+    assert!(!scrape(&rt).contains("mayu_gpu"));
+    let stat = |index, util| GpuStat {
+        index,
+        uuid: format!("GPU-{index}"),
+        utilization: util,
+        memory_used: 1 << 30,
+        memory_total: 8 << 30,
+        process_memory: None,
+        power_watts: Some(70.0),
+        temperature_c: None,
+    };
+    rt.set_gpu_stats(vec![stat(0, 0.25)]);
+    rt.set_gpu_stats(vec![stat(0, 0.75), stat(1, 0.5)]);
+    let body = scrape(&rt);
+    assert_eq!(value(&body, r#"mayu_gpu_utilization_ratio{gpu="0",uuid="GPU-0"}"#), Some(0.75));
+    assert_eq!(value(&body, r#"mayu_gpu_utilization_ratio{gpu="1",uuid="GPU-1"}"#), Some(0.5));
+    assert_eq!(value(&body, r#"mayu_gpu_memory_total_bytes{gpu="0",uuid="GPU-0"}"#), Some((8u64 << 30) as f64));
+    assert_eq!(value(&body, r#"mayu_gpu_power_watts{gpu="1",uuid="GPU-1"}"#), Some(70.0));
+    assert!(!body.contains("mayu_gpu_process_memory_bytes") && !body.contains("mayu_gpu_temperature_celsius"), "{body}");
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn lookahead_passthroughs_follow_the_ledger() {
+    let mem = MemoryBroker::default();
+    let rt = start(&mem, lazy_cfg());
+    assert_eq!(rt.lookahead_begin(), None, "no demand");
+    assert!(matches!(rt.lookahead_done("tts", true), Err(Error::Config(_))), "nothing is loading");
+    assert_eq!(rt.blocked("vram_gb"), 0);
+    assert!(rt.usage().iter().any(|(r, cap, _)| r == "vram_gb" && *cap == 7.5));
+    rt.pool_lookahead_loaded("tts");
+    assert_eq!(value(&scrape(&rt), r#"mayu_pool_lookahead_loads_total{pool="tts"}"#), Some(1.0));
     rt.shutdown(Duration::from_secs(1));
 }

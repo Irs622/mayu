@@ -26,6 +26,29 @@ def test_pool_decorator_returns_a_pool(app):
     assert repr(gemma) == "<Pool 'gemma'>"
 
 
+def test_pool_linger_is_stored_and_defaults_to_none(app):
+    assert app.pool("a")(lambda ctx: None).linger is None
+    assert app.pool("b", linger=None)(lambda ctx: None).linger is None
+    assert app.pool("c", linger=30)(lambda ctx: None).linger == 30.0
+    assert app.pool("d", linger=0.5)(lambda ctx: None).linger == 0.5
+    assert app.pool("e", vram_gb=1, linger=2)(lambda ctx: None).resources == {"vram_gb": 1}
+
+
+@pytest.mark.parametrize("bad,exc,message", [
+    (True, TypeError, "linger must be a number of seconds"),
+    ("30", TypeError, "linger must be a number of seconds"),
+    ([30], TypeError, "linger must be a number of seconds"),
+    (0, ValueError, "linger must be above 0"),
+    (-1.5, ValueError, "linger must be above 0"),
+    (float("inf"), ValueError, "linger must be a finite"),
+    (float("nan"), ValueError, "linger must be a finite"),
+])
+def test_bad_pool_linger_is_rejected(app, bad, exc, message):
+    with pytest.raises(exc, match=message):
+        app.pool("gemma", linger=bad)
+    assert app.pools == {}
+
+
 def test_close_registers_once_and_returns_the_function(app):
     @app.pool("tts")
     def tts(ctx): ...

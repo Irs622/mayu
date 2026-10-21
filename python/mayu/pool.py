@@ -1,5 +1,6 @@
 """Model pools: a fixed number of instances of an expensive object, built once per worker and lent to tasks."""
 import dataclasses
+import math
 import re
 import threading
 
@@ -50,10 +51,24 @@ def check_discard_on(discard_on) -> tuple:
     return classes
 
 
+def check_linger(linger) -> float | None:
+    """`linger=` of a lazy pool: seconds an idle instance is kept while a workflow still needs it, or None."""
+    if linger is None:
+        return None
+    if isinstance(linger, bool) or not isinstance(linger, (int, float)):
+        raise TypeError(f"linger must be a number of seconds like 30, or None; got {linger!r}")
+    if math.isnan(linger) or math.isinf(linger):
+        raise ValueError(f"linger must be a finite number of seconds above 0, or None; got {linger!r}")
+    if linger <= 0:
+        raise ValueError(f"linger must be above 0 seconds (use None to turn it off); got {linger!r}")
+    return float(linger)
+
+
 class Pool:
     """A pool made with ``app.pool``; ``@pool.close`` registers the function that unloads an instance."""
 
-    def __init__(self, app, name: str, factory, resources: dict[str, float], discard_on: tuple):
+    def __init__(self, app, name: str, factory, resources: dict[str, float], discard_on: tuple,
+                 linger: float | None = None):
         if not callable(factory):
             raise TypeError(f"the factory of pool {name!r} must be callable, got {factory!r}")
         self.app = app
@@ -61,6 +76,7 @@ class Pool:
         self.factory = factory
         self.resources = resources
         self.discard_on = discard_on
+        self.linger = linger  # lazy mode only
         self.closer = None
         self._lock = threading.Lock()
 

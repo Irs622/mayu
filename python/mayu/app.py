@@ -4,7 +4,7 @@ import threading
 
 from . import _native
 from .handle import TaskHandle
-from .pool import Pool, Use, check_discard_on, check_pool_name
+from .pool import Pool, Use, check_discard_on, check_linger, check_pool_name
 from .serializers import PICKLE, get_serializer
 from .task import Task, _enqueue, check_resources
 from .workflow import Workflow
@@ -90,14 +90,18 @@ class App:
             raise TypeError(f"unknown task option(s) {sorted(unknown)}; valid options: {sorted(_TASK_OPTIONS)}")
         return register(fn) if fn is not None else register
 
-    def pool(self, name: str, /, *, discard_on=(), **resources):
-        """Decorator registering ``fn(ctx)`` as the factory of a pool; resources are per instance."""
+    def pool(self, name: str, /, *, discard_on=(), linger: float | None = None, **resources):
+        """Decorator registering ``fn(ctx)`` as the factory of a pool; resources are per instance.
+
+        ``linger`` (lazy mode only) keeps an idle instance for that many seconds while a running workflow still
+        has a node waiting for it."""
         check_pool_name(name)
+        linger = check_linger(linger)
         resources = check_resources(f"resources of pool {name!r}", resources)
         discard_on = check_discard_on(discard_on)
 
         def register(factory):
-            pool = Pool(self, name, factory, resources, discard_on)
+            pool = Pool(self, name, factory, resources, discard_on, linger)
             with self._registry_lock:
                 if name in self.pools:
                     raise ValueError(f"pool {name!r} is already registered")

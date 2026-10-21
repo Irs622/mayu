@@ -4,8 +4,12 @@ import uuid
 
 import pytest
 
-from mayu import App
+from mayu import App, gpu
 from mayu.worker import WorkerRunner
+
+# A worker in `--gpu-monitor auto` would pick up this machine's real GPU, and whatever else uses it would feed the
+# VRAM guard and make tests flaky. test_gpu.py installs fake backends (or builds `gpu.Nvml` directly) instead.
+gpu._create_nvml = lambda: None
 
 REDIS_URL = os.environ.get("MAYU_TEST_REDIS", "redis://127.0.0.1:6390/0")
 

@@ -12,14 +12,14 @@ pub mod workflow;
 
 pub use broker::{Broker, Delivery, QueueStats, Reclaimed, StoredResult, WorkerInfo};
 pub use dispatch::{
-    Admit, Dispatcher, HOLD_HORIZON, LazyPool, OLDEST_BONUS, RESERVE_AFTER, Resources, Schedule, THROUGHPUT_BONUS,
+    Admit, Dispatcher, HOLD_HORIZON, LOOKAHEAD_BACKOFF, LazyPool, OLDEST_BONUS, RESERVE_AFTER, Resources, Schedule, THROUGHPUT_BONUS,
 };
 pub use envelope::{
     Header, decode_delayed_member, decode_header, encode_delayed_member, encode_header, now_ms,
 };
 pub use error::{Error, Result};
 pub use memory::{DeadEntry, MemoryBroker};
-pub use metrics::{DURATION_BUCKETS, Gauges, Metrics, Settled};
+pub use metrics::{DURATION_BUCKETS, Gauges, GpuStat, Metrics, Settled};
 pub use policy::{Action, Link, Outcome, RetryPolicy, backoff_ms, decide, full_jitter};
 pub use result::{ResultRecord, wait_result};
 pub use runtime::{ReadyTask, Runtime, RuntimeConfig};

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use mayu_core::{
-    Broker, Header, LazyPool, Link, Outcome, ReadyTask, Resources, Runtime, RuntimeConfig, Schedule, WorkflowNode,
+    Broker, GpuStat, Header, LazyPool, Link, Outcome, ReadyTask, Resources, Runtime, RuntimeConfig, Schedule, WorkflowNode,
     WorkflowSpec, WorkflowState,
 };
 use mayu_redis::RedisBroker;
@@ -22,8 +22,23 @@ fn core_err(e: mayu_core::Error) -> PyErr {
     }
 }
 
-/// pool name -> (resources one loaded instance holds, instances loaded at start)
-type LazyPoolArgs = HashMap<String, (HashMap<String, f64>, u32)>;
+/// pool name -> (resources one loaded instance holds, instances loaded at start, idle seconds to linger)
+type LazyPoolArgs = HashMap<String, (HashMap<String, f64>, u32, Option<f64>)>;
+
+/// (index, uuid, utilization, memory used, memory total, process memory, power watts, temperature C)
+type GpuArgs = (u32, String, f64, u64, u64, Option<u64>, Option<f64>, Option<f64>);
+
+fn lazy_pool(name: &str, (claim, loaded, linger): (HashMap<String, f64>, u32, Option<f64>)) -> PyResult<LazyPool> {
+    let linger = linger
+        .map(|secs| match Duration::try_from_secs_f64(secs) {
+            Ok(d) if !d.is_zero() => Ok(d),
+            _ => Err(PyValueError::new_err(format!(
+                "linger for pool '{name}' must be a finite number of seconds above 0, got {secs}"
+            ))),
+        })
+        .transpose()?;
+    Ok(LazyPool { claim, loaded, linger })
+}
 
 /// (task, queue, payload, content_type, max_retries, parents, trace_ctx)
 type NodeArgs = (String, String, Vec<u8>, String, u32, Vec<usize>, Option<String>);
@@ -208,7 +223,7 @@ struct Worker {
 #[pymethods]
 impl Worker {
     #[new]
-    #[pyo3(signature = (url, queues, concurrency, prefetch_multiplier=2, result_ttl_secs=None, consumer=None, visibility_timeout_ms=None, reclaim_interval_ms=None, heartbeat_interval_ms=None, max_deliveries=None, strict_priority=false, rate_limits=None, metrics_addr=None, resources=None, task_resources=None, lazy_pools=None, schedule=None))]
+    #[pyo3(signature = (url, queues, concurrency, prefetch_multiplier=2, result_ttl_secs=None, consumer=None, visibility_timeout_ms=None, reclaim_interval_ms=None, heartbeat_interval_ms=None, max_deliveries=None, strict_priority=false, rate_limits=None, metrics_addr=None, resources=None, task_resources=None, lazy_pools=None, schedule=None, lookahead=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -229,6 +244,7 @@ impl Worker {
         task_resources: Option<HashMap<String, HashMap<String, f64>>>,
         lazy_pools: Option<LazyPoolArgs>,
         schedule: Option<String>,
+        lookahead: bool,
     ) -> PyResult<Self> {
         let schedule = match schedule.as_deref() {
             None => Schedule::Fifo,
@@ -240,6 +256,9 @@ impl Worker {
                 )));
             }
         };
+        let lazy = lazy_pools.unwrap_or_default().into_iter()
+            .map(|(name, args)| lazy_pool(&name, args).map(|p| (name, p)))
+            .collect::<PyResult<HashMap<_, _>>>()?;
         let consumer = consumer.unwrap_or_else(|| format!("w-{}-{}", std::process::id(), ulid::Ulid::generate()));
         let mut cfg = RuntimeConfig {
             queues, concurrency, prefetch_multiplier, result_ttl_secs,
@@ -249,11 +268,10 @@ impl Worker {
             resources: Resources {
                 capacity: resources.unwrap_or_default(),
                 requests: task_resources.unwrap_or_default(),
-                lazy: lazy_pools.unwrap_or_default().into_iter()
-                    .map(|(name, (claim, loaded))| (name, LazyPool { claim, loaded }))
-                    .collect(),
+                lazy,
             },
             schedule,
+            lookahead,
             ..RuntimeConfig::default()
         };
         if let Some(v) = visibility_timeout_ms { cfg.visibility_timeout_ms = v; }
@@ -332,6 +350,42 @@ impl Worker {
 
     fn pool_evicted(&self, name: &str) {
         self.inner.pool_evicted(name);
+    }
+
+    /// Lazy pools: an instance was built ahead of need (also call `pool_loaded`).
+    fn pool_lookahead_loaded(&self, name: &str) {
+        self.inner.pool_lookahead_loaded(name);
+    }
+
+    /// Lazy pools: a pool name means the ledger already counts one more instance of it as loading; build it
+    /// and call `lookahead_done`. None when there is nothing to load ahead.
+    fn lookahead_begin(&self) -> Option<String> {
+        self.inner.lookahead_begin()
+    }
+
+    /// Lazy pools: the instance from `lookahead_begin` is built (`ok`) or its build failed.
+    fn lookahead_done(&self, name: &str, ok: bool) -> PyResult<()> {
+        self.inner.lookahead_done(name, ok).map_err(core_err)
+    }
+
+    /// Due tasks that need `resource` and don't fit now.
+    fn blocked(&self, resource: &str) -> usize {
+        self.inner.blocked(resource)
+    }
+
+    /// (resource, capacity, in use) for each resource, pools included as `pool:<name>`.
+    fn resource_usage(&self) -> Vec<(String, f64, f64)> {
+        self.inner.usage()
+    }
+
+    /// The GPU samples `/metrics` reports; each push replaces the last.
+    fn set_gpu_stats(&self, stats: Vec<GpuArgs>) {
+        let stats = stats.into_iter()
+            .map(|(index, uuid, utilization, memory_used, memory_total, process_memory, power_watts, temperature_c)| {
+                GpuStat { index, uuid, utilization, memory_used, memory_total, process_memory, power_watts, temperature_c }
+            })
+            .collect();
+        self.inner.set_gpu_stats(stats);
     }
 
     fn stop_fetching(&self) {
