@@ -151,6 +151,65 @@ than it has; tasks on other queues are ignored. Tasks without `resources=` are n
   time limit is reported as failed while its thread keeps running, so until the worker
   recycles, a zombie can use a GPU that a new task has already been given.
 
+## Model pools
+
+```python
+@app.pool("gemma", vram_gb=5.8)             # resources are per instance
+def gemma(ctx):                             # ctx.name, ctx.index in range(ctx.size), ctx.size
+    return load_gemma(device="cuda")
+
+@gemma.close
+def _(model):
+    model.unload()
+
+@app.task(queue="gpu")
+def encode(text, model=app.use("gemma")): ...   # model is one instance, yours alone until the task ends
+```
+
+```bash
+mayu worker tasks:app --queues gpu --pools gemma=2,tts=3 --resources gpu=1,vram_gb=40   # or MAYU_POOLS
+```
+
+Code says how to build an instance; the operator says how many. A worker builds every instance
+before it fetches anything, one at a time and logging each load time, and keeps them for its life.
+At most N tasks that use a pool of N run at once, so a task always finds a free instance and never
+waits inside the task body: it waits in the worker's queue, like any task held back by
+`resources=`. A task gets its instances before its time limits start and gives them back before
+its outcome is reported.
+
+- **Reservations:** a pool's resources are reserved for the worker's life, N × the amount, and
+  come off what `--resources` leaves for tasks. `gemma=2` above holds 11.6 GB of `vram_gb`; a
+  task asking for more than the remaining 28.4 makes the worker refuse to start. Resource names
+  starting with `pool:` are reserved.
+- **Startup checks:** a worker refuses to start if a task it serves uses a pool that the process
+  doesn't register with `@app.pool` or that `--pools` doesn't size, if `--pools` names an
+  unregistered pool, or if the reservations exceed what it declares. A pool sized but unused by the
+  queues it serves is not loaded (a warning is logged). If a factory raises while loading, the
+  instances built so far are closed and the worker exits.
+- **Broken instances:** raise `DiscardInstance` (`DiscardInstance(pool="gemma")` to discard only
+  that pool's instance, otherwise all the task holds), or list exception classes in
+  `@app.pool(..., discard_on=CudaError)`. The task still fails or retries by its usual rules
+  (`retry_on=(DiscardInstance,)` retries it on another instance). After the outcome is reported,
+  the instance is closed and a replacement built with the same `ctx.index`; the pool runs one
+  instance short meanwhile. If the rebuild fails, the pool stays smaller and
+  `mayu_pool_size` shows it. A pool with no instances left makes the worker recycle.
+- **Close:** `@pool.close` runs on discarded instances and, at shutdown, on every instance that is
+  back in the pool. Instances still held by threads that outlive the shutdown grace period are not
+  closed. Errors in `close` are logged and ignored.
+- **Zombies:** a task past its hard time limit is reported as failed while its thread keeps its
+  instance, so the pool shrinks by one for good: the instance is never reused or closed, because
+  the thread may still be using it. Recycling brings the pool back to full size.
+- **Per process:** each worker process loads its own instances, in process mode and with `--gpus`
+  too, so size pools for one process or one GPU. A recycle restarts the process and reloads every
+  instance, so recycling a worker with big models costs their load time.
+- **Sync tasks only:** an `async def` task can't use a pool (`TypeError` at registration). A task
+  can use each pool in only one parameter, and the parameter must be usable by keyword.
+- **Producers need no pool code:** `app.use("gemma")` is only a name, resolved when a worker
+  starts, so a producer can declare the task (see below) without torch or `@app.pool`. Passing
+  the pool's parameter to `send()`, `wf.add()` or a `link=` raises `TypeError`. A payload that
+  carries it anyway, only possible with `app.send` by name, has its keyword value overwritten by
+  the instance, and a positional one fails the task with a duplicate-argument `TypeError`.
+
 ## Queue priority
 
 ```bash
@@ -274,6 +333,11 @@ processes listen on 9100–9103, so scrape all four. `MAYU_METRICS_PORT` sets th
 | `mayu_worker_concurrency`, `mayu_tasks_inflight`, `mayu_tasks_running` | gauge | |
 | `mayu_queue_ready`, `mayu_queue_pending`, `mayu_queue_delayed`, `mayu_queue_dead` | gauge | `queue` |
 | `mayu_resource_capacity`, `mayu_resource_in_use` | gauge | `resource` (only with `--resources`) |
+| `mayu_pool_size`, `mayu_pool_busy` | gauge | `pool` (only with `--pools`; instances in the pool, and held by running tasks) |
+| `mayu_pool_rebuilds_total` | counter | `pool` (instances replaced after `DiscardInstance` or `discard_on`) |
+
+Pools are counted in the resource ledger as `pool:<name>`, but they appear only as `mayu_pool_*`, never under
+`mayu_resource_*`.
 
 Queue gauges are read from Redis on each scrape, so every worker reports the same values: use
 `max by (queue) (mayu_queue_ready)`. If Redis cannot be read, the scrape still answers without them.

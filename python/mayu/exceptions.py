@@ -23,3 +23,11 @@ class SoftTimeLimitExceeded(Exception):
 
 class TimeLimitExceeded(Exception):
     """The task ran past its hard_time_limit and was abandoned (its thread may still be running)."""
+
+
+class DiscardInstance(Exception):
+    """Raise inside a task to say the pool instance it was given is broken; it is closed and rebuilt."""
+
+    def __init__(self, message: str = "", *, pool: str | None = None):
+        super().__init__(message)
+        self.pool = pool  # None discards every instance the task holds

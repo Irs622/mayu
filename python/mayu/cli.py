@@ -45,6 +45,23 @@ def parse_resources(text: str | None) -> dict[str, float] | None:
     return out
 
 
+def parse_pools(text: str | None) -> dict[str, int] | None:
+    """'gemma=2,tts=3' -> {'gemma': 2, 'tts': 3}; None or '' -> None."""
+    if not text or not text.strip():
+        return None
+    out: dict[str, int] = {}
+    for item in text.split(","):
+        name, sep, count = item.partition("=")
+        name, count = name.strip(), count.strip()
+        if not sep or not name or not (count.isascii() and count.isdigit()) or any(c.isspace() for c in name):
+            raise ValueError(f"bad --pools entry {item.strip()!r}: use name=count with a whole number >= 0, "
+                             f"like gemma=2,tts=3")
+        if name in out:
+            raise ValueError(f"bad --pools: {name!r} given twice")
+        out[name] = int(count)
+    return out
+
+
 def parse_gpus(text: str | None) -> list[str] | None:
     """'0,1' -> ['0', '1']. Ids are opaque (indexes or UUIDs like 'GPU-abc'): they go to CUDA_VISIBLE_DEVICES."""
     if not text or not text.strip():
@@ -72,7 +89,7 @@ def _build_runner(app, args, threads: int):
                         max_tasks_per_process=args.max_tasks_per_process,
                         max_memory_per_process=args.max_memory_per_process,
                         metrics_port=args.metrics_port, metrics_host=args.metrics_host,
-                        resources=args.resources)
+                        resources=args.resources, pools=args.pools)
 
 
 def _cmd_worker(args) -> int:
@@ -84,6 +101,11 @@ def _cmd_worker(args) -> int:
         return 2
     try:
         args.resources = parse_resources(args.resources)
+    except ValueError as e:
+        print(f"mayu: {e}", file=sys.stderr)
+        return 2
+    try:
+        args.pools = parse_pools(args.pools)
     except ValueError as e:
         print(f"mayu: {e}", file=sys.stderr)
         return 2
@@ -273,6 +295,9 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--resources", default=os.environ.get("MAYU_RESOURCES") or None, metavar="NAME=AMOUNT,...",
                    help="what each worker process has, e.g. gpu=1,vram_gb=7.5,cpu=12; a task starts only when "
                         "its resources= requests fit in what is left")
+    w.add_argument("--pools", default=os.environ.get("MAYU_POOLS") or None, metavar="NAME=COUNT,...",
+                   help="instances of each model pool to load in each worker process, e.g. gemma=2,tts=3 "
+                        "(pools are declared in code with @app.pool)")
     w.add_argument("--gpus", default=None, metavar="ID,...",
                    help="one worker process per listed GPU, each with CUDA_VISIBLE_DEVICES set to its id")
     w.add_argument("--log-format", choices=("text", "json"), default=os.environ.get("MAYU_LOG_FORMAT") or "text")

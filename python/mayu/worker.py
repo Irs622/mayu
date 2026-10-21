@@ -1,4 +1,5 @@
 import asyncio
+import collections
 import logging
 import queue
 import signal
@@ -7,8 +8,9 @@ import time
 import traceback
 
 from . import _native, otel
-from .exceptions import Retry, SoftTimeLimitExceeded, TimeLimitExceeded
+from .exceptions import DiscardInstance, Retry, SoftTimeLimitExceeded, TimeLimitExceeded
 from .limits import TimeLimits
+from .pool import PoolContext, check_pool_name
 from .recycle import rss_mb
 from .serializers import for_content_type
 from .task import check_resources
@@ -63,6 +65,37 @@ class _Slot:
         self.zombie = False
 
 
+class _PoolState:
+    """The live instances of one pool. The lock guards only the free list, never user code."""
+
+    def __init__(self, pool, size: int):
+        self.pool = pool
+        self.target = size  # what ctx.size says
+        self.size = size  # instances the pool is expected to have; shrinks when one is lost for good
+        self.free: collections.deque = collections.deque()  # (index, instance)
+        self.lock = threading.Lock()
+
+    def push(self, index: int, instance) -> None:
+        with self.lock:
+            self.free.append((index, instance))
+
+    def take(self):
+        with self.lock:
+            return self.free.popleft() if self.free else None
+
+    def drain(self) -> list:
+        with self.lock:
+            out = list(self.free)
+            self.free.clear()
+        return out
+
+
+class _Held(collections.namedtuple("_Held", "param state index instance")):
+    """A pool instance checked out by a task."""
+
+    __slots__ = ()
+
+
 class WorkerRunner:
     """Runs tasks on real OS threads; Rust owns fetching, acks, retries and timers."""
 
@@ -72,7 +105,7 @@ class WorkerRunner:
                  max_deliveries: int = 5, max_zombie_threads: int = 4,
                  max_tasks_per_process: int | None = None, max_memory_per_process: float | None = None,
                  metrics_port: int | None = None, metrics_host: str = "0.0.0.0",
-                 resources: dict[str, float] | None = None):
+                 resources: dict[str, float] | None = None, pools: dict[str, int] | None = None):
         if threads < 1:
             raise ValueError("threads must be >= 1")
         if visibility_timeout <= 0 or heartbeat_interval <= 0:
@@ -100,7 +133,9 @@ class WorkerRunner:
             raise ValueError("no queue to serve: every queue has tasks declared but not implemented in this process; "
                              "import their implementations or pass queues")
         self.resources = check_resources("resources", resources, allow_zero=True)
-        self.task_resources = self._served_requests()
+        left = self._plan_pools(pools)
+        self.task_resources = self._served_requests(left)
+        self.capacity = {**left, **{f"pool:{p}": float(n) for p, n in self._loaded.items()}}
         self.strict_priority = bool(queues)  # only a non-empty explicit list is a priority order
         self.prefetch_multiplier = prefetch_multiplier
         self.shutdown_grace = shutdown_grace
@@ -134,23 +169,81 @@ class WorkerRunner:
         self._pending_lock = threading.Lock()
         self._spans: dict = {}
         self._spans_lock = threading.Lock()
+        self._states: dict[str, _PoolState] = {}  # loaded pools in load order; only start() adds to it
+        self._checked_out: dict = {}  # token -> [_Held], so the hard limit can find what a zombie holds
+        self._held_lock = threading.Lock()
 
-    def _served_requests(self) -> dict[str, dict[str, float]]:
-        """Requests of the tasks on served queues, checked against what this worker has."""
+    def _plan_pools(self, pools) -> dict[str, float]:
+        """Checks `pools` against the served tasks; returns what each declared resource has left after reserving
+        room for the loaded pools. Sets `self._loaded` ({pool: instances}, in `pools` order) and `self._reserved`."""
+        if pools is None:
+            pools = {}
+        shape = "pools must be a dict like {'gemma': 2} (pool name -> number of instances)"
+        if not isinstance(pools, dict):
+            raise TypeError(f"{shape}, got {type(pools).__name__}")
+        for name, n in pools.items():
+            check_pool_name(name)
+            if isinstance(n, bool) or not isinstance(n, int):
+                raise TypeError(f"{shape}; {name!r} must be a whole number, got {n!r}")
+            if n < 0:
+                raise ValueError(f"pool {name!r} cannot have {n} instances")
+        registered = self.app.pools
+        used: set[str] = set()
+        for t in sorted(self.app.registry.values(), key=lambda t: t.name):
+            if t.queue not in self.queues:
+                continue
+            for p in sorted(set(t.pools.values())):
+                if p not in registered:
+                    raise ValueError(f"task {t.name!r} uses pool {p!r}, which this process does not define; "
+                                     f"import the module with @app.pool({p!r})")
+                if not pools.get(p):
+                    raise ValueError(f"task {t.name!r} uses pool {p!r} but this worker has no instances of it; "
+                                     f"pass --pools {p}=N")
+                used.add(p)
+        for name, n in pools.items():
+            if n and name not in registered:
+                raise ValueError(f"--pools names pool {name!r}, which this process does not define; "
+                                 f"import the module with @app.pool({name!r})")
+            if n and name not in used:
+                log.warning("pool %r is sized but no task on the served queues uses it; not loading it", name)
+        self._loaded = {p: n for p, n in pools.items() if n and p in used}
+        reserved: dict[str, int] = {}  # milli-units, like the dispatcher
+        parts: dict[str, list[str]] = {}
+        for p, n in self._loaded.items():
+            for r, amount in registered[p].resources.items():
+                if r not in self.resources:
+                    raise ValueError(f"pool {p!r} needs {r!r} per instance but this worker declares no such "
+                                     f"resource; pass --resources {r}=...")
+                reserved[r] = reserved.get(r, 0) + n * round(amount * 1000)
+                parts.setdefault(r, []).append(f"{p} {n} × {amount:g}")
+        left = {}
+        for r, cap in self.resources.items():
+            milli = round(cap * 1000) - reserved.get(r, 0)
+            if milli < 0:
+                raise ValueError(f"pools reserve {r}={reserved[r] / 1000:g} ({', '.join(parts[r])}) but this "
+                                 f"worker has {cap:g}; lower --pools or raise --resources {r}=...")
+            left[r] = milli / 1000
+        self._reserved = reserved
+        return left
+
+    def _served_requests(self, left: dict[str, float]) -> dict[str, dict[str, float]]:
+        """Requests of the tasks on served queues (plus one `pool:` slot per pool used), checked against `left`."""
         out = {}
         for t in sorted(self.app.registry.values(), key=lambda t: t.name):
-            if t.queue not in self.queues or not t.resources:
+            if t.queue not in self.queues or not (t.resources or t.pools):
                 continue
             for name, amount in sorted(t.resources.items()):
                 if name not in self.resources:
                     raise ValueError(f"task {t.name!r} requests {name!r} but this worker declares no such resource; "
                                      f"pass --resources {name}=...")
-                if round(amount * 1000) > round(self.resources[name] * 1000):
+                if round(amount * 1000) > round(left[name] * 1000):
+                    after = (f" left after pools reserve {self._reserved[name] / 1000:g}"
+                             if name in self._reserved else "")
                     raise ValueError(
                         f"task {t.name!r} requests {name}={amount:g} but this worker has "
-                        f"{name}={self.resources[name]:g}; raise --resources {name}=... "
+                        f"{name}={left[name]:g}{after}; raise --resources {name}=... "
                         f"or route the task to a bigger worker")
-            out[t.name] = dict(t.resources)
+            out[t.name] = {**t.resources, **{f"pool:{p}": 1.0 for p in t.pools.values()}}
         return out
 
     @property
@@ -164,19 +257,12 @@ class WorkerRunner:
 
     def start(self) -> None:
         rate_limits = {t.name: t.rate_per_sec for t in self.app.registry.values() if t.rate_per_sec is not None}
-        self.native = _native.Worker(
-            self.app.broker_url, self.queues, self.threads, self.prefetch_multiplier, self.app.result_ttl,
-            visibility_timeout_ms=_ms(self.visibility_timeout),
-            reclaim_interval_ms=_ms(min(5.0, self.visibility_timeout / 2)),
-            heartbeat_interval_ms=_ms(self.heartbeat_interval),
-            max_deliveries=self.max_deliveries,
-            strict_priority=self.strict_priority,
-            rate_limits=rate_limits,
-            resources=self.resources or None,
-            task_resources=self.task_resources or None,
-            metrics_addr=(None if self.metrics_port_requested is None
-                          else _hostport(self.metrics_host, self.metrics_port_requested)),
-        )
+        self._load_pools()  # before the native worker: it starts fetching as soon as it exists
+        try:
+            self.native = self._start_native(rate_limits)
+        except BaseException:
+            self._close_pools()
+            raise
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(target=self._loop.run_forever, name="mayu-async", daemon=True)
         self._loop_thread.start()
@@ -186,6 +272,21 @@ class WorkerRunner:
         self._supervisor = threading.Thread(target=self._supervise, name="mayu-supervisor", daemon=True)
         self._supervisor.start()
         log.info("worker started", extra={"worker_id": self.worker_id, "queues": self.queues, "threads": self.threads})
+
+    def _start_native(self, rate_limits):
+        return _native.Worker(
+            self.app.broker_url, self.queues, self.threads, self.prefetch_multiplier, self.app.result_ttl,
+            visibility_timeout_ms=_ms(self.visibility_timeout),
+            reclaim_interval_ms=_ms(min(5.0, self.visibility_timeout / 2)),
+            heartbeat_interval_ms=_ms(self.heartbeat_interval),
+            max_deliveries=self.max_deliveries,
+            strict_priority=self.strict_priority,
+            rate_limits=rate_limits,
+            resources=self.capacity or None,
+            task_resources=self.task_resources or None,
+            metrics_addr=(None if self.metrics_port_requested is None
+                          else _hostport(self.metrics_host, self.metrics_port_requested)),
+        )
 
     def stop(self) -> None:
         self._running.clear()
@@ -210,6 +311,7 @@ class WorkerRunner:
         self._supervisor.join(1.0)
         remaining_ms = int(max(0.0, deadline - time.monotonic()) * 1000)
         self.native.shutdown(max(remaining_ms, 1000))
+        self._close_pools()  # what threads past the grace period still hold is not closed
         self._loop.call_soon_threadsafe(self._loop.stop)
         self._loop_thread.join(1.0)
         if not self._loop_thread.is_alive():
@@ -226,6 +328,117 @@ class WorkerRunner:
             pass
         self.join()
         return self.restart_reason
+
+    # -- pools ---------------------------------------------------------------
+
+    def _load_pools(self) -> None:
+        """Builds every instance of every loaded pool, one at a time, in `pools` order then index order."""
+        for name, n in self._loaded.items():
+            pool = self.app.pools[name]
+            state = self._states[name] = _PoolState(pool, n)
+            for index in range(n):
+                started = time.monotonic()
+                try:
+                    instance = pool.factory(PoolContext(name, index, n))
+                except Exception as e:
+                    self._close_pools()
+                    raise RuntimeError(f"pool {name!r} instance {index} failed to load: {e!r}") from e
+                state.push(index, instance)
+                log.info("pool instance loaded", extra={"pool": name, "index": index, "size": n,
+                                                        "load_seconds": round(time.monotonic() - started, 3)})
+
+    def _close_pools(self) -> None:
+        """Closes the idle instances, last loaded first."""
+        for state in reversed(list(self._states.values())):
+            for _, instance in sorted(state.drain(), key=lambda entry: entry[0], reverse=True):
+                self._close_instance(state.pool, instance)
+
+    @staticmethod
+    def _close_instance(pool, instance) -> None:
+        if pool.closer is None:
+            return
+        try:
+            pool.closer(instance)
+        except Exception:
+            log.exception("closing an instance of pool %r failed", pool.name)
+
+    def _checkout(self, token, task) -> list[_Held]:
+        held: list[_Held] = []
+        try:
+            for param, name in task.pools.items():
+                state = self._states[name]
+                entry = state.take()
+                if entry is None:  # the ledger admitted this task, so an instance must be free
+                    raise RuntimeError(f"pool {name!r} has no free instance; this is a mayu bug")
+                held.append(_Held(param, state, *entry))
+        except Exception:
+            for h in held:
+                h.state.push(h.index, h.instance)
+            raise
+        with self._held_lock:
+            self._checked_out[token] = held
+        return held
+
+    @staticmethod
+    def _is_broken(h: _Held, error: BaseException) -> bool:
+        if isinstance(error, DiscardInstance) and error.pool in (None, h.state.pool.name):
+            return True
+        return isinstance(error, h.state.pool.discard_on)
+
+    def _release(self, token, held: list[_Held], outcome) -> list[_Held]:
+        """Returns the healthy instances to their pools and takes the broken ones' slots out of the ledger.
+
+        Runs before the outcome is reported: reporting releases the task's `pool:` slots, so the instances
+        must already be back and the broken ones' slots already gone, or another task could be admitted
+        with no instance to take.
+        """
+        with self._held_lock:
+            self._checked_out.pop(token, None)
+        broken = [] if outcome[0] else [h for h in held if self._is_broken(h, outcome[1])]
+        for h in held:
+            if not any(h is b for b in broken):
+                h.state.push(h.index, h.instance)
+        for h in broken:
+            self._adjust(f"pool:{h.state.pool.name}", -1.0)
+        return broken
+
+    def _rebuild(self, h: _Held) -> None:
+        """Closes a broken instance and builds its replacement; runs after the outcome was reported."""
+        pool, state = h.state.pool, h.state
+        self._close_instance(pool, h.instance)
+        started = time.monotonic()
+        try:
+            fresh = pool.factory(PoolContext(pool.name, h.index, state.target))
+        except Exception:
+            log.exception("rebuilding instance %d of pool %r failed; the pool is one smaller", h.index, pool.name)
+            self._pool_shrunk(state)
+            return
+        state.push(h.index, fresh)  # before growing the ledger, so checkout never finds the list empty
+        self._adjust(f"pool:{pool.name}", 1.0)
+        self.native.pool_rebuilt(pool.name)
+        log.info("pool instance rebuilt", extra={"pool": pool.name, "index": h.index,
+                                                 "load_seconds": round(time.monotonic() - started, 3)})
+
+    def _forfeit(self, token) -> None:
+        """A zombie keeps its instances (its thread may still use them): the pool just gets smaller."""
+        with self._held_lock:
+            held = self._checked_out.pop(token, None)
+        for h in held or ():
+            self._adjust(f"pool:{h.state.pool.name}", -1.0)
+            self._pool_shrunk(h.state)
+
+    def _pool_shrunk(self, state: _PoolState) -> None:
+        with state.lock:
+            state.size -= 1
+            size = state.size
+        if size == 0:
+            self._request_restart(f"pool {state.pool.name!r} has no instances left")
+
+    def _adjust(self, resource: str, delta: float) -> None:
+        try:
+            self.native.adjust_capacity(resource, delta)
+        except Exception:
+            log.exception("could not adjust the capacity of %s by %+g", resource, delta)
 
     # -- recycling -----------------------------------------------------------
 
@@ -318,6 +531,11 @@ class WorkerRunner:
     def _on_hard_limit(self, run) -> None:
         task, slot = run.context
         slot.zombie = True
+        if task.pools:
+            try:
+                self._forfeit(run.token)  # before the failure is reported, as for a rebuild
+            except Exception:
+                log.exception("worker supervisor step failed")
         try:
             # Decide before reporting: once clients see the failure they may submit new work, and a
             # worker that is about to recycle must already have stopped fetching.
@@ -384,8 +602,15 @@ class WorkerRunner:
         at most once per run, so one catch-and-resume loop covers that whole span; every step in it
         is idempotent (`arm` returns the registered run, `outcome` is kept, `disarm` can be re-run).
         """
-        run = outcome = owned = None
+        run = outcome = owned = held = None
         armed = settled = False
+        if task.pools:  # before the limits are armed: waiting for or building an instance is not the task's time
+            try:
+                held = self._checkout(token, task)
+            except Exception as e:
+                self._report_error(token, task, e)
+                return
+            kwargs = {**kwargs, **{h.param: h.instance for h in held}}
         # The span is attached before the run is armed and detached after it is disarmed, so the
         # soft-limit exception (only delivered while armed) never lands inside attach/detach.
         with otel.activate(self._span(token)):
@@ -409,11 +634,14 @@ class WorkerRunner:
         if not owned:
             slot.zombie = True  # the hard limit already settled this task; this thread retires
             return
+        broken = () if held is None else self._release(token, held, outcome)
         ok, value = outcome
         if ok:
             self._report_success(token, serializer, value, links)
         else:
             self._report_error(token, task, value)
+        for h in broken:
+            self._rebuild(h)
 
     def _submit_async(self, token, task, serializer, args, kwargs, links=()) -> None:
         coro = _in_span(self._span(token),

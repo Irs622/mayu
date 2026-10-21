@@ -293,6 +293,15 @@ impl<B: Broker> Runtime<B> {
         }
     }
 
+    /// Changes a resource's capacity while running (pools shrink and regrow it); see `Dispatcher::adjust_capacity`.
+    pub fn adjust_capacity(&self, resource: &str, delta: f64) -> Result<()> {
+        self.ready.adjust_capacity(resource, delta)
+    }
+
+    pub fn pool_rebuilt(&self, pool: &str) {
+        self.metrics.pool_rebuilt(pool);
+    }
+
     pub fn stop_fetching(&self) {
         self.stop_tx.send_replace(true);
     }

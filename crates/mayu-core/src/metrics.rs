@@ -13,6 +13,9 @@ use crate::broker::QueueStats;
 pub const DURATION_BUCKETS: [f64; 14] =
     [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0];
 
+/// Ledger resources named `pool:<name>` are model pools, reported separately from real resources.
+const POOL_PREFIX: &str = "pool:";
+
 /// How a claimed task was settled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Settled {
@@ -53,6 +56,7 @@ struct Counters {
     deferred: BTreeMap<Key, u64>,
     reclaimed: BTreeMap<String, u64>,
     broker_errors: BTreeMap<&'static str, u64>,
+    pool_rebuilds: BTreeMap<String, u64>,
 }
 
 /// Sampled when `/metrics` is scraped.
@@ -111,6 +115,10 @@ impl Metrics {
         *self.c.lock().unwrap().broker_errors.entry(op).or_default() += 1;
     }
 
+    pub fn pool_rebuilt(&self, pool: &str) {
+        *self.c.lock().unwrap().pool_rebuilds.entry(pool.to_string()).or_default() += 1;
+    }
+
     pub fn render(&self, g: &Gauges) -> String {
         let c = self.c.lock().unwrap();
         let mut out = String::with_capacity(4096);
@@ -145,6 +153,12 @@ impl Metrics {
         for (op, n) in &c.broker_errors {
             sample(&mut out, "mayu_broker_errors_total", &[("op", op)], n);
         }
+        if !c.pool_rebuilds.is_empty() {
+            family(&mut out, "mayu_pool_rebuilds_total", "counter", "Pool instances replaced after being discarded.");
+            for (p, n) in &c.pool_rebuilds {
+                sample(&mut out, "mayu_pool_rebuilds_total", &[("pool", p)], n);
+            }
+        }
         drop(c);
 
         family(&mut out, "mayu_worker_concurrency", "gauge", "Task threads in this worker process.");
@@ -165,14 +179,26 @@ impl Metrics {
                 sample(&mut out, name, &[("queue", q)], get(s));
             }
         }
-        if !g.resources.is_empty() {
+        // Pool sizes ride in the resource ledger as `pool:<name>`; they get their own families.
+        let (pools, resources): (Vec<_>, Vec<_>) = g.resources.iter().partition(|(r, ..)| r.starts_with(POOL_PREFIX));
+        if !resources.is_empty() {
             family(&mut out, "mayu_resource_capacity", "gauge", "What this worker process declared for each resource.");
-            for (r, cap, _) in &g.resources {
+            for (r, cap, _) in &resources {
                 sample(&mut out, "mayu_resource_capacity", &[("resource", r)], cap);
             }
             family(&mut out, "mayu_resource_in_use", "gauge", "Resource amounts held by tasks running in this process.");
-            for (r, _, used) in &g.resources {
+            for (r, _, used) in &resources {
                 sample(&mut out, "mayu_resource_in_use", &[("resource", r)], used);
+            }
+        }
+        if !pools.is_empty() {
+            family(&mut out, "mayu_pool_size", "gauge", "Instances in each model pool of this process.");
+            for (r, size, _) in &pools {
+                sample(&mut out, "mayu_pool_size", &[("pool", r.strip_prefix(POOL_PREFIX).unwrap_or(r))], size);
+            }
+            family(&mut out, "mayu_pool_busy", "gauge", "Pool instances held by running tasks.");
+            for (r, _, busy) in &pools {
+                sample(&mut out, "mayu_pool_busy", &[("pool", r.strip_prefix(POOL_PREFIX).unwrap_or(r))], busy);
             }
         }
         out
@@ -310,5 +336,46 @@ mod tests {
             assert!(typed.iter().any(|t| t == family), "sample {line:?} has no preceding TYPE");
             assert!(line.rsplit(' ').next().unwrap().parse::<f64>().is_ok(), "bad value in {line:?}");
         }
+    }
+
+    #[test]
+    fn pool_gauges_use_the_pool_label_and_stay_out_of_resource_families() {
+        let g = Gauges {
+            resources: vec![("gpu".into(), 1.0, 0.5), ("pool:gemma".into(), 2.0, 1.0), ("pool:tts".into(), 3.0, 0.0)],
+            ..Gauges::default()
+        };
+        let b = Metrics::default().render(&g);
+        assert_eq!(value(&b, r#"mayu_pool_size{pool="gemma"}"#), Some(2.0));
+        assert_eq!(value(&b, r#"mayu_pool_busy{pool="gemma"}"#), Some(1.0));
+        assert_eq!(value(&b, r#"mayu_pool_size{pool="tts"}"#), Some(3.0));
+        assert_eq!(value(&b, r#"mayu_pool_busy{pool="tts"}"#), Some(0.0));
+        assert_eq!(value(&b, r#"mayu_resource_capacity{resource="gpu"}"#), Some(1.0));
+        assert!(!b.contains("pool:"), "{b}");
+    }
+
+    #[test]
+    fn only_pool_entries_emit_no_resource_families() {
+        let g = Gauges { resources: vec![("pool:gemma".into(), 2.0, 0.0)], ..Gauges::default() };
+        let b = Metrics::default().render(&g);
+        assert!(!b.contains("mayu_resource"), "{b}");
+        assert!(b.contains("# TYPE mayu_pool_size gauge") && b.contains("# TYPE mayu_pool_busy gauge"), "{b}");
+    }
+
+    #[test]
+    fn pool_rebuilds_are_counted_per_pool() {
+        let m = Metrics::default();
+        m.pool_rebuilt("gemma");
+        m.pool_rebuilt("gemma");
+        m.pool_rebuilt("tts");
+        let b = m.render(&Gauges::default());
+        assert_eq!(value(&b, r#"mayu_pool_rebuilds_total{pool="gemma"}"#), Some(2.0));
+        assert_eq!(value(&b, r#"mayu_pool_rebuilds_total{pool="tts"}"#), Some(1.0));
+    }
+
+    #[test]
+    fn no_pool_families_without_pool_entries() {
+        let g = Gauges { resources: vec![("gpu".into(), 1.0, 0.0)], ..Gauges::default() };
+        let b = Metrics::default().render(&g);
+        assert!(!b.contains("mayu_pool"), "{b}");
     }
 }

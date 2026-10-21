@@ -288,6 +288,15 @@ impl Worker {
         self.inner.complete(token, Outcome::Retry { countdown_ms, error });
     }
 
+    /// Pools resize their `pool:<name>` resource as instances are discarded and rebuilt.
+    fn adjust_capacity(&self, resource: &str, delta: f64) -> PyResult<()> {
+        self.inner.adjust_capacity(resource, delta).map_err(core_err)
+    }
+
+    fn pool_rebuilt(&self, name: &str) {
+        self.inner.pool_rebuilt(name);
+    }
+
     fn stop_fetching(&self) {
         self.inner.stop_fetching();
     }

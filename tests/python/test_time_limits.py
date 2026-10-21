@@ -147,7 +147,7 @@ def test_soft_limit_landing_anywhere_in_run_sync_yields_exactly_one_outcome():
         def dumps(self, value):
             return b""
 
-    app = SimpleNamespace(result_ttl=None, queues=lambda **kw: ["q"], registry={})
+    app = SimpleNamespace(result_ttl=None, queues=lambda **kw: ["q"], registry={}, pools={})
     runner = WorkerRunner(app, threads=1)
     runner.native = Native()
 
@@ -166,7 +166,7 @@ def test_soft_limit_landing_anywhere_in_run_sync_yields_exactly_one_outcome():
     def worker_thread():
         slot = _Slot("t")
         slot.ident = threading.get_ident()
-        task = SimpleNamespace(soft_time_limit=0.002, hard_time_limit=None, retry_on=(),
+        task = SimpleNamespace(soft_time_limit=0.002, hard_time_limit=None, retry_on=(), pools={},
                                fn=lambda: _busy(random.uniform(0.0015, 0.0025)))
         try:
             for token in range(count):
