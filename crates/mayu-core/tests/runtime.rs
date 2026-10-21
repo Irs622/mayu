@@ -531,6 +531,7 @@ fn gpu_cfg(concurrency: usize, prefetch: usize) -> RuntimeConfig {
         resources: Resources {
             capacity: [("gpu".to_string(), 1.0)].into(),
             requests: [("g".to_string(), [("gpu".to_string(), 1.0)].into())].into(),
+            ..Default::default()
         },
         ..cfg(concurrency, prefetch)
     }

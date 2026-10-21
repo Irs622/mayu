@@ -81,6 +81,10 @@ pub struct ReadyTask {
     pub content_type: String,
     pub payload: Vec<u8>,
     pub trace_ctx: Option<String>,
+    /// Lazy pools only: model pools to build an instance of before the task runs, one entry per instance.
+    pub loads: Vec<String>,
+    /// Lazy pools only: model pools to close an idle instance of first (before `loads`), one entry per instance.
+    pub evicts: Vec<String>,
 }
 
 impl ReadyTask {
@@ -95,6 +99,8 @@ impl ReadyTask {
             content_type: d.header.content_type.clone(),
             payload: d.payload.clone(),
             trace_ctx: d.header.trace_ctx.clone(),
+            loads: Vec::new(),
+            evicts: Vec::new(),
         }
     }
 }
@@ -302,6 +308,26 @@ impl<B: Broker> Runtime<B> {
         self.metrics.pool_rebuilt(pool);
     }
 
+    /// See `Dispatcher::unload_begin`.
+    pub fn unload_begin(&self, pool: &str) -> Result<()> {
+        self.ready.unload_begin(pool)
+    }
+
+    /// See `Dispatcher::unload_done`.
+    pub fn unload_done(&self, pool: &str) -> Result<()> {
+        self.ready.unload_done(pool)
+    }
+
+    /// A lazy pool instance was built.
+    pub fn pool_loaded(&self, pool: &str) {
+        self.metrics.pool_loaded(pool);
+    }
+
+    /// A lazy pool instance was closed to make room (after the close).
+    pub fn pool_evicted(&self, pool: &str) {
+        self.metrics.pool_evicted(pool);
+    }
+
     pub fn stop_fetching(&self) {
         self.stop_tx.send_replace(true);
     }
@@ -464,7 +490,7 @@ async fn fetch_batches<B: Broker>(c: &mut FetchCtx<B>, skips: &mut JoinSet<()>) 
             let task = ReadyTask::from_delivery(token, &d);
             c.inflight.lock().unwrap().insert(token, InFlight { delivery: d, last_claim: Instant::now(), lost: false, started: None });
             if let Admit::Defer { task, delay } = c.ready.push(task, Instant::now()) {
-                defer(c, task, delay).await;
+                defer(c, *task, delay).await;
             }
         }
         if overshoot > 0 {
@@ -855,5 +881,5 @@ async fn scrape<B: Broker>(
             }
         }
     }
-    metrics.render(&Gauges { concurrency, inflight: n, running, queues: stats, resources: ready.usage() })
+    metrics.render(&Gauges { concurrency, inflight: n, running, queues: stats, resources: ready.usage(), loaded: ready.lazy_usage() })
 }

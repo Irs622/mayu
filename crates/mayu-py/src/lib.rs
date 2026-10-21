@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use mayu_core::{
-    Broker, Header, Link, Outcome, ReadyTask, Resources, Runtime, RuntimeConfig, WorkflowNode, WorkflowSpec,
+    Broker, Header, LazyPool, Link, Outcome, ReadyTask, Resources, Runtime, RuntimeConfig, WorkflowNode, WorkflowSpec,
     WorkflowState,
 };
 use mayu_redis::RedisBroker;
@@ -21,6 +21,9 @@ fn core_err(e: mayu_core::Error) -> PyErr {
         e => rt_err(e),
     }
 }
+
+/// pool name -> (resources one loaded instance holds, instances loaded at start)
+type LazyPoolArgs = HashMap<String, (HashMap<String, f64>, u32)>;
 
 /// (task, queue, payload, content_type, max_retries, parents, trace_ctx)
 type NodeArgs = (String, String, Vec<u8>, String, u32, Vec<usize>, Option<String>);
@@ -205,7 +208,7 @@ struct Worker {
 #[pymethods]
 impl Worker {
     #[new]
-    #[pyo3(signature = (url, queues, concurrency, prefetch_multiplier=2, result_ttl_secs=None, consumer=None, visibility_timeout_ms=None, reclaim_interval_ms=None, heartbeat_interval_ms=None, max_deliveries=None, strict_priority=false, rate_limits=None, metrics_addr=None, resources=None, task_resources=None))]
+    #[pyo3(signature = (url, queues, concurrency, prefetch_multiplier=2, result_ttl_secs=None, consumer=None, visibility_timeout_ms=None, reclaim_interval_ms=None, heartbeat_interval_ms=None, max_deliveries=None, strict_priority=false, rate_limits=None, metrics_addr=None, resources=None, task_resources=None, lazy_pools=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -224,6 +227,7 @@ impl Worker {
         metrics_addr: Option<String>,
         resources: Option<HashMap<String, f64>>,
         task_resources: Option<HashMap<String, HashMap<String, f64>>>,
+        lazy_pools: Option<LazyPoolArgs>,
     ) -> PyResult<Self> {
         let consumer = consumer.unwrap_or_else(|| format!("w-{}-{}", std::process::id(), ulid::Ulid::generate()));
         let mut cfg = RuntimeConfig {
@@ -234,6 +238,9 @@ impl Worker {
             resources: Resources {
                 capacity: resources.unwrap_or_default(),
                 requests: task_resources.unwrap_or_default(),
+                lazy: lazy_pools.unwrap_or_default().into_iter()
+                    .map(|(name, (claim, loaded))| (name, LazyPool { claim, loaded }))
+                    .collect(),
             },
             ..RuntimeConfig::default()
         };
@@ -297,6 +304,24 @@ impl Worker {
         self.inner.pool_rebuilt(name);
     }
 
+    /// Lazy pools: an instance is being discarded; its memory stays held until `unload_done`.
+    fn unload_begin(&self, name: &str) -> PyResult<()> {
+        self.inner.unload_begin(name).map_err(core_err)
+    }
+
+    /// Lazy pools: the instance from `unload_begin` is closed.
+    fn unload_done(&self, name: &str) -> PyResult<()> {
+        self.inner.unload_done(name).map_err(core_err)
+    }
+
+    fn pool_loaded(&self, name: &str) {
+        self.inner.pool_loaded(name);
+    }
+
+    fn pool_evicted(&self, name: &str) {
+        self.inner.pool_evicted(name);
+    }
+
     fn stop_fetching(&self) {
         self.inner.stop_fetching();
     }
@@ -350,6 +375,16 @@ impl PyReadyTask {
     #[getter]
     fn trace_ctx(&self) -> Option<&str> {
         self.0.trace_ctx.as_deref()
+    }
+    /// Lazy pools to build an instance of before running, one entry per instance.
+    #[getter]
+    fn loads(&self) -> Vec<String> {
+        self.0.loads.clone()
+    }
+    /// Lazy pools to close an idle instance of first, one entry per instance.
+    #[getter]
+    fn evicts(&self) -> Vec<String> {
+        self.0.evicts.clone()
     }
     fn __repr__(&self) -> String {
         format!("ReadyTask(id={:?}, task={:?}, attempt={})", self.0.id, self.0.task, self.0.attempt)
