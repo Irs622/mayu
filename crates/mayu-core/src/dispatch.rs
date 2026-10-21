@@ -1,8 +1,10 @@
 //! Orders claimed tasks for the worker threads: queue priority first, then per-task rate limits.
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::envelope::now_ms;
 use crate::error::{Error, Result};
 use crate::runtime::ReadyTask;
 
@@ -14,10 +16,33 @@ pub const HOLD_HORIZON: Duration = Duration::from_secs(1);
 /// only if they request none of the resources the head requests.
 pub const RESERVE_AFTER: Duration = Duration::from_secs(5);
 
+/// How much earlier than it arrived a resident task counts under `Schedule::Throughput`: it may run ahead of
+/// non-resident work that arrived up to this long before it, which bounds how long that work can wait.
+pub const THROUGHPUT_BONUS: Duration = Duration::from_secs(60);
+
+/// How much earlier than its workflow started a resident task counts under `Schedule::Oldest`, about one
+/// model load.
+pub const OLDEST_BONUS: Duration = Duration::from_secs(10);
+
+/// A workflow is never counted as older than this, so a bogus id cannot rank a task ahead of everything.
+const MAX_ORIGIN_AGE: Duration = Duration::from_secs(24 * 3600);
+
 /// Ledger units per whole unit: amounts are integer milli-units so repeated acquire/release never drifts.
 const MILLI: f64 = 1000.0;
 /// Larger amounts could overflow the ledger sums; far beyond any real resource.
 const MAX_MILLI: f64 = 1e15;
+
+/// How a worker with lazy pools orders the tasks it could start. Strict queue priority always comes first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Schedule {
+    /// Arrival order. The only choice without lazy pools.
+    #[default]
+    Fifo,
+    /// Tasks whose model is loaded jump ahead of work that arrived up to `THROUGHPUT_BONUS` before them.
+    Throughput,
+    /// Oldest workflow first (other tasks by arrival); a loaded model is worth `OLDEST_BONUS`.
+    Oldest,
+}
 
 /// What a worker has and what its tasks use, in the units the user picked (GPUs, GB, cores).
 #[derive(Debug, Clone, Default)]
@@ -212,7 +237,25 @@ struct Held {
     level: u32,
     seq: u64,
     at: Instant,
+    /// When the task's workflow started (`at` for other tasks, and unless the schedule is `Oldest`).
+    origin: Instant,
     task: ReadyTask,
+}
+
+/// A due task with its rank (level, age with bonus - older first -, arrival), claim and plan, when scoring.
+struct Ranked<'a> {
+    key: (u32, Reverse<Duration>, u64),
+    i: usize,
+    claim: Option<&'a Claim>,
+    plan: Option<Plan>,
+}
+
+/// The instant a workflow that started at wall-clock `started_ms` corresponds to, for a task held at `at`.
+/// A start in the future (clock skew) or one before `at` can be represented only roughly: both clamp.
+fn origin_of(at: Instant, started_ms: u64, wall_ms: u64) -> Instant {
+    let age = Duration::from_millis(wall_ms.saturating_sub(started_ms)).min(MAX_ORIGIN_AGE);
+    // An Instant close to the clock's epoch (just after boot) cannot go back that far.
+    at.checked_sub(age).unwrap_or(at)
 }
 
 pub struct Dispatcher {
@@ -230,17 +273,30 @@ pub struct Dispatcher {
     /// Token -> what that running task holds, until `release`.
     held_by: HashMap<u64, Claim>,
     lazy: Lazy,
+    /// `Fifo` exactly when `lazy` has no pools.
+    schedule: Schedule,
 }
 
 impl Dispatcher {
     /// With `strict`, earlier `queues` run first; otherwise every queue ranks equally (FIFO).
-    /// `rate_limits` maps task name to starts per second, for this worker.
+    /// `rate_limits` maps task name to starts per second, for this worker. `schedule` orders the tasks of
+    /// a worker with lazy pools within a priority; it is `Fifo` exactly when there are none.
     pub fn new(
         queues: &[String],
         strict: bool,
         rate_limits: &HashMap<String, f64>,
         resources: &Resources,
+        schedule: Schedule,
     ) -> Result<Self> {
+        match (resources.lazy.is_empty(), schedule) {
+            (false, Schedule::Fifo) => {
+                return Err(Error::Config("lazy pools need a schedule, 'throughput' or 'oldest'".into()));
+            }
+            (true, Schedule::Throughput | Schedule::Oldest) => {
+                return Err(Error::Config("a schedule other than fifo needs lazy pools".into()));
+            }
+            _ => {}
+        }
         let levels = if strict {
             queues.iter().enumerate().map(|(i, q)| (q.clone(), i as u32)).collect()
         } else {
@@ -327,7 +383,7 @@ impl Dispatcher {
         }
         Ok(Dispatcher {
             levels, throttles, held: Vec::new(), seq: 0,
-            resource_names, capacity, in_use, requests, held_by: HashMap::new(), lazy,
+            resource_names, capacity, in_use, requests, held_by: HashMap::new(), lazy, schedule,
         })
     }
 
@@ -353,12 +409,16 @@ impl Dispatcher {
     pub fn hold(&mut self, task: ReadyTask, at: Instant) {
         let level = self.levels.get(&task.queue).copied().unwrap_or(0);
         self.seq += 1;
-        self.held.push(Held { level, seq: self.seq, at, task });
+        let origin = match task.workflow_started_ms {
+            Some(started) if self.schedule == Schedule::Oldest => origin_of(at, started, now_ms()),
+            _ => at,
+        };
+        self.held.push(Held { level, seq: self.seq, at, origin, task });
     }
 
     /// The highest-priority task that is due and fits the free resources, oldest first within a priority.
     pub fn pop(&mut self, now: Instant) -> Option<ReadyTask> {
-        if self.requests.is_empty() {
+        if self.requests.is_empty() && self.schedule == Schedule::Fifo {
             let i = self.held.iter().enumerate()
                 .filter(|(_, h)| h.at <= now)
                 .min_by_key(|(_, h)| (h.level, h.seq))
@@ -384,23 +444,61 @@ impl Dispatcher {
     }
 
     /// Index of the task to start (and its loads and evictions, empty unless the worker has lazy pools):
-    /// walks due tasks in priority order. The first one that doesn't fit is the head; later ones may
-    /// backfill while the head is young, and afterwards only if they request nothing the head requests,
-    /// so a big request cannot be starved by a stream of small ones.
+    /// walks due tasks in priority order, and within a priority by the schedule. The first one that doesn't
+    /// fit is the head; later ones may backfill while the head is young, and afterwards only if they request
+    /// nothing the head requests, so a big request cannot be starved by a stream of small ones.
     fn pop_fitting(&self, now: Instant) -> Option<(usize, Plan)> {
         let mut due: Vec<usize> = (0..self.held.len()).filter(|&i| self.held[i].at <= now).collect();
-        due.sort_unstable_by_key(|&i| (self.held[i].level, self.held[i].seq));
+        if self.schedule == Schedule::Fifo {
+            due.sort_unstable_by_key(|&i| (self.held[i].level, self.held[i].seq));
+            // Plans are made as the walk reaches each task, so it stops at the first that can start.
+            return self.walk(now, due.into_iter().map(|i| {
+                let claim = self.requests.get(&self.held[i].task.task);
+                let plan = match claim {
+                    None => Some(Plan::default()),
+                    Some(c) => self.fits(c).then(Plan::default),
+                };
+                (i, claim, plan)
+            }));
+        }
+        // Scoring: whether a task is resident (its plan is empty) is part of its rank, so every due task is
+        // planned up front. Age counts back from `now`, which cannot underflow an `Instant` the way
+        // subtracting the bonus from a task's instant could.
+        let (basis, bonus): (fn(&Held) -> Instant, Duration) = match self.schedule {
+            Schedule::Oldest => (|h| h.origin, OLDEST_BONUS),
+            _ => (|h| h.at, THROUGHPUT_BONUS),
+        };
+        let mut ranked: Vec<Ranked> = due.into_iter()
+            .map(|i| {
+                let h = &self.held[i];
+                let claim = self.requests.get(&h.task.task);
+                let plan = match claim {
+                    None => Some(Plan::default()),
+                    Some(c) => self.lazy.plan(c, &self.in_use, &self.capacity),
+                };
+                let resident = plan.as_ref().is_some_and(|p| p.loads.is_empty() && p.evicts.is_empty());
+                let mut age = now.saturating_duration_since(basis(h));
+                if resident {
+                    age = age.saturating_add(bonus);
+                }
+                Ranked { key: (h.level, Reverse(age), h.seq), i, claim, plan }
+            })
+            .collect();
+        ranked.sort_unstable_by_key(|r| r.key);
+        self.walk(now, ranked.into_iter().map(|r| (r.i, r.claim, r.plan)))
+    }
+
+    /// The first of `candidates` (task index, its claim, its plan if it can start) that may start now.
+    fn walk<'a>(
+        &'a self,
+        now: Instant,
+        candidates: impl Iterator<Item = (usize, Option<&'a Claim>, Option<Plan>)>,
+    ) -> Option<(usize, Plan)> {
         let mut head: Option<(&Claim, Instant)> = None;
         // Lazy workers: what else the head wants (see `Lazy::wanted_beyond`).
         let mut head_beyond: Vec<usize> = Vec::new();
-        for i in due {
+        for (i, claim, plan) in candidates {
             let h = &self.held[i];
-            let claim = self.requests.get(&h.task.task);
-            let plan = match claim {
-                None => Some(Plan::default()),
-                Some(c) if self.lazy.pools.is_empty() => self.fits(c).then(Plan::default),
-                Some(c) => self.lazy.plan(c, &self.in_use, &self.capacity),
-            };
             if let Some(plan) = plan {
                 let backfill = match head {
                     None => true,
@@ -628,6 +726,7 @@ mod tests {
             trace_ctx: None,
             loads: vec![],
             evicts: vec![],
+            workflow_started_ms: None,
         }
     }
 
@@ -647,7 +746,7 @@ mod tests {
 
     #[test]
     fn strict_priority_pops_earlier_queues_first_fifo_within() {
-        let mut d = Dispatcher::new(&qs(&["hi", "lo"]), true, &HashMap::new(), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["hi", "lo"]), true, &HashMap::new(), &Resources::default(), Schedule::Fifo).unwrap();
         let now = Instant::now();
         for (tok, q) in [(1, "lo"), (2, "hi"), (3, "lo"), (4, "hi")] {
             assert!(matches!(d.push(task(tok, "t", q), now), Admit::Held));
@@ -657,7 +756,7 @@ mod tests {
 
     #[test]
     fn equal_priority_is_fifo_across_queues() {
-        let mut d = Dispatcher::new(&qs(&["hi", "lo"]), false, &HashMap::new(), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["hi", "lo"]), false, &HashMap::new(), &Resources::default(), Schedule::Fifo).unwrap();
         let now = Instant::now();
         for (tok, q) in [(1, "lo"), (2, "hi"), (3, "lo")] {
             d.push(task(tok, "t", q), now);
@@ -667,7 +766,7 @@ mod tests {
 
     #[test]
     fn rate_limit_spaces_tasks_one_interval_apart() {
-        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 10.0)]), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 10.0)]), &Resources::default(), Schedule::Fifo).unwrap();
         let t0 = Instant::now();
         for tok in 1..=3 {
             assert!(matches!(d.push(task(tok, "slow", "q"), t0), Admit::Held));
@@ -682,7 +781,7 @@ mod tests {
 
     #[test]
     fn throttled_task_does_not_block_others() {
-        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 10.0)]), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 10.0)]), &Resources::default(), Schedule::Fifo).unwrap();
         let t0 = Instant::now();
         d.push(task(1, "slow", "q"), t0);
         d.push(task(2, "slow", "q"), t0);
@@ -692,7 +791,7 @@ mod tests {
 
     #[test]
     fn throttled_higher_priority_task_lets_lower_priority_run() {
-        let mut d = Dispatcher::new(&qs(&["hi", "lo"]), true, &limits(&[("slow", 10.0)]), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["hi", "lo"]), true, &limits(&[("slow", 10.0)]), &Resources::default(), Schedule::Fifo).unwrap();
         let t0 = Instant::now();
         d.push(task(1, "slow", "hi"), t0);
         d.push(task(2, "slow", "hi"), t0);
@@ -703,7 +802,7 @@ mod tests {
 
     #[test]
     fn idle_bucket_refills() {
-        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 10.0)]), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 10.0)]), &Resources::default(), Schedule::Fifo).unwrap();
         let t0 = Instant::now();
         d.push(task(1, "slow", "q"), t0);
         let later = t0 + Duration::from_secs(5);
@@ -714,7 +813,7 @@ mod tests {
     #[test]
     fn beyond_horizon_defers_spread_one_interval_apart() {
         // 0.5/s = one start every 2 s, past the 1 s horizon
-        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 0.5)]), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 0.5)]), &Resources::default(), Schedule::Fifo).unwrap();
         let t0 = Instant::now();
         assert!(matches!(d.push(task(1, "slow", "q"), t0), Admit::Held));
         let delays: Vec<Duration> = (2..=4)
@@ -733,7 +832,7 @@ mod tests {
 
     #[test]
     fn deferred_task_returning_on_time_is_admitted() {
-        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 0.5)]), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 0.5)]), &Resources::default(), Schedule::Fifo).unwrap();
         let t0 = Instant::now();
         d.push(task(1, "slow", "q"), t0);
         assert!(matches!(d.push(task(2, "slow", "q"), t0), Admit::Defer { .. }));
@@ -744,7 +843,7 @@ mod tests {
 
     #[test]
     fn slot_exactly_at_the_horizon_is_held() {
-        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 1.0)]), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 1.0)]), &Resources::default(), Schedule::Fifo).unwrap();
         let t0 = Instant::now();
         d.push(task(1, "slow", "q"), t0);
         assert!(matches!(d.push(task(2, "slow", "q"), t0), Admit::Held));
@@ -752,7 +851,7 @@ mod tests {
 
     #[test]
     fn hold_ignores_the_rate_limit_and_waits_until_at() {
-        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 0.5)]), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 0.5)]), &Resources::default(), Schedule::Fifo).unwrap();
         let t0 = Instant::now();
         let at = t0 + Duration::from_secs(3);
         d.hold(task(1, "slow", "q"), at);
@@ -763,7 +862,7 @@ mod tests {
 
     #[test]
     fn drain_returns_everything_held() {
-        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 10.0)]), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 10.0)]), &Resources::default(), Schedule::Fifo).unwrap();
         let t0 = Instant::now();
         d.push(task(1, "slow", "q"), t0);
         d.push(task(2, "slow", "q"), t0); // not due yet
@@ -777,14 +876,14 @@ mod tests {
     fn rejects_unusable_rate_limits() {
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e-300] {
             assert!(
-                matches!(Dispatcher::new(&qs(&["q"]), false, &limits(&[("t", bad)]), &Resources::default()), Err(Error::Config(_))),
+                matches!(Dispatcher::new(&qs(&["q"]), false, &limits(&[("t", bad)]), &Resources::default(), Schedule::Fifo), Err(Error::Config(_))),
                 "rate {bad} must be rejected"
             );
         }
     }
 
     fn empty_queue() -> ReadyQueue {
-        ReadyQueue::new(Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &Resources::default()).unwrap())
+        ReadyQueue::new(Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &Resources::default(), Schedule::Fifo).unwrap())
     }
 
     #[test]
@@ -826,7 +925,7 @@ mod tests {
     }
 
     fn with_res(r: &Resources) -> Dispatcher {
-        Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), r).unwrap()
+        Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), r, Schedule::Fifo).unwrap()
     }
 
     fn in_use(d: &Dispatcher, name: &str) -> f64 {
@@ -850,7 +949,7 @@ mod tests {
     fn rejects_unusable_resources() {
         let bad = |caps: &[(&str, f64)], reqs: &[(&str, &[(&str, f64)])]| {
             let r = res(caps, reqs);
-            matches!(Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r), Err(Error::Config(_)))
+            matches!(Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r, Schedule::Fifo), Err(Error::Config(_)))
         };
         assert!(bad(&[("gpu", 1.0)], &[("g", &[("vram", 1.0)])]), "undeclared resource");
         assert!(bad(&[], &[("g", &[("gpu", 1.0)])]), "no resources at all");
@@ -869,7 +968,7 @@ mod tests {
     #[test]
     fn config_error_names_the_task_and_resource() {
         let r = res(&[("gpu", 1.0)], &[("train", &[("vram", 1.0)])]);
-        let Err(Error::Config(m)) = Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r) else { panic!() };
+        let Err(Error::Config(m)) = Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r, Schedule::Fifo) else { panic!() };
         assert!(m.contains("train") && m.contains("vram"), "{m}");
     }
 
@@ -913,7 +1012,7 @@ mod tests {
     fn priority_order_is_kept_among_tasks_that_fit() {
         let mut d = Dispatcher::new(
             &qs(&["hi", "lo"]), true, &HashMap::new(),
-            &res(&[("gpu", 1.0)], &[("g", &[("gpu", 0.25)])]),
+            &res(&[("gpu", 1.0)], &[("g", &[("gpu", 0.25)])]), Schedule::Fifo,
         ).unwrap();
         let t0 = Instant::now();
         for (tok, q) in [(1, "lo"), (2, "hi"), (3, "lo"), (4, "hi")] {
@@ -926,7 +1025,7 @@ mod tests {
     fn a_blocked_high_priority_task_lets_a_lower_one_that_fits_start() {
         let mut d = Dispatcher::new(
             &qs(&["hi", "lo"]), true, &HashMap::new(),
-            &res(&[("gpu", 1.0)], &[("g", &[("gpu", 0.75)]), ("h", &[("gpu", 0.25)])]),
+            &res(&[("gpu", 1.0)], &[("g", &[("gpu", 0.75)]), ("h", &[("gpu", 0.25)])]), Schedule::Fifo,
         ).unwrap();
         let t0 = Instant::now();
         d.push(task(1, "g", "lo"), t0);
@@ -1145,7 +1244,7 @@ mod tests {
     }
 
     fn lazy(caps: &[(&str, f64)], reqs: &[(&str, &[(&str, f64)])], pools: &[PoolSpec]) -> Dispatcher {
-        Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &lazy_res(caps, reqs, pools)).unwrap()
+        Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &lazy_res(caps, reqs, pools), Schedule::Oldest).unwrap()
     }
 
     fn loaded(d: &Dispatcher) -> Vec<(String, u32)> {
@@ -1371,8 +1470,9 @@ mod tests {
         assert_eq!(h.join().unwrap(), Some(2));
     }
 
-    /// vram 16, two gemma instances (14.8) and a tts needing 9.0: tts must evict both.
-    fn reservation_setup(t0: Instant) -> Dispatcher {
+    /// vram 16, two gemma instances (14.8) and a tts needing 9.0: tts must evict both. The gemma task 3
+    /// arrives `late` after the others.
+    fn reservation_setup(t0: Instant, late: Duration) -> Dispatcher {
         let mut d = lazy(
             &[("vram_gb", 16.0), ("pool:gemma", 2.0), ("pool:tts", 1.0)],
             &[("g", &[("pool:gemma", 1.0)]), ("t", &[("pool:tts", 1.0)])],
@@ -1381,14 +1481,14 @@ mod tests {
         d.push(task(1, "g", "q"), t0);
         assert!(d.pop(t0).is_some()); // one gemma instance is running, the other idle
         d.push(task(2, "t", "q"), t0); // the head: needs both gemma instances gone
-        d.push(task(3, "g", "q"), t0);
+        d.push(task(3, "g", "q"), t0 + late);
         d
     }
 
     #[test]
     fn before_the_reservation_gemma_tasks_keep_backfilling() {
         let t0 = Instant::now();
-        let mut d = reservation_setup(t0);
+        let mut d = reservation_setup(t0, Duration::ZERO);
         assert_eq!(d.pop(t0 + RESERVE_AFTER - MS).map(|t| t.token), Some(3));
         assert!(d.pop(t0 + RESERVE_AFTER - MS).is_none(), "the head still waits");
     }
@@ -1396,8 +1496,10 @@ mod tests {
     #[test]
     fn the_reserved_head_stops_tasks_that_would_keep_a_victim_busy() {
         let t0 = Instant::now();
-        let mut d = reservation_setup(t0);
-        let reserved = t0 + RESERVE_AFTER;
+        // A resident task outranks a swap for `OLDEST_BONUS`, so the tts head is the head only once it is older.
+        let late = OLDEST_BONUS + MS;
+        let mut d = reservation_setup(t0, late);
+        let reserved = t0 + late;
         assert!(d.pop(reserved).is_none(), "gemma task 3 would keep the idle instance busy");
         d.release(1);
         let t = d.pop(reserved).unwrap();
@@ -1435,7 +1537,10 @@ mod tests {
 
     #[test]
     fn rejects_unusable_lazy_pools() {
-        let bad = |r: Resources| matches!(Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r), Err(Error::Config(_)));
+        let bad = |r: Resources| {
+            let schedule = if r.lazy.is_empty() { Schedule::Fifo } else { Schedule::Oldest };
+            matches!(Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r, schedule), Err(Error::Config(_)))
+        };
         let caps = [("vram_gb", 7.5), ("pool:gemma", 1.0), ("pool:tts", 1.0)];
         let gemma: &[(&str, f64)] = &[("vram_gb", 7.4)];
         let tts: &[(&str, f64)] = &[("vram_gb", 7.2)];
@@ -1456,5 +1561,174 @@ mod tests {
         let t = d.pop(t0).unwrap();
         assert!(t.loads.is_empty() && t.evicts.is_empty());
         assert!(d.lazy_usage().is_empty());
+    }
+
+    // ---- scheduling ----
+
+    fn lazy_sched(schedule: Schedule) -> Dispatcher {
+        Dispatcher::new(
+            &qs(&["q"]), false, &HashMap::new(),
+            &lazy_res(
+                &[("vram_gb", 7.5), ("pool:gemma", 1.0), ("pool:tts", 1.0)],
+                &[("g", &[("pool:gemma", 1.0)]), ("t", &[("pool:tts", 1.0)])],
+                &[("gemma", &[("vram_gb", 7.4)], 1), ("tts", &[("vram_gb", 7.2)], 0)],
+            ),
+            schedule,
+        ).unwrap()
+    }
+
+    /// An instant far enough from the clock's epoch to subtract a day from.
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(48 * 3600)
+    }
+
+    fn in_workflow(token: u64, name: &str, started_ms: u64) -> ReadyTask {
+        ReadyTask { workflow_started_ms: Some(started_ms), ..task(token, name, "q") }
+    }
+
+    #[test]
+    fn throughput_groups_resident_tasks_before_a_swap() {
+        let mut d = lazy_sched(Schedule::Throughput);
+        let t0 = Instant::now();
+        for (tok, name) in [(1, "g"), (2, "t"), (3, "g"), (4, "t"), (5, "g"), (6, "t")] {
+            d.push(task(tok, name, "q"), t0);
+        }
+        let mut order = Vec::new();
+        while let Some(t) = d.pop(t0) {
+            order.push(t.token);
+            assert_eq!(d.pop(t0).map(|t| t.token), None, "the model is busy: nothing else can start");
+            d.release(t.token);
+        }
+        assert_eq!(order, vec![1, 3, 5, 2, 4, 6]);
+    }
+
+    #[test]
+    fn throughput_resident_bonus_is_bounded_by_the_wait() {
+        let first = |gap: Duration| {
+            let mut d = lazy_sched(Schedule::Throughput);
+            let t0 = Instant::now();
+            d.push(task(1, "t", "q"), t0);
+            d.push(task(2, "g", "q"), t0 + gap);
+            d.pop(t0 + gap).unwrap().token
+        };
+        assert_eq!(first(THROUGHPUT_BONUS - MS), 2, "t arrived less than the bonus before g");
+        assert_eq!(first(THROUGHPUT_BONUS + MS), 1, "t waited longer than the bonus");
+    }
+
+    #[test]
+    fn oldest_runs_an_older_workflow_before_a_younger_resident_task() {
+        let mut d = lazy_sched(Schedule::Oldest);
+        let t0 = far();
+        let wall = now_ms();
+        d.push(in_workflow(1, "g", wall - 1_000), t0);
+        d.push(in_workflow(2, "t", wall - 600_000), t0);
+        let t = d.pop(t0).unwrap();
+        assert_eq!((t.token, t.evicts), (2, vec!["gemma".to_string()]));
+    }
+
+    #[test]
+    fn oldest_prefers_a_resident_task_over_a_swap_that_is_only_slightly_older() {
+        let first = |t_started_ago: u64| {
+            let mut d = lazy_sched(Schedule::Oldest);
+            let t0 = far();
+            let wall = now_ms();
+            d.push(in_workflow(1, "t", wall - t_started_ago), t0);
+            d.push(in_workflow(2, "g", wall - 10_000), t0);
+            d.pop(t0).unwrap().token
+        };
+        assert_eq!(first(14_000), 2, "4 s older is less than the bonus");
+        assert_eq!(first(30_000), 1, "20 s older is more");
+    }
+
+    #[test]
+    fn oldest_ranks_tasks_outside_workflows_by_arrival() {
+        let first = |gap: Duration| {
+            let mut d = lazy_sched(Schedule::Oldest);
+            let t0 = Instant::now();
+            d.push(task(1, "t", "q"), t0);
+            d.push(task(2, "g", "q"), t0 + gap);
+            d.pop(t0 + gap).unwrap().token
+        };
+        assert_eq!(first(OLDEST_BONUS - MS), 2);
+        assert_eq!(first(OLDEST_BONUS + MS), 1);
+    }
+
+    #[test]
+    fn strict_priority_still_beats_scoring() {
+        for schedule in [Schedule::Throughput, Schedule::Oldest] {
+            let mut d = Dispatcher::new(
+                &qs(&["hi", "lo"]), true, &HashMap::new(),
+                &lazy_res(
+                    &[("vram_gb", 7.5), ("pool:gemma", 1.0), ("pool:tts", 1.0)],
+                    &[("g", &[("pool:gemma", 1.0)]), ("t", &[("pool:tts", 1.0)])],
+                    &[("gemma", &[("vram_gb", 7.4)], 1), ("tts", &[("vram_gb", 7.2)], 0)],
+                ),
+                schedule,
+            ).unwrap();
+            let t0 = far();
+            // The gemma task is resident but in the lower queue; the tts one needs a swap and is far older.
+            d.hold(ReadyTask { queue: "lo".into(), ..in_workflow(1, "g", now_ms() - 1_000) }, t0);
+            d.hold(ReadyTask { queue: "hi".into(), ..in_workflow(2, "t", now_ms() - 600_000) }, t0);
+            assert_eq!(d.pop(t0).unwrap().token, 2, "{schedule:?}");
+        }
+    }
+
+    #[test]
+    fn a_task_that_cannot_start_does_not_block_others_when_scoring() {
+        let mut d = lazy(
+            &[("vram_gb", 7.5), ("pool:gemma", 1.0)],
+            &[("g", &[("pool:gemma", 1.0)]), ("p", &[("vram_gb", 0.5)])],
+            &[("gemma", &[("vram_gb", 7.4)], 0)],
+        );
+        let t0 = Instant::now();
+        d.push(task(1, "g", "q"), t0);
+        assert!(d.pop(t0).is_some());
+        d.push(task(2, "g", "q"), t0);
+        d.push(task(3, "plain", "q"), t0);
+        assert_eq!(d.pop(t0).unwrap().token, 3, "the second gemma task waits for pool:gemma");
+    }
+
+    #[test]
+    fn schedule_and_lazy_pools_must_agree() {
+        let lazy_r = lazy_res(
+            &[("vram_gb", 7.5), ("pool:gemma", 1.0)], &[], &[("gemma", &[("vram_gb", 7.4)], 0)],
+        );
+        let new = |r: &Resources, s| Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), r, s).map(|_| ());
+        assert!(matches!(new(&lazy_r, Schedule::Fifo), Err(Error::Config(_))));
+        assert!(new(&lazy_r, Schedule::Throughput).is_ok() && new(&lazy_r, Schedule::Oldest).is_ok());
+        let plain = res(&[("gpu", 1.0)], &[]);
+        assert!(matches!(new(&plain, Schedule::Throughput), Err(Error::Config(_))));
+        assert!(matches!(new(&plain, Schedule::Oldest), Err(Error::Config(_))));
+        assert!(new(&plain, Schedule::Fifo).is_ok());
+    }
+
+    #[test]
+    fn only_the_oldest_schedule_looks_at_the_workflow_start() {
+        let origin_age = |schedule| {
+            let mut d = lazy_sched(schedule);
+            let t0 = far();
+            d.push(in_workflow(1, "g", now_ms() - 30_000), t0);
+            t0 - d.held[0].origin
+        };
+        assert_eq!(origin_age(Schedule::Throughput), Duration::ZERO);
+        let age = origin_age(Schedule::Oldest);
+        assert!(age >= Duration::from_secs(29) && age <= Duration::from_secs(31), "{age:?}");
+    }
+
+    #[test]
+    fn origin_clamps_a_future_start_and_a_very_old_one() {
+        let at = far();
+        assert_eq!(origin_of(at, 5_000, 4_000), at, "started in the future (clock skew)");
+        assert_eq!(origin_of(at, 5_000, 5_000), at);
+        assert_eq!(origin_of(at, 1_000, 11_000), at - Duration::from_secs(10));
+        assert_eq!(origin_of(at, 0, u64::MAX), at - MAX_ORIGIN_AGE, "capped at a day");
+    }
+
+    #[test]
+    fn origin_falls_back_to_at_when_the_instant_cannot_go_back() {
+        // An Instant can't be moved before the clock's epoch; a task held right after boot must not panic.
+        let at = Instant::now();
+        let origin = origin_of(at, 0, 3_600_000);
+        assert!(origin == at || at - origin == Duration::from_secs(3600));
     }
 }

@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use mayu_core::{
-    Broker, Header, LazyPool, Link, Outcome, ReadyTask, Resources, Runtime, RuntimeConfig, WorkflowNode, WorkflowSpec,
-    WorkflowState,
+    Broker, Header, LazyPool, Link, Outcome, ReadyTask, Resources, Runtime, RuntimeConfig, Schedule, WorkflowNode,
+    WorkflowSpec, WorkflowState,
 };
 use mayu_redis::RedisBroker;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -208,7 +208,7 @@ struct Worker {
 #[pymethods]
 impl Worker {
     #[new]
-    #[pyo3(signature = (url, queues, concurrency, prefetch_multiplier=2, result_ttl_secs=None, consumer=None, visibility_timeout_ms=None, reclaim_interval_ms=None, heartbeat_interval_ms=None, max_deliveries=None, strict_priority=false, rate_limits=None, metrics_addr=None, resources=None, task_resources=None, lazy_pools=None))]
+    #[pyo3(signature = (url, queues, concurrency, prefetch_multiplier=2, result_ttl_secs=None, consumer=None, visibility_timeout_ms=None, reclaim_interval_ms=None, heartbeat_interval_ms=None, max_deliveries=None, strict_priority=false, rate_limits=None, metrics_addr=None, resources=None, task_resources=None, lazy_pools=None, schedule=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -228,7 +228,18 @@ impl Worker {
         resources: Option<HashMap<String, f64>>,
         task_resources: Option<HashMap<String, HashMap<String, f64>>>,
         lazy_pools: Option<LazyPoolArgs>,
+        schedule: Option<String>,
     ) -> PyResult<Self> {
+        let schedule = match schedule.as_deref() {
+            None => Schedule::Fifo,
+            Some("throughput") => Schedule::Throughput,
+            Some("oldest") => Schedule::Oldest,
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "schedule must be 'throughput' or 'oldest', got {other:?}"
+                )));
+            }
+        };
         let consumer = consumer.unwrap_or_else(|| format!("w-{}-{}", std::process::id(), ulid::Ulid::generate()));
         let mut cfg = RuntimeConfig {
             queues, concurrency, prefetch_multiplier, result_ttl_secs,
@@ -242,6 +253,7 @@ impl Worker {
                     .map(|(name, (claim, loaded))| (name, LazyPool { claim, loaded }))
                     .collect(),
             },
+            schedule,
             ..RuntimeConfig::default()
         };
         if let Some(v) = visibility_timeout_ms { cfg.visibility_timeout_ms = v; }

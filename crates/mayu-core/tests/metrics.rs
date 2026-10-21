@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use mayu_core::{Error, Header, MemoryBroker, Outcome, Resources, RetryPolicy, Runtime, RuntimeConfig};
+use mayu_core::{Error, Header, MemoryBroker, Outcome, Resources, RetryPolicy, Runtime, RuntimeConfig, Schedule};
 
 fn cfg(concurrency: usize, prefetch: usize) -> RuntimeConfig {
     RuntimeConfig {
@@ -232,6 +232,7 @@ fn lazy_cfg() -> RuntimeConfig {
                 ("tts".to_string(), LazyPool { claim: [("vram_gb".to_string(), 7.2)].into(), loaded: 0 }),
             ].into(),
         },
+        schedule: Schedule::Oldest,
         ..cfg(4, 2)
     }
 }

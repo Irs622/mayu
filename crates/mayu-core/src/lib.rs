@@ -11,7 +11,9 @@ pub mod runtime;
 pub mod workflow;
 
 pub use broker::{Broker, Delivery, QueueStats, Reclaimed, StoredResult, WorkerInfo};
-pub use dispatch::{Admit, Dispatcher, HOLD_HORIZON, LazyPool, RESERVE_AFTER, Resources};
+pub use dispatch::{
+    Admit, Dispatcher, HOLD_HORIZON, LazyPool, OLDEST_BONUS, RESERVE_AFTER, Resources, Schedule, THROUGHPUT_BONUS,
+};
 pub use envelope::{
     Header, decode_delayed_member, decode_header, encode_delayed_member, encode_header, now_ms,
 };

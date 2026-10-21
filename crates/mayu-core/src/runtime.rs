@@ -8,7 +8,7 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 
-use crate::dispatch::{Admit, Dispatcher, ReadyQueue, Resources};
+use crate::dispatch::{Admit, Dispatcher, ReadyQueue, Resources, Schedule};
 use crate::broker::{Broker, Delivery, StoredResult, WorkerInfo};
 use crate::envelope::{Header, now_ms};
 use crate::error::{Error, Result};
@@ -43,6 +43,8 @@ pub struct RuntimeConfig {
     pub rate_limits: HashMap<String, f64>,
     /// What this worker process has and what its tasks use; a task starts only when its request fits.
     pub resources: Resources,
+    /// How tasks of a worker with lazy pools are ordered; `Fifo` exactly when there are none.
+    pub schedule: Schedule,
     /// Serve Prometheus metrics here (`GET /metrics`). Port 0 picks a free port.
     pub metrics_addr: Option<SocketAddr>,
 }
@@ -65,6 +67,7 @@ impl Default for RuntimeConfig {
             strict_priority: false,
             rate_limits: HashMap::new(),
             resources: Resources::default(),
+            schedule: Schedule::Fifo,
             metrics_addr: None,
         }
     }
@@ -85,6 +88,8 @@ pub struct ReadyTask {
     pub loads: Vec<String>,
     /// Lazy pools only: model pools to close an idle instance of first (before `loads`), one entry per instance.
     pub evicts: Vec<String>,
+    /// Unix ms the task's workflow started, from its ULID id; None outside workflows or for other id formats.
+    pub workflow_started_ms: Option<u64>,
 }
 
 impl ReadyTask {
@@ -101,6 +106,9 @@ impl ReadyTask {
             trace_ctx: d.header.trace_ctx.clone(),
             loads: Vec::new(),
             evicts: Vec::new(),
+            workflow_started_ms: d.header.workflow_id.as_deref()
+                .and_then(|id| ulid::Ulid::from_string(id).ok())
+                .map(|u| u.timestamp_ms()),
         }
     }
 }
@@ -154,7 +162,7 @@ impl<B: Broker> Runtime<B> {
         if cfg.visibility_timeout_ms == 0 || cfg.reclaim_interval_ms == 0 || cfg.heartbeat_interval_ms == 0 {
             return Err(Error::Config("visibility, reclaim and heartbeat intervals must be > 0".into()));
         }
-        let dispatcher = Dispatcher::new(&cfg.queues, cfg.strict_priority, &cfg.rate_limits, &cfg.resources)?;
+        let dispatcher = Dispatcher::new(&cfg.queues, cfg.strict_priority, &cfg.rate_limits, &cfg.resources, cfg.schedule)?;
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("mayu-rt")
@@ -882,4 +890,30 @@ async fn scrape<B: Broker>(
         }
     }
     metrics.render(&Gauges { concurrency, inflight: n, running, queues: stats, resources: ready.usage(), loaded: ready.lazy_usage() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn delivery(workflow_id: Option<&str>) -> Delivery {
+        let mut header = Header::new("t", "q", 0, "ct");
+        header.workflow_id = workflow_id.map(String::from);
+        Delivery { queue: "q".into(), stream_id: "1-0".into(), header, raw_header: vec![], payload: vec![], delivery_count: 1 }
+    }
+
+    #[test]
+    fn workflow_start_comes_from_the_ulid_timestamp() {
+        let ms = 1_700_000_000_123;
+        let id = ulid::Ulid::from_parts(ms, 42).to_string();
+        assert_eq!(ReadyTask::from_delivery(1, &delivery(Some(&id))).workflow_started_ms, Some(ms));
+    }
+
+    #[test]
+    fn no_workflow_start_without_a_workflow_or_a_ulid() {
+        assert_eq!(ReadyTask::from_delivery(1, &delivery(None)).workflow_started_ms, None);
+        for bad in ["01WF", "", "not-a-ulid-at-all-not-a-ulid"] {
+            assert_eq!(ReadyTask::from_delivery(1, &delivery(Some(bad))).workflow_started_ms, None, "{bad:?}");
+        }
+    }
 }
