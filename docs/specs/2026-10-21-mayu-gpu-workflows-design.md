@@ -181,7 +181,7 @@ key layout.
 |---|---|---|---|
 | 8 | Declarations, `implement`, send by name (done) | — | no |
 | ~~9~~ | ~~Python 3.11 / 3.12~~: dropped, see §4 | | |
-| 10 | Resource admission, `--resources`, `--gpus`, capacity requeue | — | defaults only |
+| 10 | Resource admission, `--resources`, `--gpus` (done; capacity requeue on OOM deferred) | — | defaults only |
 | 11 | Workflows (DAG) | — | no |
 | 12 | Resident models, residency-aware scoring, `cost=` | 10, 11 | yes: load times, VRAM |
 | 13 | Self-tuning concurrency (NVML, optional `gpu` extra), GPU metrics, linger | 12 | yes |
