@@ -7,7 +7,7 @@ import sys
 import pytest
 
 from mayu import App
-from mayu.cli import load_app, parse_gpus
+from mayu.cli import load_app, parse_gpus, parse_pools
 
 HERE = pathlib.Path(__file__).parent
 
@@ -172,3 +172,72 @@ def test_each_gpu_gets_its_own_worker_process(tmp_path, redis_url, queue):
     finally:
         _stop(proc)
     assert seen == {("4", "4"), ("7", "7")}
+
+
+POOL_APP = (
+    "from mayu import App\n"
+    "app = App(result_ttl=60)\n"
+    "@app.pool('gemma')\n"
+    "def gemma(ctx):\n"
+    "    if %s:\n"
+    "        raise OSError('no weights')\n"
+    "    return f'gemma-{ctx.index}'\n"
+    "@app.task(name='pool.use')\n"
+    "def use(model=app.use('gemma')):\n"
+    "    return model\n"
+)
+
+
+@pytest.mark.parametrize("text,expected", [
+    (None, None), ("", None), ("  ", None), ("gemma=2", {"gemma": 2}), ("gemma=0", {"gemma": 0}),
+    ("gemma=2, tts = 3", {"gemma": 2, "tts": 3}),
+])
+def test_parse_pools(text, expected):
+    assert parse_pools(text) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "gemma", "=1", "gemma=", "gemma=x", "gemma=-1", "gemma=1.5", "gemma=+1", "gemma=1,,tts=2", "gemma=1,gemma=2",
+    "ge mma=1", "gemma=1=2",
+])
+def test_parse_pools_rejects_malformed_input(text):
+    with pytest.raises(ValueError, match="--pools"):
+        parse_pools(text)
+
+
+@pytest.mark.parametrize("extra", [[], ["--mode", "process", "--processes", "2"]])
+def test_worker_cli_rejects_malformed_pools_and_unsized_pools(tmp_path, redis_url, queue, extra):
+    app_source = POOL_APP % "False"
+    r = _run_worker(tmp_path, redis_url, queue, app_source, "--pools", "gemma=x", *extra)
+    assert r.returncode == 2
+    assert "mayu: bad --pools entry 'gemma=x'" in r.stderr, r.stderr
+    r = _run_worker(tmp_path, redis_url, queue, app_source, *extra)
+    assert r.returncode == 2
+    assert ("mayu: task 'pool.use' uses pool 'gemma' but this worker has no instances of it; "
+            "pass --pools gemma=N") in r.stderr, r.stderr
+    r = _run_worker(tmp_path, redis_url, queue, app_source, "--pools", "gemma=0", *extra)
+    assert r.returncode == 2 and "pass --pools gemma=N" in r.stderr
+    r = _run_worker(tmp_path, redis_url, queue, app_source, "--pools", "gemma=1,ghost=1", *extra)
+    assert r.returncode == 2 and "--pools names pool 'ghost'" in r.stderr, r.stderr
+
+
+def test_worker_cli_reports_a_pool_that_fails_to_load(tmp_path, redis_url, queue):
+    r = _run_worker(tmp_path, redis_url, queue, POOL_APP % "True", "--pools", "gemma=1")
+    assert r.returncode == 1
+    assert "mayu: cannot start worker: pool 'gemma' instance 0 failed to load: OSError('no weights')" in r.stderr
+
+
+def test_worker_cli_loads_pools_from_the_environment(tmp_path, redis_url, queue):
+    (tmp_path / "res_app.py").write_text(POOL_APP % "False")
+    env = {**_env(redis_url, queue), "PYTHONPATH": str(tmp_path), "MAYU_POOLS": "gemma=1"}
+    proc = subprocess.Popen([sys.executable, "-m", "mayu", "worker", "res_app:app", "--mode", "thread",
+                             "--threads", "2"], env=env, stderr=subprocess.PIPE, text=True)
+    try:
+        producer = App(broker=redis_url, result_ttl=60, default_queue=queue)
+
+        @producer.declare(name="pool.use")
+        def use(model=producer.use("gemma")): ...
+
+        assert use.send().result(timeout=30) == "gemma-0"
+    finally:
+        _stop(proc)
