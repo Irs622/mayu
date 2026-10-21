@@ -221,6 +221,33 @@ impl Dispatcher {
         true
     }
 
+    /// Changes a resource's capacity by `delta` (negative shrinks). Capacity may drop below what is in
+    /// use: nothing new fits until enough is released, and `release` still subtracts what was taken.
+    /// Returns whether it grew, which is when waiters may now fit.
+    pub fn adjust_capacity(&mut self, resource: &str, delta: f64) -> Result<bool> {
+        let i = self.resource_names.binary_search_by(|n| n.as_str().cmp(resource)).map_err(|_| {
+            Error::Config(format!("cannot adjust resource {resource:?}, which this worker does not declare"))
+        })?;
+        let d = (delta * MILLI).round();
+        if !d.is_finite() || d.abs() >= MAX_MILLI {
+            return Err(Error::Config(format!("cannot adjust resource {resource:?} by {delta}")));
+        }
+        let d = d as i64;
+        // |d| < 1e15 and capacity < 1e15, so the sum cannot overflow an i64.
+        let new = self.capacity[i] as i64 + d;
+        if new < 0 {
+            return Err(Error::Config(format!(
+                "cannot adjust resource {resource:?} by {delta}: it has only {}",
+                self.capacity[i] as f64 / MILLI
+            )));
+        }
+        if new as f64 >= MAX_MILLI {
+            return Err(Error::Config(format!("cannot adjust resource {resource:?} by {delta}")));
+        }
+        self.capacity[i] = new as u64;
+        Ok(d > 0)
+    }
+
     /// (resource, capacity, in use), for metrics.
     pub fn usage(&self) -> Vec<(String, f64, f64)> {
         self.resource_names.iter().enumerate()
@@ -272,6 +299,15 @@ impl ReadyQueue {
     pub(crate) fn hold(&self, task: ReadyTask, at: Instant) {
         self.inner.lock().unwrap().hold(task, at);
         self.cv.notify_one();
+    }
+
+    /// See `Dispatcher::adjust_capacity`. Growth wakes the waiters, several of which may now fit.
+    pub(crate) fn adjust_capacity(&self, resource: &str, delta: f64) -> Result<()> {
+        let grew = self.inner.lock().unwrap().adjust_capacity(resource, delta)?;
+        if grew {
+            self.cv.notify_all();
+        }
+        Ok(())
     }
 
     /// (resource, capacity, in use), for metrics.
@@ -755,5 +791,81 @@ mod tests {
         got.sort();
         assert_eq!(got, vec![Some(3), Some(4)]);
         assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn shrinking_below_in_use_blocks_admission_until_enough_is_released() {
+        let mut d = with_res(&res(&[("pool:m", 3.0)], &[("g", &[("pool:m", 1.0)])]));
+        let t0 = Instant::now();
+        for tok in 1..=4 {
+            d.push(task(tok, "g", "q"), t0);
+        }
+        assert_eq!(tokens(&mut d, t0), vec![1, 2, 3]);
+        d.adjust_capacity("pool:m", -2.0).unwrap(); // capacity 1, three in use
+        assert_eq!(in_use(&d, "pool:m"), 3.0);
+        d.release(1);
+        assert_eq!(tokens(&mut d, t0), Vec::<u64>::new(), "2 in use, capacity 1");
+        d.release(2);
+        assert_eq!(tokens(&mut d, t0), Vec::<u64>::new(), "1 in use, capacity 1");
+        d.release(3);
+        assert_eq!(tokens(&mut d, t0), vec![4]);
+        assert_eq!(in_use(&d, "pool:m"), 1.0);
+    }
+
+    #[test]
+    fn growing_lets_a_waiting_task_start() {
+        let mut d = with_res(&res(&[("pool:m", 1.0)], &[("g", &[("pool:m", 1.0)])]));
+        let t0 = Instant::now();
+        d.push(task(1, "g", "q"), t0);
+        d.push(task(2, "g", "q"), t0);
+        assert_eq!(tokens(&mut d, t0), vec![1]);
+        d.adjust_capacity("pool:m", 1.0).unwrap();
+        assert_eq!(tokens(&mut d, t0), vec![2]);
+        assert_eq!(d.usage(), vec![("pool:m".to_string(), 2.0, 2.0)]);
+    }
+
+    #[test]
+    fn adjust_capacity_rejects_unusable_changes_and_leaves_capacity_alone() {
+        let mut d = with_res(&res(&[("pool:m", 2.0)], &[]));
+        for (name, delta) in [("nope", 1.0), ("pool:m", -2.5), ("pool:m", f64::NAN), ("pool:m", f64::INFINITY),
+            ("pool:m", f64::NEG_INFINITY), ("pool:m", 1e300)] {
+            assert!(matches!(d.adjust_capacity(name, delta), Err(Error::Config(_))), "{name} {delta}");
+        }
+        assert_eq!(d.usage(), vec![("pool:m".to_string(), 2.0, 0.0)]);
+        d.adjust_capacity("pool:m", -2.0).unwrap(); // down to exactly zero is fine
+        assert_eq!(d.usage(), vec![("pool:m".to_string(), 0.0, 0.0)]);
+    }
+
+    #[test]
+    fn adjust_capacity_works_in_milli_units() {
+        let mut d = with_res(&res(&[("vram_gb", 8.0)], &[]));
+        d.adjust_capacity("vram_gb", -5.8).unwrap();
+        d.adjust_capacity("vram_gb", 0.1).unwrap();
+        assert_eq!(d.usage(), vec![("vram_gb".to_string(), 2.3, 0.0)]);
+    }
+
+    #[test]
+    fn ready_queue_growth_wakes_a_blocked_receiver() {
+        let q = Arc::new(gpu_queue());
+        q.push(task(1, "g", "q"), Instant::now());
+        q.push(task(2, "g", "q"), Instant::now());
+        assert_eq!(q.recv_timeout(Duration::from_secs(1)).map(|t| t.token), Some(1));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let q2 = q.clone();
+        let h = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            q2.recv_timeout(Duration::from_secs(10)).map(|t| t.token)
+        });
+        started_rx.recv().unwrap();
+        // The receiver may or may not be parked yet; growth must wake it either way.
+        q.adjust_capacity("gpu", 1.0).unwrap();
+        assert_eq!(h.join().unwrap(), Some(2));
+    }
+
+    #[test]
+    fn ready_queue_adjust_capacity_reports_errors() {
+        let q = gpu_queue();
+        assert!(matches!(q.adjust_capacity("gpu", -2.0), Err(Error::Config(_))));
+        assert_eq!(q.usage(), vec![("gpu".to_string(), 1.0, 0.0)]);
     }
 }
