@@ -64,3 +64,40 @@ def test_worker_cli_rejects_queue_with_unimplemented_tasks(tmp_path, redis_url, 
                        text=True, timeout=30)
     assert r.returncode == 2
     assert "mayu: queue 'gpu-q' has tasks declared but not implemented in this process: decl.gpu" in r.stderr
+
+
+def _run_worker(tmp_path, redis_url, queue, source, *extra, env=None):
+    (tmp_path / "res_app.py").write_text(source)
+    cmd = [sys.executable, "-m", "mayu", "worker", "res_app:app", "--mode", "thread", *extra]
+    return subprocess.run(cmd, env={**_env(redis_url, queue), "PYTHONPATH": str(tmp_path), **(env or {})},
+                          capture_output=True, text=True, timeout=30)
+
+
+GPU_APP = (
+    "from mayu import App\n"
+    "app = App()\n"
+    "@app.task(name='res.train', resources={'gpu': 1})\n"
+    "def train(): ...\n"
+)
+
+
+@pytest.mark.parametrize("value", ["gpu", "gpu=x", "gpu=-1", "=1", "gpu=1,gpu=2"])
+def test_worker_cli_rejects_malformed_resources(tmp_path, redis_url, queue, value):
+    r = _run_worker(tmp_path, redis_url, queue, GPU_APP, "--resources", value)
+    assert r.returncode == 2
+    assert "mayu: bad --resources" in r.stderr, r.stderr
+
+
+def test_worker_cli_refuses_to_start_when_a_task_requests_more_than_the_worker_has(tmp_path, redis_url, queue):
+    r = _run_worker(tmp_path, redis_url, queue, GPU_APP, "--resources", "cpu=4")
+    assert r.returncode == 2
+    assert ("mayu: task 'res.train' requests 'gpu' but this worker declares no such resource; "
+            "pass --resources gpu=...") in r.stderr
+    r = _run_worker(tmp_path, redis_url, queue, GPU_APP)
+    assert r.returncode == 2 and "pass --resources gpu=..." in r.stderr
+
+
+def test_worker_cli_reads_resources_from_the_environment(tmp_path, redis_url, queue):
+    r = _run_worker(tmp_path, redis_url, queue, GPU_APP, env={"MAYU_RESOURCES": "gpu=0.5"})
+    assert r.returncode == 2
+    assert "requests gpu=1 but this worker has gpu=0.5" in r.stderr

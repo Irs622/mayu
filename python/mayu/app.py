@@ -8,7 +8,7 @@ from .serializers import PICKLE, get_serializer
 from .task import Task, _enqueue
 
 _TASK_OPTIONS = frozenset({"name", "queue", "max_retries", "retry_on", "soft_time_limit", "hard_time_limit",
-                           "threadsafe", "rate_limit"})
+                           "threadsafe", "rate_limit", "resources"})
 
 
 class App:
@@ -51,10 +51,10 @@ class App:
     def task(self, fn=None, /, *, name: str | None = None, queue: str | None = None,
              max_retries: int | None = None, retry_on=(),
              soft_time_limit: float | None = None, hard_time_limit: float | None = None, threadsafe: bool = True,
-             rate_limit=None):
+             rate_limit=None, resources=None):
         options = dict(name=name, queue=queue, max_retries=max_retries, retry_on=retry_on,
                        soft_time_limit=soft_time_limit, hard_time_limit=hard_time_limit, threadsafe=threadsafe,
-                       rate_limit=rate_limit)
+                       rate_limit=rate_limit, resources=resources)
         return self._register(fn, options, implemented=True)
 
     def declare(self, fn=None, /, **options):
@@ -73,6 +73,7 @@ class App:
                 hard_time_limit=options.get("hard_time_limit"),
                 threadsafe=options.get("threadsafe", True),
                 rate_limit=options.get("rate_limit"),
+                resources=options.get("resources"),
                 implemented=implemented,
             )
             with self._registry_lock:

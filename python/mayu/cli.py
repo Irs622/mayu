@@ -2,6 +2,7 @@ import argparse
 import importlib
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -23,6 +24,27 @@ def load_app(path: str) -> App:
     return obj
 
 
+def parse_resources(text: str | None) -> dict[str, float] | None:
+    """'gpu=1,vram_gb=7.5' -> {'gpu': 1.0, 'vram_gb': 7.5}; None or '' -> None."""
+    if not text or not text.strip():
+        return None
+    out: dict[str, float] = {}
+    for item in text.split(","):
+        name, sep, amount = item.partition("=")
+        name = name.strip()
+        try:
+            value = float(amount)
+        except ValueError:
+            value = float("nan")
+        if not sep or not name or not math.isfinite(value) or value < 0:
+            raise ValueError(f"bad --resources entry {item.strip()!r}: use name=amount with an amount >= 0, "
+                             f"like gpu=1,vram_gb=7.5")
+        if name in out:
+            raise ValueError(f"bad --resources: {name!r} given twice")
+        out[name] = value
+    return out
+
+
 def _build_runner(app, args, threads: int):
     from .worker import WorkerRunner
 
@@ -36,7 +58,8 @@ def _build_runner(app, args, threads: int):
                         max_zombie_threads=args.max_zombie_threads,
                         max_tasks_per_process=args.max_tasks_per_process,
                         max_memory_per_process=args.max_memory_per_process,
-                        metrics_port=args.metrics_port, metrics_host=args.metrics_host)
+                        metrics_port=args.metrics_port, metrics_host=args.metrics_host,
+                        resources=args.resources)
 
 
 def _cmd_worker(args) -> int:
@@ -44,6 +67,11 @@ def _cmd_worker(args) -> int:
     try:
         configure_logging(args.log_format, args.log_level)
     except ValueError as e:  # argparse does not check `choices` against env-provided defaults
+        print(f"mayu: {e}", file=sys.stderr)
+        return 2
+    try:
+        args.resources = parse_resources(args.resources)
+    except ValueError as e:
         print(f"mayu: {e}", file=sys.stderr)
         return 2
     from .modes import gil_enabled, import_app_detecting_gil, resolve_mode
@@ -211,6 +239,9 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--metrics-port", type=int, default=os.environ.get("MAYU_METRICS_PORT") or None,
                    help="serve Prometheus metrics on this port (process i of --processes uses port+i)")
     w.add_argument("--metrics-host", default="0.0.0.0", help="address to serve metrics on")
+    w.add_argument("--resources", default=os.environ.get("MAYU_RESOURCES") or None, metavar="NAME=AMOUNT,...",
+                   help="what each worker process has, e.g. gpu=1,vram_gb=7.5,cpu=12; a task starts only when "
+                        "its resources= requests fit in what is left")
     w.add_argument("--log-format", choices=("text", "json"), default=os.environ.get("MAYU_LOG_FORMAT") or "text")
     w.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"),
                    type=str.upper, default=(os.environ.get("MAYU_LOG_LEVEL") or "INFO").upper())
