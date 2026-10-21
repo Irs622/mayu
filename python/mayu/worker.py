@@ -69,11 +69,13 @@ class _Slot:
 class _PoolState:
     """The live instances of one pool. The lock guards only the free list, never user code."""
 
-    def __init__(self, pool, size: int):
+    def __init__(self, pool, size: int, lazy: bool = False):
         self.pool = pool
+        self.lazy = lazy
         self.target = size  # what ctx.size says
         self.size = size  # instances the pool is expected to have; shrinks when one is lost for good
-        self.free: collections.deque = collections.deque()  # (index, instance)
+        self.free: collections.deque = collections.deque()  # (index, instance), least recently returned first
+        self.indexes = set(range(size)) if lazy else set()  # lazy pools: indexes no instance has right now
         self.lock = threading.Lock()
 
     def push(self, index: int, instance) -> None:
@@ -83,6 +85,28 @@ class _PoolState:
     def take(self):
         with self.lock:
             return self.free.popleft() if self.free else None
+
+    def take_recent(self):
+        """Lazy pools: the instance returned last (its weights are the most likely to still be warm)."""
+        with self.lock:
+            return self.free.pop() if self.free else None
+
+    def take_lru(self):
+        """Lazy pools: the instance returned longest ago, the one to evict."""
+        with self.lock:
+            return self.free.popleft() if self.free else None
+
+    def take_index(self) -> int | None:
+        with self.lock:
+            if not self.indexes:
+                return None
+            index = min(self.indexes)
+            self.indexes.discard(index)
+            return index
+
+    def give_index(self, index: int) -> None:
+        with self.lock:
+            self.indexes.add(index)
 
     def drain(self) -> list:
         with self.lock:
@@ -107,7 +131,8 @@ class WorkerRunner:
                  max_tasks_per_process: int | None = None, max_memory_per_process: float | None = None,
                  metrics_port: int | None = None, metrics_host: str = "0.0.0.0",
                  resources: dict[str, float] | None = None, pools: dict[str, int] | None = None,
-                 thp: str = "python"):
+                 thp: str = "python", pool_mode: str = "eager", schedule: str | None = None,
+                 preload: list[str] | None = None):
         if threads < 1:
             raise ValueError("threads must be >= 1")
         if visibility_timeout <= 0 or heartbeat_interval <= 0:
@@ -122,6 +147,14 @@ class WorkerRunner:
             raise ValueError("max_memory_per_process must be positive (MB)")
         if metrics_port is not None and not 0 <= metrics_port <= 65535:
             raise ValueError("metrics_port must be between 0 and 65535")
+        if pool_mode not in ("eager", "lazy"):
+            raise ValueError(f"pool_mode must be 'eager' or 'lazy', got {pool_mode!r}")
+        if schedule not in (None, "throughput", "oldest"):
+            raise ValueError(f"schedule must be 'throughput' or 'oldest', got {schedule!r}")
+        if pool_mode != "lazy" and schedule is not None:
+            raise ValueError("--schedule needs --pool-mode lazy")
+        if pool_mode != "lazy" and preload:
+            raise ValueError("--preload needs --pool-mode lazy")
         self.thp = thp_mod.check(thp)
         self.app = app
         self.threads = threads
@@ -136,7 +169,11 @@ class WorkerRunner:
             raise ValueError("no queue to serve: every queue has tasks declared but not implemented in this process; "
                              "import their implementations or pass queues")
         self.resources = check_resources("resources", resources, allow_zero=True)
+        self.lazy = pool_mode == "lazy"
         left = self._plan_pools(pools)
+        self.lazy_pools = self._plan_preload(preload)
+        self.lazy = self.lazy and bool(self._loaded)  # a lazy worker with no pools is an ordinary one
+        self.schedule = (schedule or "oldest") if self.lazy else None
         self.task_resources = self._served_requests(left)
         self.capacity = {**left, **{f"pool:{p}": float(n) for p, n in self._loaded.items()}}
         self.strict_priority = bool(queues)  # only a non-empty explicit list is a priority order
@@ -209,6 +246,7 @@ class WorkerRunner:
                                  f"import the module with @app.pool({name!r})")
             if n and name not in used:
                 log.warning("pool %r is sized but no task on the served queues uses it; not loading it", name)
+        self._sized = {p: n for p, n in pools.items() if n}
         self._loaded = {p: n for p, n in pools.items() if n and p in used}
         reserved: dict[str, int] = {}  # milli-units, like the dispatcher
         parts: dict[str, list[str]] = {}
@@ -217,8 +255,9 @@ class WorkerRunner:
                 if r not in self.resources:
                     raise ValueError(f"pool {p!r} needs {r!r} per instance but this worker declares no such "
                                      f"resource; pass --resources {r}=...")
-                reserved[r] = reserved.get(r, 0) + n * round(amount * 1000)
-                parts.setdefault(r, []).append(f"{p} {n} × {amount:g}")
+                if not self.lazy:  # a lazy pool holds its resources only while an instance is loaded
+                    reserved[r] = reserved.get(r, 0) + n * round(amount * 1000)
+                    parts.setdefault(r, []).append(f"{p} {n} × {amount:g}")
         left = {}
         for r, cap in self.resources.items():
             milli = round(cap * 1000) - reserved.get(r, 0)
@@ -228,6 +267,39 @@ class WorkerRunner:
             left[r] = milli / 1000
         self._reserved = reserved
         return left
+
+    def _plan_preload(self, preload) -> dict[str, tuple[dict[str, float], int]]:
+        """Checks `preload`; returns the lazy pools as {pool: (resources per instance, instances preloaded)}."""
+        if preload is None:
+            preload = []
+        if isinstance(preload, str) or not all(isinstance(n, str) for n in preload):
+            raise TypeError(f"preload must be a list of pool names like ['gemma'], got {preload!r}")
+        names = list(preload)
+        registered = self.app.pools
+        for name in names:
+            check_pool_name(name)
+            if names.count(name) > 1:
+                raise ValueError(f"--preload lists pool {name!r} more than once")
+            if name not in registered:
+                raise ValueError(f"--preload names pool {name!r}, which this process does not define; "
+                                 f"import the module with @app.pool({name!r})")
+            if name not in self._sized:
+                raise ValueError(f"--preload names pool {name!r} but this worker has no instances of it; "
+                                 f"pass --pools {name}=N")
+            if name not in self._loaded:
+                raise ValueError(f"--preload names pool {name!r}, which no task on the served queues uses")
+        total: dict[str, int] = {}  # milli-units
+        for name in names:
+            for r, amount in registered[name].resources.items():
+                total[r] = total.get(r, 0) + round(amount * 1000)
+        for r, milli in sorted(total.items()):
+            if milli > round(self.resources[r] * 1000):
+                raise ValueError(f"preloading {', '.join(names)} needs {r}={milli / 1000:g} but this worker has "
+                                 f"{r}={self.resources[r]:g}; preload fewer pools or raise --resources {r}=...")
+        self._preload = names
+        if not self.lazy:
+            return {}
+        return {p: (dict(registered[p].resources), 1 if p in names else 0) for p in self._loaded}
 
     def _served_requests(self, left: dict[str, float]) -> dict[str, dict[str, float]]:
         """Requests of the tasks on served queues (plus one `pool:` slot per pool used), checked against `left`."""
@@ -246,8 +318,25 @@ class WorkerRunner:
                         f"task {t.name!r} requests {name}={amount:g} but this worker has "
                         f"{name}={left[name]:g}{after}; raise --resources {name}=... "
                         f"or route the task to a bigger worker")
+            if self.lazy and t.pools:  # its own request plus every model it needs in memory at once
+                self._check_lazy_fit(t)
             out[t.name] = {**t.resources, **{f"pool:{p}": 1.0 for p in t.pools.values()}}
         return out
+
+    def _check_lazy_fit(self, t) -> None:
+        need: dict[str, int] = {r: round(a * 1000) for r, a in t.resources.items()}
+        parts: dict[str, list[str]] = {}
+        for p in sorted(set(t.pools.values())):
+            for r, amount in self.app.pools[p].resources.items():
+                need[r] = need.get(r, 0) + round(amount * 1000)
+                parts.setdefault(r, []).append(f"{p} {amount:g}")
+        for r, milli in sorted(need.items()):
+            if milli > round(self.resources[r] * 1000):
+                if r in t.resources:
+                    parts.setdefault(r, []).append(f"{t.resources[r]:g} of its own")
+                raise ValueError(
+                    f"task {t.name!r} needs {r}={milli / 1000:g} ({' + '.join(parts[r])}) but this worker has "
+                    f"{r}={self.resources[r]:g}; raise --resources {r}=... or route the task to a bigger worker")
 
     @property
     def worker_id(self) -> str | None:
@@ -267,6 +356,8 @@ class WorkerRunner:
         except BaseException:
             self._close_pools()
             raise
+        for name in self._preload if self.lazy else ():  # the dispatcher already counts them (lazy_pools)
+            self.native.pool_loaded(name)
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(target=self._loop.run_forever, name="mayu-async", daemon=True)
         self._loop_thread.start()
@@ -288,6 +379,8 @@ class WorkerRunner:
             rate_limits=rate_limits,
             resources=self.capacity or None,
             task_resources=self.task_resources or None,
+            lazy_pools=self.lazy_pools or None,
+            schedule=self.schedule,
             metrics_addr=(None if self.metrics_port_requested is None
                           else _hostport(self.metrics_host, self.metrics_port_requested)),
         )
@@ -336,7 +429,25 @@ class WorkerRunner:
     # -- pools ---------------------------------------------------------------
 
     def _load_pools(self) -> None:
-        """Builds every instance of every loaded pool, one at a time, in `pools` order then index order."""
+        """Builds every instance of every loaded pool, one at a time, in `pools` order then index order.
+
+        A lazy worker builds only the `preload` pools, one instance each, in the order given."""
+        if self.lazy:
+            for name, n in self._loaded.items():
+                self._states[name] = _PoolState(self.app.pools[name], n, lazy=True)
+            for name in self._preload:
+                state = self._states[name]
+                index = state.take_index()
+                started = time.monotonic()
+                try:
+                    instance = state.pool.factory(PoolContext(name, index, state.target))
+                except Exception as e:
+                    self._close_pools()
+                    raise RuntimeError(f"pool {name!r} instance {index} failed to load: {e!r}") from e
+                state.push(index, instance)
+                log.info("pool instance loaded", extra={"pool": name, "index": index, "size": state.target,
+                                                        "load_seconds": round(time.monotonic() - started, 3)})
+            return
         for name, n in self._loaded.items():
             pool = self.app.pools[name]
             state = self._states[name] = _PoolState(pool, n)
@@ -366,7 +477,9 @@ class WorkerRunner:
         except Exception:
             log.exception("closing an instance of pool %r failed", pool.name)
 
-    def _checkout(self, token, task) -> list[_Held]:
+    def _checkout(self, token, task, loads=(), evicts=()) -> list[_Held]:
+        if self.lazy:
+            return self._checkout_lazy(token, task, loads, evicts)
         held: list[_Held] = []
         try:
             for param, name in task.pools.items():
@@ -382,6 +495,94 @@ class WorkerRunner:
         with self._held_lock:
             self._checked_out[token] = held
         return held
+
+    def _checkout_lazy(self, token, task, loads, evicts) -> list[_Held]:
+        """Carries out the dispatcher's plan for this task: evictions, then loads, then takes the resident instances.
+
+        The dispatcher already counts every load as done, so on failure each one that was not built is undone
+        (`unload_begin` + `unload_done`), and what was built or taken goes back to its pool: the dispatcher's
+        loaded count always equals the instances this process has.
+        """
+        pending = list(loads)  # loads the dispatcher counted that are not built yet
+        built: dict[str, tuple] = {}  # pool -> (index, instance) built for this task, not taken yet
+        held: list[_Held] = []
+        try:
+            failed = None
+            for name in evicts:  # all of them, even after a failure: the dispatcher counts them as gone
+                try:
+                    self._evict(name)
+                except Exception as e:
+                    log.exception("could not evict an instance of pool %r", name)
+                    failed = failed or e
+            if failed is not None:
+                raise failed
+            while pending:
+                built[pending[0]] = self._load(pending[0])
+                pending.pop(0)
+            for param, name in task.pools.items():
+                state = self._states[name]
+                entry = built.pop(name, None) or state.take_recent()
+                if entry is None:  # the ledger admitted this task, so an idle instance must exist
+                    raise RuntimeError(f"pool {name!r} has no free instance; this is a mayu bug")
+                held.append(_Held(param, state, *entry))
+        except BaseException:
+            for name in pending:
+                self._unload_unbuilt(name)
+            for name, (index, instance) in built.items():
+                self._states[name].push(index, instance)
+            for h in held:
+                h.state.push(h.index, h.instance)
+            raise
+        if held:
+            with self._held_lock:
+                self._checked_out[token] = held
+        return held
+
+    def _evict(self, name: str) -> None:
+        """Closes the idle instance of `name` that was returned longest ago."""
+        state = self._states[name]
+        entry = state.take_lru()
+        if entry is None:
+            raise RuntimeError(f"pool {name!r} has no idle instance to evict; this is a mayu bug")
+        index, instance = entry
+        self._close_instance(state.pool, instance)
+        state.give_index(index)  # after the close: nothing may reuse the index while the old instance lives
+        self.native.pool_evicted(name)
+        log.info("pool instance evicted", extra={"pool": name, "index": index})
+
+    def _load(self, name: str) -> tuple:
+        state = self._states[name]
+        index = state.take_index()
+        if index is None:
+            raise RuntimeError(f"pool {name!r} has no free index to load into; this is a mayu bug")
+        started = time.monotonic()
+        try:
+            instance = state.pool.factory(PoolContext(name, index, state.target))
+        except Exception as e:
+            state.give_index(index)
+            raise RuntimeError(f"pool {name!r} failed to load: {e!r}") from e
+        self.native.pool_loaded(name)
+        log.info("pool instance loaded", extra={"pool": name, "index": index, "size": state.target,
+                                                "load_seconds": round(time.monotonic() - started, 3)})
+        return index, instance
+
+    def _unload_unbuilt(self, name: str) -> None:
+        """Takes back a load the dispatcher counted but nothing was built for."""
+        try:
+            self.native.unload_begin(name)
+            self.native.unload_done(name)
+        except Exception:
+            log.exception("could not undo a planned load of pool %r", name)
+
+    def _abandon(self, loads, evicts) -> None:
+        """A planned task failed before it could run: still carry out its evictions, and undo its loads."""
+        for name in evicts:
+            try:
+                self._evict(name)
+            except Exception:
+                log.exception("could not evict an instance of pool %r", name)
+        for name in loads:
+            self._unload_unbuilt(name)
 
     @staticmethod
     def _is_broken(h: _Held, error: BaseException) -> bool:
@@ -403,13 +604,32 @@ class WorkerRunner:
             if not any(h is b for b in broken):
                 h.state.push(h.index, h.instance)
         for h in broken:
-            self._adjust(f"pool:{h.state.pool.name}", -1.0)
+            if self.lazy:  # the instance stays in memory until it is closed, after the report
+                self._unload_begin(h.state.pool.name)
+            else:
+                self._adjust(f"pool:{h.state.pool.name}", -1.0)
         return broken
+
+    def _unload_begin(self, name: str) -> bool:
+        try:
+            self.native.unload_begin(name)
+        except Exception:
+            log.exception("could not mark an instance of pool %r as unloading", name)
+            return False
+        return True
 
     def _rebuild(self, h: _Held) -> None:
         """Closes a broken instance and builds its replacement; runs after the outcome was reported."""
         pool, state = h.state.pool, h.state
         self._close_instance(pool, h.instance)
+        if self.lazy:  # no replacement: the next task that needs this model loads one
+            try:
+                self.native.unload_done(pool.name)
+            except Exception:
+                log.exception("could not release the memory of a discarded instance of pool %r", pool.name)
+            state.give_index(h.index)
+            log.info("pool instance unloaded", extra={"pool": pool.name, "index": h.index})
+            return
         started = time.monotonic()
         try:
             fresh = pool.factory(PoolContext(pool.name, h.index, state.target))
@@ -429,6 +649,8 @@ class WorkerRunner:
             held = self._checked_out.pop(token, None)
         for h in held or ():
             self._adjust(f"pool:{h.state.pool.name}", -1.0)
+            if self.lazy:  # never unload_done: the zombie may still be using the memory
+                self._unload_begin(h.state.pool.name)
             self._pool_shrunk(h.state)
 
     def _pool_shrunk(self, state: _PoolState) -> None:
@@ -513,12 +735,13 @@ class WorkerRunner:
         slot.ident = threading.get_ident()
         while not slot.zombie:
             try:
-                token, task, serializer, args, kwargs, links = self._serial_q.get(timeout=_RECV_TIMEOUT_MS / 1000)
+                token, task, serializer, args, kwargs, links, loads, evicts = self._serial_q.get(
+                    timeout=_RECV_TIMEOUT_MS / 1000)
             except queue.Empty:
                 if not self._running.is_set():
                     return  # drained after stop
                 continue
-            self._run_sync(token, task, serializer, args, kwargs, slot, links)
+            self._run_sync(token, task, serializer, args, kwargs, slot, links, loads, evicts)
 
     def _supervise(self) -> None:
         while not self._halt.wait(_SUPERVISOR_TICK):
@@ -559,12 +782,16 @@ class WorkerRunner:
     # -- execution -----------------------------------------------------------
 
     def _execute(self, ready, slot: _Slot) -> None:
+        # what the dispatcher decided to load and evict for this task (lazy pools only)
+        loads, evicts = (ready.loads, ready.evicts) if self.lazy else ((), ())
         task = self.app.registry.get(ready.task)
         if task is None:
+            self._abandon(loads, evicts)
             self.native.complete_failure(ready.token, f"unknown task {ready.task!r}", "")
             self._settled()
             return
         if not task.implemented:  # declared elsewhere; running the stub would record a bogus success
+            self._abandon(loads, evicts)
             self.native.complete_failure(
                 ready.token, f"task {ready.task!r} is declared but not implemented in this worker", "")
             self._settled()
@@ -573,21 +800,27 @@ class WorkerRunner:
         if span is not None:
             with self._spans_lock:
                 self._spans[ready.token] = span
+        planned = bool(loads or evicts)  # true until something carries the plan out
         try:
             serializer = for_content_type(ready.content_type, allow_pickle=self.app.allow_pickle)
             args, kwargs, *extra = serializer.loads(ready.payload)
             links = extra[0].get("links", ()) if extra else ()
             if task.is_async:
+                if planned:  # an async task uses no pool, but it may have to make room
+                    planned = False
+                    self._checkout(ready.token, task, loads, evicts)
                 self._submit_async(ready.token, task, serializer, args, kwargs, links)
                 return
         except BaseException as e:
+            if planned:
+                self._abandon(loads, evicts)
             self._report_error(ready.token, task, e)
             return
         if not task.threadsafe:
             self._ensure_serial()
-            self._serial_q.put((ready.token, task, serializer, args, kwargs, links))
+            self._serial_q.put((ready.token, task, serializer, args, kwargs, links, loads, evicts))
             return
-        self._run_sync(ready.token, task, serializer, args, kwargs, slot, links)
+        self._run_sync(ready.token, task, serializer, args, kwargs, slot, links, loads, evicts)
 
     def _span(self, token):
         with self._spans_lock:
@@ -598,7 +831,7 @@ class WorkerRunner:
             span = self._spans.pop(token, None)
         otel.end(span, error)
 
-    def _run_sync(self, token, task, serializer, args, kwargs, slot: _Slot, links=()) -> None:
+    def _run_sync(self, token, task, serializer, args, kwargs, slot: _Slot, links=(), loads=(), evicts=()) -> None:
         """Exactly one outcome per task, and a soft-limit exception never leaves this method.
 
         The soft-limit exception can land on any bytecode of this thread from the moment the run is
@@ -608,9 +841,10 @@ class WorkerRunner:
         """
         run = outcome = owned = held = None
         armed = settled = False
-        if task.pools:  # before the limits are armed: waiting for or building an instance is not the task's time
+        # before the limits are armed: waiting for or building an instance is not the task's time
+        if task.pools or evicts:  # in lazy mode a task without pools can still evict one to make room
             try:
-                held = self._checkout(token, task)
+                held = self._checkout(token, task, loads, evicts)
             except Exception as e:
                 self._report_error(token, task, e)
                 return

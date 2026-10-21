@@ -1,8 +1,10 @@
 //! Orders claimed tasks for the worker threads: queue priority first, then per-task rate limits.
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::envelope::now_ms;
 use crate::error::{Error, Result};
 use crate::runtime::ReadyTask;
 
@@ -14,10 +16,33 @@ pub const HOLD_HORIZON: Duration = Duration::from_secs(1);
 /// only if they request none of the resources the head requests.
 pub const RESERVE_AFTER: Duration = Duration::from_secs(5);
 
+/// How much earlier than it arrived a resident task counts under `Schedule::Throughput`: it may run ahead of
+/// non-resident work that arrived up to this long before it, which bounds how long that work can wait.
+pub const THROUGHPUT_BONUS: Duration = Duration::from_secs(60);
+
+/// How much earlier than its workflow started a resident task counts under `Schedule::Oldest`, about one
+/// model load.
+pub const OLDEST_BONUS: Duration = Duration::from_secs(10);
+
+/// A workflow is never counted as older than this, so a bogus id cannot rank a task ahead of everything.
+const MAX_ORIGIN_AGE: Duration = Duration::from_secs(24 * 3600);
+
 /// Ledger units per whole unit: amounts are integer milli-units so repeated acquire/release never drifts.
 const MILLI: f64 = 1000.0;
 /// Larger amounts could overflow the ledger sums; far beyond any real resource.
 const MAX_MILLI: f64 = 1e15;
+
+/// How a worker with lazy pools orders the tasks it could start. Strict queue priority always comes first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Schedule {
+    /// Arrival order. The only choice without lazy pools.
+    #[default]
+    Fifo,
+    /// Tasks whose model is loaded jump ahead of work that arrived up to `THROUGHPUT_BONUS` before them.
+    Throughput,
+    /// Oldest workflow first (other tasks by arrival); a loaded model is worth `OLDEST_BONUS`.
+    Oldest,
+}
 
 /// What a worker has and what its tasks use, in the units the user picked (GPUs, GB, cores).
 #[derive(Debug, Clone, Default)]
@@ -26,6 +51,18 @@ pub struct Resources {
     pub capacity: HashMap<String, f64>,
     /// Task name -> resource -> amount one running instance uses.
     pub requests: HashMap<String, HashMap<String, f64>>,
+    /// Pool name -> lazily loaded model pool. Empty unless the worker runs pools in lazy mode.
+    pub lazy: HashMap<String, LazyPool>,
+}
+
+/// A model pool whose instances are loaded when a task needs one and evicted when the room is needed.
+/// Needs a `pool:<name>` resource (the most instances at once) and holds `claim` per loaded instance.
+#[derive(Debug, Clone, Default)]
+pub struct LazyPool {
+    /// Resource -> amount one loaded instance holds, idle or not.
+    pub claim: HashMap<String, f64>,
+    /// Instances already loaded when the dispatcher starts (preloaded).
+    pub loaded: u32,
 }
 
 fn milli(amount: f64) -> Option<u64> {
@@ -49,14 +86,176 @@ pub enum Admit {
     /// Held here until it is due.
     Held,
     /// Too far out: the caller must return it to the broker to run after `delay`.
-    Defer { task: ReadyTask, delay: Duration },
+    Defer { task: Box<ReadyTask>, delay: Duration },
+}
+
+/// One lazy pool's residency, as far as the ledger knows.
+struct LazyState {
+    name: String,
+    /// Ledger index of `pool:<name>`; its `in_use` is the number of busy instances.
+    res: usize,
+    /// What one loaded instance holds in the ledger.
+    claim: Claim,
+    /// Instances loaded or being loaded (idle or busy).
+    loaded: u32,
+    /// Unloads begun and not done: the memory is still in `in_use`.
+    unloading: u32,
+    /// When a task for this pool was last popped; None until then.
+    last_used: Option<Instant>,
+}
+
+/// The lazy pools, sorted by name. Empty for eager and non-pool workers, which never look at it.
+#[derive(Default)]
+struct Lazy {
+    pools: Vec<LazyState>,
+    /// Ledger resource index -> the lazy pool whose `pool:<name>` it is.
+    of_res: Vec<Option<usize>>,
+}
+
+/// What popping a task changes in a lazy worker: pools (indexes into `Lazy::pools`), one entry per instance.
+#[derive(Default)]
+struct Plan {
+    loads: Vec<usize>,
+    evicts: Vec<usize>,
+}
+
+impl Lazy {
+    fn idle(&self, p: usize, in_use: &[u64]) -> u32 {
+        let busy = (in_use[self.pools[p].res] / MILLI as u64) as u32;
+        self.pools[p].loaded.saturating_sub(busy)
+    }
+
+    /// How many instances `m` milli-units of `pool:<name>` asks for.
+    fn instances(m: u64) -> u32 {
+        (m / MILLI as u64).max(1) as u32
+    }
+
+    /// Pools to load for `claim`: one entry per instance the task needs beyond the idle ones. A pool already
+    /// at its instance limit gets no load: the task waits for `pool:<name>`, not for room to build one.
+    fn loads_for(&self, claim: &Claim, in_use: &[u64], capacity: &[u64]) -> Vec<usize> {
+        let mut loads = Vec::new();
+        for &(r, m) in claim {
+            let Some(p) = self.of_res[r] else { continue };
+            let room = ((capacity[r] / MILLI as u64) as u32).saturating_sub(self.pools[p].loaded);
+            let missing = Self::instances(m).saturating_sub(self.idle(p, in_use));
+            loads.extend(std::iter::repeat_n(p, missing.min(room) as usize));
+        }
+        loads
+    }
+
+    /// Whether `claim` can start now, loading what is missing and evicting idle instances (least recently
+    /// used pool first) for the room; the plan says how. None if it cannot, even with every idle instance gone.
+    fn plan(&self, claim: &Claim, in_use: &[u64], capacity: &[u64]) -> Option<Plan> {
+        let loads = self.loads_for(claim, in_use, capacity);
+        if loads.is_empty() && claim.iter().all(|&(r, m)| in_use[r] + m <= capacity[r]) {
+            return Some(Plan::default());
+        }
+        let mut add = vec![0u64; capacity.len()];
+        for &(r, m) in claim {
+            add[r] += m;
+        }
+        for &p in &loads {
+            for &(r, m) in &self.pools[p].claim {
+                add[r] += m;
+            }
+        }
+        // Only what this task touches counts: a resource over capacity after a shrink must not block it.
+        let mut short: Vec<u64> = (0..capacity.len())
+            .map(|r| if add[r] > 0 { (in_use[r] + add[r]).saturating_sub(capacity[r]) } else { 0 })
+            .collect();
+        // The instances this task takes are not victims.
+        let mut avail: Vec<u32> = (0..self.pools.len()).map(|p| self.idle(p, in_use)).collect();
+        for &(r, m) in claim {
+            if let Some(p) = self.of_res[r] {
+                avail[p] = avail[p].saturating_sub(Self::instances(m));
+            }
+        }
+        let mut order: Vec<usize> = (0..self.pools.len()).filter(|&p| avail[p] > 0).collect();
+        order.sort_by_key(|&p| (self.pools[p].last_used, p));
+        let mut evicts = Vec::new();
+        while short.iter().any(|&s| s > 0) {
+            // A pool that holds none of what is short would be closed for nothing.
+            let p = order.iter().copied()
+                .find(|&p| avail[p] > 0 && self.pools[p].claim.iter().any(|&(r, _)| short[r] > 0))?;
+            avail[p] -= 1;
+            evicts.push(p);
+            for &(r, m) in &self.pools[p].claim {
+                short[r] = short[r].saturating_sub(m);
+            }
+        }
+        Some(Plan { loads, evicts })
+    }
+
+    /// Resources a waiting head claim wants beyond its own: those of its loads, and `pool:<name>` of every
+    /// pool holding any of what it needs, so tasks that would keep such a pool busy stop backfilling.
+    fn wanted_beyond(&self, claim: &Claim, in_use: &[u64], capacity: &[u64]) -> Vec<usize> {
+        let mut wanted: Vec<usize> = self.loads_for(claim, in_use, capacity).into_iter()
+            .flat_map(|p| self.pools[p].claim.iter().map(|&(r, _)| r))
+            .collect();
+        let needs = |r: usize| wanted.contains(&r) || claim.iter().any(|&(c, _)| c == r);
+        let holders: Vec<usize> = self.pools.iter()
+            .filter(|p| p.claim.iter().any(|&(r, _)| needs(r)))
+            .map(|p| p.res)
+            .collect();
+        wanted.extend(holders);
+        wanted
+    }
+
+    /// Applies `plan` for the task being popped; `claim` is already in `in_use`.
+    fn commit(&mut self, claim: &Claim, plan: Plan, in_use: &mut [u64], task: &mut ReadyTask, now: Instant) {
+        // The victims' room goes straight to the loads: the task closes them before it builds.
+        for p in plan.evicts {
+            let pool = &mut self.pools[p];
+            pool.loaded -= 1;
+            for &(r, m) in &pool.claim {
+                in_use[r] = in_use[r].saturating_sub(m);
+            }
+            task.evicts.push(pool.name.clone());
+        }
+        for p in plan.loads {
+            let pool = &mut self.pools[p];
+            pool.loaded += 1;
+            for &(r, m) in &pool.claim {
+                in_use[r] += m;
+            }
+            task.loads.push(pool.name.clone());
+        }
+        for &(r, _) in claim {
+            if let Some(p) = self.of_res[r] {
+                self.pools[p].last_used = Some(now);
+            }
+        }
+    }
+
+    fn pool_mut(&mut self, name: &str) -> Result<&mut LazyState> {
+        self.pools.iter_mut().find(|p| p.name == name)
+            .ok_or_else(|| Error::Config(format!("pool {name:?} is not a lazy pool of this worker")))
+    }
 }
 
 struct Held {
     level: u32,
     seq: u64,
     at: Instant,
+    /// When the task's workflow started (`at` for other tasks, and unless the schedule is `Oldest`).
+    origin: Instant,
     task: ReadyTask,
+}
+
+/// A due task with its rank (level, age with bonus - older first -, arrival), claim and plan, when scoring.
+struct Ranked<'a> {
+    key: (u32, Reverse<Duration>, u64),
+    i: usize,
+    claim: Option<&'a Claim>,
+    plan: Option<Plan>,
+}
+
+/// The instant a workflow that started at wall-clock `started_ms` corresponds to, for a task held at `at`.
+/// A start in the future (clock skew) or one before `at` can be represented only roughly: both clamp.
+fn origin_of(at: Instant, started_ms: u64, wall_ms: u64) -> Instant {
+    let age = Duration::from_millis(wall_ms.saturating_sub(started_ms)).min(MAX_ORIGIN_AGE);
+    // An Instant close to the clock's epoch (just after boot) cannot go back that far.
+    at.checked_sub(age).unwrap_or(at)
 }
 
 pub struct Dispatcher {
@@ -73,17 +272,31 @@ pub struct Dispatcher {
     requests: HashMap<String, Claim>,
     /// Token -> what that running task holds, until `release`.
     held_by: HashMap<u64, Claim>,
+    lazy: Lazy,
+    /// `Fifo` exactly when `lazy` has no pools.
+    schedule: Schedule,
 }
 
 impl Dispatcher {
     /// With `strict`, earlier `queues` run first; otherwise every queue ranks equally (FIFO).
-    /// `rate_limits` maps task name to starts per second, for this worker.
+    /// `rate_limits` maps task name to starts per second, for this worker. `schedule` orders the tasks of
+    /// a worker with lazy pools within a priority; it is `Fifo` exactly when there are none.
     pub fn new(
         queues: &[String],
         strict: bool,
         rate_limits: &HashMap<String, f64>,
         resources: &Resources,
+        schedule: Schedule,
     ) -> Result<Self> {
+        match (resources.lazy.is_empty(), schedule) {
+            (false, Schedule::Fifo) => {
+                return Err(Error::Config("lazy pools need a schedule, 'throughput' or 'oldest'".into()));
+            }
+            (true, Schedule::Throughput | Schedule::Oldest) => {
+                return Err(Error::Config("a schedule other than fifo needs lazy pools".into()));
+            }
+            _ => {}
+        }
         let levels = if strict {
             queues.iter().enumerate().map(|(i, q)| (q.clone(), i as u32)).collect()
         } else {
@@ -129,10 +342,48 @@ impl Dispatcher {
                 requests.insert(task.clone(), claim);
             }
         }
-        let in_use = vec![0; capacity.len()];
+        let mut in_use = vec![0u64; capacity.len()];
+        let mut lazy = Lazy { pools: Vec::new(), of_res: vec![None; capacity.len()] };
+        let mut lazy_names: Vec<&String> = resources.lazy.keys().collect();
+        lazy_names.sort();
+        for name in lazy_names {
+            let pool = &resources.lazy[name];
+            let key = format!("pool:{name}");
+            let res = resource_names.binary_search(&key).map_err(|_| {
+                Error::Config(format!("lazy pool {name:?} needs the resource {key:?}, which this worker does not declare"))
+            })?;
+            if u64::from(pool.loaded) * MILLI as u64 > capacity[res] {
+                return Err(Error::Config(format!(
+                    "lazy pool {name:?} starts with {} loaded but allows only {}",
+                    pool.loaded, capacity[res] as f64 / MILLI
+                )));
+            }
+            let mut claim: Claim = Vec::with_capacity(pool.claim.len());
+            for (rname, &amount) in &pool.claim {
+                let i = resource_names.binary_search(rname).map_err(|_| {
+                    Error::Config(format!("lazy pool {name:?} uses resource {rname:?}, which this worker does not declare"))
+                })?;
+                let m = milli(amount).filter(|&m| m > 0).ok_or_else(|| {
+                    Error::Config(format!("lazy pool {name:?} uses {amount} of {rname:?}; it must be a finite amount of at least 0.001"))
+                })?;
+                let total = u64::from(pool.loaded).checked_mul(m).and_then(|t| t.checked_add(in_use[i]))
+                    .filter(|&t| t <= capacity[i])
+                    .ok_or_else(|| Error::Config(format!(
+                        "lazy pool {name:?} with {} loaded needs more {rname:?} than this worker has ({})",
+                        pool.loaded, capacity[i] as f64 / MILLI
+                    )))?;
+                in_use[i] = total;
+                claim.push((i, m));
+            }
+            claim.sort_unstable();
+            lazy.of_res[res] = Some(lazy.pools.len());
+            lazy.pools.push(LazyState {
+                name: name.clone(), res, claim, loaded: pool.loaded, unloading: 0, last_used: None,
+            });
+        }
         Ok(Dispatcher {
             levels, throttles, held: Vec::new(), seq: 0,
-            resource_names, capacity, in_use, requests, held_by: HashMap::new(),
+            resource_names, capacity, in_use, requests, held_by: HashMap::new(), lazy, schedule,
         })
     }
 
@@ -144,7 +395,7 @@ impl Dispatcher {
                 if slot - now > HOLD_HORIZON {
                     let eta = t.next_deferred.map_or(slot, |d| d.max(slot));
                     t.next_deferred = Some(eta + t.interval);
-                    return Admit::Defer { task, delay: eta - now };
+                    return Admit::Defer { task: Box::new(task), delay: eta - now };
                 }
                 t.next = Some(slot + t.interval);
                 slot
@@ -158,54 +409,112 @@ impl Dispatcher {
     pub fn hold(&mut self, task: ReadyTask, at: Instant) {
         let level = self.levels.get(&task.queue).copied().unwrap_or(0);
         self.seq += 1;
-        self.held.push(Held { level, seq: self.seq, at, task });
+        let origin = match task.workflow_started_ms {
+            Some(started) if self.schedule == Schedule::Oldest => origin_of(at, started, now_ms()),
+            _ => at,
+        };
+        self.held.push(Held { level, seq: self.seq, at, origin, task });
     }
 
     /// The highest-priority task that is due and fits the free resources, oldest first within a priority.
     pub fn pop(&mut self, now: Instant) -> Option<ReadyTask> {
-        if self.requests.is_empty() {
+        if self.requests.is_empty() && self.schedule == Schedule::Fifo {
             let i = self.held.iter().enumerate()
                 .filter(|(_, h)| h.at <= now)
                 .min_by_key(|(_, h)| (h.level, h.seq))
                 .map(|(i, _)| i)?;
             return Some(self.held.swap_remove(i).task);
         }
-        let i = self.pop_fitting(now)?;
-        let h = self.held.swap_remove(i);
-        if let Some(claim) = self.requests.get(&h.task.task) {
+        let (i, plan) = self.pop_fitting(now)?;
+        let mut task = self.held.swap_remove(i).task;
+        if let Some(claim) = self.requests.get(&task.task) {
             for &(r, m) in claim {
                 self.in_use[r] += m;
             }
-            self.held_by.insert(h.task.token, claim.clone());
+            self.held_by.insert(task.token, claim.clone());
+            if !self.lazy.pools.is_empty() {
+                self.lazy.commit(claim, plan, &mut self.in_use, &mut task, now);
+            }
         }
-        Some(h.task)
+        Some(task)
     }
 
     fn fits(&self, claim: &Claim) -> bool {
         claim.iter().all(|&(r, m)| self.in_use[r] + m <= self.capacity[r])
     }
 
-    /// Index of the task to start: walks due tasks in priority order. The first one that doesn't fit is
-    /// the head; later ones may backfill while the head is young, and afterwards only if they request
+    /// Index of the task to start (and its loads and evictions, empty unless the worker has lazy pools):
+    /// walks due tasks in priority order, and within a priority by the schedule. The first one that doesn't
+    /// fit is the head; later ones may backfill while the head is young, and afterwards only if they request
     /// nothing the head requests, so a big request cannot be starved by a stream of small ones.
-    fn pop_fitting(&self, now: Instant) -> Option<usize> {
+    fn pop_fitting(&self, now: Instant) -> Option<(usize, Plan)> {
         let mut due: Vec<usize> = (0..self.held.len()).filter(|&i| self.held[i].at <= now).collect();
-        due.sort_unstable_by_key(|&i| (self.held[i].level, self.held[i].seq));
+        if self.schedule == Schedule::Fifo {
+            due.sort_unstable_by_key(|&i| (self.held[i].level, self.held[i].seq));
+            // Plans are made as the walk reaches each task, so it stops at the first that can start.
+            return self.walk(now, due.into_iter().map(|i| {
+                let claim = self.requests.get(&self.held[i].task.task);
+                let plan = match claim {
+                    None => Some(Plan::default()),
+                    Some(c) => self.fits(c).then(Plan::default),
+                };
+                (i, claim, plan)
+            }));
+        }
+        // Scoring: whether a task is resident (its plan is empty) is part of its rank, so every due task is
+        // planned up front. Age counts back from `now`, which cannot underflow an `Instant` the way
+        // subtracting the bonus from a task's instant could.
+        let (basis, bonus): (fn(&Held) -> Instant, Duration) = match self.schedule {
+            Schedule::Oldest => (|h| h.origin, OLDEST_BONUS),
+            _ => (|h| h.at, THROUGHPUT_BONUS),
+        };
+        let mut ranked: Vec<Ranked> = due.into_iter()
+            .map(|i| {
+                let h = &self.held[i];
+                let claim = self.requests.get(&h.task.task);
+                let plan = match claim {
+                    None => Some(Plan::default()),
+                    Some(c) => self.lazy.plan(c, &self.in_use, &self.capacity),
+                };
+                let resident = plan.as_ref().is_some_and(|p| p.loads.is_empty() && p.evicts.is_empty());
+                let mut age = now.saturating_duration_since(basis(h));
+                if resident {
+                    age = age.saturating_add(bonus);
+                }
+                Ranked { key: (h.level, Reverse(age), h.seq), i, claim, plan }
+            })
+            .collect();
+        ranked.sort_unstable_by_key(|r| r.key);
+        self.walk(now, ranked.into_iter().map(|r| (r.i, r.claim, r.plan)))
+    }
+
+    /// The first of `candidates` (task index, its claim, its plan if it can start) that may start now.
+    fn walk<'a>(
+        &'a self,
+        now: Instant,
+        candidates: impl Iterator<Item = (usize, Option<&'a Claim>, Option<Plan>)>,
+    ) -> Option<(usize, Plan)> {
         let mut head: Option<(&Claim, Instant)> = None;
-        for i in due {
+        // Lazy workers: what else the head wants (see `Lazy::wanted_beyond`).
+        let mut head_beyond: Vec<usize> = Vec::new();
+        for (i, claim, plan) in candidates {
             let h = &self.held[i];
-            let claim = self.requests.get(&h.task.task);
-            if claim.is_none_or(|c| self.fits(c)) {
+            if let Some(plan) = plan {
                 let backfill = match head {
                     None => true,
                     Some((_, since)) if now.saturating_duration_since(since) < RESERVE_AFTER => true,
-                    Some((wanted, _)) => claim.is_none_or(|c| c.iter().all(|(r, _)| wanted.iter().all(|(w, _)| w != r))),
+                    Some((wanted, _)) => claim.is_none_or(|c| {
+                        c.iter().all(|(r, _)| wanted.iter().all(|(w, _)| w != r) && !head_beyond.contains(r))
+                    }),
                 };
                 if backfill {
-                    return Some(i);
+                    return Some((i, plan));
                 }
             } else if head.is_none() {
                 head = claim.map(|c| (c, h.at));
+                if let Some(c) = claim.filter(|_| !self.lazy.pools.is_empty()) {
+                    head_beyond = self.lazy.wanted_beyond(c, &self.in_use, &self.capacity);
+                }
             }
         }
         None
@@ -248,6 +557,36 @@ impl Dispatcher {
         Ok(d > 0)
     }
 
+    /// A loaded instance of lazy pool `pool` is going away (its memory is still held until `unload_done`):
+    /// it no longer counts as loaded, so releasing its `pool:<name>` does not make it look idle.
+    pub fn unload_begin(&mut self, pool: &str) -> Result<()> {
+        let p = self.lazy.pool_mut(pool)?;
+        if p.loaded == 0 {
+            return Err(Error::Config(format!("pool {pool:?} has no loaded instance to unload")));
+        }
+        p.loaded -= 1;
+        p.unloading += 1;
+        Ok(())
+    }
+
+    /// The instance from `unload_begin` is closed: gives its memory back.
+    pub fn unload_done(&mut self, pool: &str) -> Result<()> {
+        let p = self.lazy.pool_mut(pool)?;
+        if p.unloading == 0 {
+            return Err(Error::Config(format!("pool {pool:?} has no unload in progress")));
+        }
+        p.unloading -= 1;
+        for &(r, m) in &p.claim {
+            self.in_use[r] = self.in_use[r].saturating_sub(m);
+        }
+        Ok(())
+    }
+
+    /// (pool, instances loaded or being loaded) for each lazy pool, for metrics.
+    pub fn lazy_usage(&self) -> Vec<(String, u32)> {
+        self.lazy.pools.iter().map(|p| (p.name.clone(), p.loaded)).collect()
+    }
+
     /// (resource, capacity, in use), for metrics.
     pub fn usage(&self) -> Vec<(String, f64, f64)> {
         self.resource_names.iter().enumerate()
@@ -284,7 +623,7 @@ pub(crate) struct ReadyQueue {
 
 impl ReadyQueue {
     pub(crate) fn new(d: Dispatcher) -> Self {
-        let gated = !d.requests.is_empty();
+        let gated = !d.requests.is_empty() || !d.lazy.pools.is_empty();
         ReadyQueue { inner: Mutex::new(d), cv: Condvar::new(), gated }
     }
 
@@ -308,6 +647,24 @@ impl ReadyQueue {
             self.cv.notify_all();
         }
         Ok(())
+    }
+
+    /// See `Dispatcher::unload_begin`. Fewer loaded instances can change what a waiter may evict.
+    pub(crate) fn unload_begin(&self, pool: &str) -> Result<()> {
+        self.inner.lock().unwrap().unload_begin(pool)?;
+        self.cv.notify_all();
+        Ok(())
+    }
+
+    /// See `Dispatcher::unload_done`. The freed memory may let several waiters fit.
+    pub(crate) fn unload_done(&self, pool: &str) -> Result<()> {
+        self.inner.lock().unwrap().unload_done(pool)?;
+        self.cv.notify_all();
+        Ok(())
+    }
+
+    pub(crate) fn lazy_usage(&self) -> Vec<(String, u32)> {
+        self.inner.lock().unwrap().lazy_usage()
     }
 
     /// (resource, capacity, in use), for metrics.
@@ -367,6 +724,9 @@ mod tests {
             content_type: "ct".into(),
             payload: vec![],
             trace_ctx: None,
+            loads: vec![],
+            evicts: vec![],
+            workflow_started_ms: None,
         }
     }
 
@@ -386,7 +746,7 @@ mod tests {
 
     #[test]
     fn strict_priority_pops_earlier_queues_first_fifo_within() {
-        let mut d = Dispatcher::new(&qs(&["hi", "lo"]), true, &HashMap::new(), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["hi", "lo"]), true, &HashMap::new(), &Resources::default(), Schedule::Fifo).unwrap();
         let now = Instant::now();
         for (tok, q) in [(1, "lo"), (2, "hi"), (3, "lo"), (4, "hi")] {
             assert!(matches!(d.push(task(tok, "t", q), now), Admit::Held));
@@ -396,7 +756,7 @@ mod tests {
 
     #[test]
     fn equal_priority_is_fifo_across_queues() {
-        let mut d = Dispatcher::new(&qs(&["hi", "lo"]), false, &HashMap::new(), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["hi", "lo"]), false, &HashMap::new(), &Resources::default(), Schedule::Fifo).unwrap();
         let now = Instant::now();
         for (tok, q) in [(1, "lo"), (2, "hi"), (3, "lo")] {
             d.push(task(tok, "t", q), now);
@@ -406,7 +766,7 @@ mod tests {
 
     #[test]
     fn rate_limit_spaces_tasks_one_interval_apart() {
-        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 10.0)]), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 10.0)]), &Resources::default(), Schedule::Fifo).unwrap();
         let t0 = Instant::now();
         for tok in 1..=3 {
             assert!(matches!(d.push(task(tok, "slow", "q"), t0), Admit::Held));
@@ -421,7 +781,7 @@ mod tests {
 
     #[test]
     fn throttled_task_does_not_block_others() {
-        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 10.0)]), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 10.0)]), &Resources::default(), Schedule::Fifo).unwrap();
         let t0 = Instant::now();
         d.push(task(1, "slow", "q"), t0);
         d.push(task(2, "slow", "q"), t0);
@@ -431,7 +791,7 @@ mod tests {
 
     #[test]
     fn throttled_higher_priority_task_lets_lower_priority_run() {
-        let mut d = Dispatcher::new(&qs(&["hi", "lo"]), true, &limits(&[("slow", 10.0)]), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["hi", "lo"]), true, &limits(&[("slow", 10.0)]), &Resources::default(), Schedule::Fifo).unwrap();
         let t0 = Instant::now();
         d.push(task(1, "slow", "hi"), t0);
         d.push(task(2, "slow", "hi"), t0);
@@ -442,7 +802,7 @@ mod tests {
 
     #[test]
     fn idle_bucket_refills() {
-        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 10.0)]), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 10.0)]), &Resources::default(), Schedule::Fifo).unwrap();
         let t0 = Instant::now();
         d.push(task(1, "slow", "q"), t0);
         let later = t0 + Duration::from_secs(5);
@@ -453,7 +813,7 @@ mod tests {
     #[test]
     fn beyond_horizon_defers_spread_one_interval_apart() {
         // 0.5/s = one start every 2 s, past the 1 s horizon
-        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 0.5)]), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 0.5)]), &Resources::default(), Schedule::Fifo).unwrap();
         let t0 = Instant::now();
         assert!(matches!(d.push(task(1, "slow", "q"), t0), Admit::Held));
         let delays: Vec<Duration> = (2..=4)
@@ -472,7 +832,7 @@ mod tests {
 
     #[test]
     fn deferred_task_returning_on_time_is_admitted() {
-        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 0.5)]), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 0.5)]), &Resources::default(), Schedule::Fifo).unwrap();
         let t0 = Instant::now();
         d.push(task(1, "slow", "q"), t0);
         assert!(matches!(d.push(task(2, "slow", "q"), t0), Admit::Defer { .. }));
@@ -483,7 +843,7 @@ mod tests {
 
     #[test]
     fn slot_exactly_at_the_horizon_is_held() {
-        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 1.0)]), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 1.0)]), &Resources::default(), Schedule::Fifo).unwrap();
         let t0 = Instant::now();
         d.push(task(1, "slow", "q"), t0);
         assert!(matches!(d.push(task(2, "slow", "q"), t0), Admit::Held));
@@ -491,7 +851,7 @@ mod tests {
 
     #[test]
     fn hold_ignores_the_rate_limit_and_waits_until_at() {
-        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 0.5)]), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 0.5)]), &Resources::default(), Schedule::Fifo).unwrap();
         let t0 = Instant::now();
         let at = t0 + Duration::from_secs(3);
         d.hold(task(1, "slow", "q"), at);
@@ -502,7 +862,7 @@ mod tests {
 
     #[test]
     fn drain_returns_everything_held() {
-        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 10.0)]), &Resources::default()).unwrap();
+        let mut d = Dispatcher::new(&qs(&["q"]), false, &limits(&[("slow", 10.0)]), &Resources::default(), Schedule::Fifo).unwrap();
         let t0 = Instant::now();
         d.push(task(1, "slow", "q"), t0);
         d.push(task(2, "slow", "q"), t0); // not due yet
@@ -516,14 +876,14 @@ mod tests {
     fn rejects_unusable_rate_limits() {
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e-300] {
             assert!(
-                matches!(Dispatcher::new(&qs(&["q"]), false, &limits(&[("t", bad)]), &Resources::default()), Err(Error::Config(_))),
+                matches!(Dispatcher::new(&qs(&["q"]), false, &limits(&[("t", bad)]), &Resources::default(), Schedule::Fifo), Err(Error::Config(_))),
                 "rate {bad} must be rejected"
             );
         }
     }
 
     fn empty_queue() -> ReadyQueue {
-        ReadyQueue::new(Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &Resources::default()).unwrap())
+        ReadyQueue::new(Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &Resources::default(), Schedule::Fifo).unwrap())
     }
 
     #[test]
@@ -560,11 +920,12 @@ mod tests {
         Resources {
             capacity: caps.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
             requests: reqs.iter().map(|(t, r)| (t.to_string(), limits(r))).collect(),
+            ..Default::default()
         }
     }
 
     fn with_res(r: &Resources) -> Dispatcher {
-        Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), r).unwrap()
+        Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), r, Schedule::Fifo).unwrap()
     }
 
     fn in_use(d: &Dispatcher, name: &str) -> f64 {
@@ -588,7 +949,7 @@ mod tests {
     fn rejects_unusable_resources() {
         let bad = |caps: &[(&str, f64)], reqs: &[(&str, &[(&str, f64)])]| {
             let r = res(caps, reqs);
-            matches!(Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r), Err(Error::Config(_)))
+            matches!(Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r, Schedule::Fifo), Err(Error::Config(_)))
         };
         assert!(bad(&[("gpu", 1.0)], &[("g", &[("vram", 1.0)])]), "undeclared resource");
         assert!(bad(&[], &[("g", &[("gpu", 1.0)])]), "no resources at all");
@@ -607,7 +968,7 @@ mod tests {
     #[test]
     fn config_error_names_the_task_and_resource() {
         let r = res(&[("gpu", 1.0)], &[("train", &[("vram", 1.0)])]);
-        let Err(Error::Config(m)) = Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r) else { panic!() };
+        let Err(Error::Config(m)) = Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r, Schedule::Fifo) else { panic!() };
         assert!(m.contains("train") && m.contains("vram"), "{m}");
     }
 
@@ -651,7 +1012,7 @@ mod tests {
     fn priority_order_is_kept_among_tasks_that_fit() {
         let mut d = Dispatcher::new(
             &qs(&["hi", "lo"]), true, &HashMap::new(),
-            &res(&[("gpu", 1.0)], &[("g", &[("gpu", 0.25)])]),
+            &res(&[("gpu", 1.0)], &[("g", &[("gpu", 0.25)])]), Schedule::Fifo,
         ).unwrap();
         let t0 = Instant::now();
         for (tok, q) in [(1, "lo"), (2, "hi"), (3, "lo"), (4, "hi")] {
@@ -664,7 +1025,7 @@ mod tests {
     fn a_blocked_high_priority_task_lets_a_lower_one_that_fits_start() {
         let mut d = Dispatcher::new(
             &qs(&["hi", "lo"]), true, &HashMap::new(),
-            &res(&[("gpu", 1.0)], &[("g", &[("gpu", 0.75)]), ("h", &[("gpu", 0.25)])]),
+            &res(&[("gpu", 1.0)], &[("g", &[("gpu", 0.75)]), ("h", &[("gpu", 0.25)])]), Schedule::Fifo,
         ).unwrap();
         let t0 = Instant::now();
         d.push(task(1, "g", "lo"), t0);
@@ -867,5 +1228,507 @@ mod tests {
         let q = gpu_queue();
         assert!(matches!(q.adjust_capacity("gpu", -2.0), Err(Error::Config(_))));
         assert_eq!(q.usage(), vec![("gpu".to_string(), 1.0, 0.0)]);
+    }
+    // ---- lazy pools ----
+
+    /// (name, what one instance claims, instances loaded at start)
+    type PoolSpec<'a> = (&'a str, &'a [(&'a str, f64)], u32);
+
+    fn lazy_res(caps: &[(&str, f64)], reqs: &[(&str, &[(&str, f64)])], pools: &[PoolSpec]) -> Resources {
+        Resources {
+            lazy: pools.iter()
+                .map(|(n, c, loaded)| (n.to_string(), LazyPool { claim: limits(c), loaded: *loaded }))
+                .collect(),
+            ..res(caps, reqs)
+        }
+    }
+
+    fn lazy(caps: &[(&str, f64)], reqs: &[(&str, &[(&str, f64)])], pools: &[PoolSpec]) -> Dispatcher {
+        Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &lazy_res(caps, reqs, pools), Schedule::Oldest).unwrap()
+    }
+
+    fn loaded(d: &Dispatcher) -> Vec<(String, u32)> {
+        d.lazy_usage()
+    }
+
+    /// vram 7.5 (one model at a time), gemma 7.4 and tts 7.2, one instance each at most.
+    fn two_models(gemma_loaded: u32, tts_loaded: u32) -> Dispatcher {
+        lazy(
+            &[("vram_gb", 7.5), ("pool:gemma", 1.0), ("pool:tts", 1.0)],
+            &[("g", &[("pool:gemma", 1.0)]), ("t", &[("pool:tts", 1.0)])],
+            &[("gemma", &[("vram_gb", 7.4)], gemma_loaded), ("tts", &[("vram_gb", 7.2)], tts_loaded)],
+        )
+    }
+
+    #[test]
+    fn a_resident_task_loads_and_evicts_nothing() {
+        let mut d = two_models(1, 0);
+        let t0 = Instant::now();
+        d.push(task(1, "g", "q"), t0);
+        let t = d.pop(t0).unwrap();
+        assert!(t.loads.is_empty() && t.evicts.is_empty(), "{:?} {:?}", t.loads, t.evicts);
+        assert_eq!(in_use(&d, "vram_gb"), 7.4, "the preloaded instance is counted once");
+        assert_eq!(in_use(&d, "pool:gemma"), 1.0);
+        assert_eq!(loaded(&d), vec![("gemma".to_string(), 1), ("tts".to_string(), 0)]);
+    }
+
+    #[test]
+    fn a_non_resident_task_loads_its_model() {
+        let mut d = two_models(0, 0);
+        let t0 = Instant::now();
+        d.push(task(1, "g", "q"), t0);
+        let t = d.pop(t0).unwrap();
+        assert_eq!(t.loads, vec!["gemma".to_string()]);
+        assert!(t.evicts.is_empty());
+        assert_eq!(in_use(&d, "vram_gb"), 7.4);
+        assert_eq!(loaded(&d), vec![("gemma".to_string(), 1), ("tts".to_string(), 0)]);
+        d.release(1);
+        assert_eq!(in_use(&d, "vram_gb"), 7.4, "the model stays loaded after its task ends");
+    }
+
+    #[test]
+    fn a_task_that_needs_the_room_evicts_an_idle_model() {
+        let mut d = two_models(1, 0);
+        let t0 = Instant::now();
+        d.push(task(1, "t", "q"), t0);
+        let t = d.pop(t0).unwrap();
+        assert_eq!(t.evicts, vec!["gemma".to_string()]);
+        assert_eq!(t.loads, vec!["tts".to_string()]);
+        assert_eq!(in_use(&d, "vram_gb"), 7.2);
+        assert_eq!(loaded(&d), vec![("gemma".to_string(), 0), ("tts".to_string(), 1)]);
+    }
+
+    #[test]
+    fn a_busy_instance_is_never_a_victim() {
+        let mut d = two_models(1, 0);
+        let t0 = Instant::now();
+        d.push(task(1, "g", "q"), t0);
+        assert!(d.pop(t0).unwrap().evicts.is_empty());
+        d.push(task(2, "t", "q"), t0);
+        assert!(d.pop(t0).is_none(), "gemma is running; tts must wait");
+        assert_eq!(loaded(&d)[0], ("gemma".to_string(), 1));
+        d.release(1);
+        let t = d.pop(t0).unwrap();
+        assert_eq!((t.loads, t.evicts), (vec!["tts".to_string()], vec!["gemma".to_string()]));
+    }
+
+    #[test]
+    fn the_least_recently_popped_idle_model_is_evicted_first() {
+        let mk = |loaded| lazy(
+            &[("vram_gb", 6.0), ("pool:a", 1.0), ("pool:b", 1.0), ("pool:c", 1.0), ("pool:d", 1.0)],
+            &[("ta", &[("pool:a", 1.0)]), ("tb", &[("pool:b", 1.0)]), ("tc", &[("pool:c", 1.0)]),
+              ("td", &[("pool:d", 1.0)])],
+            &[("a", &[("vram_gb", 2.0)], loaded), ("b", &[("vram_gb", 2.0)], loaded),
+              ("c", &[("vram_gb", 2.0)], loaded), ("d", &[("vram_gb", 2.0)], 0)],
+        );
+        let mut d = mk(1);
+        let t0 = Instant::now();
+        // Use b, then a, then c: a is not the oldest by name, b is by use.
+        for (tok, name, at) in [(1, "tb", 0), (2, "ta", 1), (3, "tc", 2)] {
+            d.push(task(tok, name, "q"), t0 + at * MS);
+            assert!(d.pop(t0 + at * MS).is_some());
+            d.release(tok);
+        }
+        d.push(task(4, "td", "q"), t0 + 3 * MS);
+        let t = d.pop(t0 + 3 * MS).unwrap();
+        assert_eq!((t.loads, t.evicts), (vec!["d".to_string()], vec!["b".to_string()]));
+        assert_eq!(loaded(&d), vec![("a".into(), 1), ("b".into(), 0), ("c".into(), 1), ("d".into(), 1)]);
+    }
+
+    #[test]
+    fn a_model_that_frees_nothing_the_task_lacks_is_not_evicted() {
+        // "x" is the oldest idle model but only holds cpu; the shortfall is vram.
+        let mut d = lazy(
+            &[("vram_gb", 4.0), ("cpu", 4.0), ("pool:a", 1.0), ("pool:x", 1.0), ("pool:d", 1.0)],
+            &[("td", &[("pool:d", 1.0)])],
+            &[("a", &[("vram_gb", 2.0)], 1), ("x", &[("cpu", 4.0)], 1), ("d", &[("vram_gb", 3.0)], 0)],
+        );
+        let t0 = Instant::now();
+        d.push(task(1, "td", "q"), t0);
+        let t = d.pop(t0).unwrap();
+        assert_eq!((t.loads, t.evicts), (vec!["d".to_string()], vec!["a".to_string()]));
+        assert_eq!(in_use(&d, "cpu"), 4.0);
+    }
+
+    #[test]
+    fn a_plain_task_evicts_an_idle_model_only_when_it_must() {
+        let reqs: &[(&str, &[(&str, f64)])] = &[("render", &[("vram_gb", 0.6)])];
+        let mut tight = lazy(&[("vram_gb", 7.5), ("pool:gemma", 1.0)], reqs, &[("gemma", &[("vram_gb", 7.4)], 1)]);
+        let t0 = Instant::now();
+        tight.push(task(1, "render", "q"), t0);
+        let t = tight.pop(t0).unwrap();
+        assert_eq!((t.loads, t.evicts), (vec![], vec!["gemma".to_string()]));
+        assert_eq!(in_use(&tight, "vram_gb"), 0.6);
+
+        let mut roomy = lazy(&[("vram_gb", 8.0), ("pool:gemma", 1.0)], reqs, &[("gemma", &[("vram_gb", 7.4)], 1)]);
+        roomy.push(task(1, "render", "q"), t0);
+        let t = roomy.pop(t0).unwrap();
+        assert!(t.loads.is_empty() && t.evicts.is_empty());
+        assert_eq!(loaded(&roomy), vec![("gemma".to_string(), 1)]);
+    }
+
+    #[test]
+    fn a_pool_at_capacity_does_not_load_even_with_room() {
+        let mut d = lazy(
+            &[("vram_gb", 20.0), ("pool:gemma", 1.0)],
+            &[("g", &[("pool:gemma", 1.0)])],
+            &[("gemma", &[("vram_gb", 7.4)], 0)],
+        );
+        let t0 = Instant::now();
+        d.push(task(1, "g", "q"), t0);
+        d.push(task(2, "g", "q"), t0);
+        assert_eq!(d.pop(t0).unwrap().loads, vec!["gemma".to_string()]);
+        assert!(d.pop(t0).is_none());
+        assert_eq!(in_use(&d, "vram_gb"), 7.4);
+    }
+
+    #[test]
+    fn a_pool_of_two_loads_a_second_instance_while_the_first_is_busy() {
+        let mut d = lazy(
+            &[("vram_gb", 20.0), ("pool:gemma", 2.0)],
+            &[("g", &[("pool:gemma", 1.0)])],
+            &[("gemma", &[("vram_gb", 7.4)], 0)],
+        );
+        let t0 = Instant::now();
+        for tok in 1..=3 {
+            d.push(task(tok, "g", "q"), t0);
+        }
+        assert_eq!(d.pop(t0).unwrap().loads, vec!["gemma".to_string()]);
+        assert_eq!(d.pop(t0).unwrap().loads, vec!["gemma".to_string()]);
+        assert!(d.pop(t0).is_none(), "both instances are busy");
+        assert_eq!(in_use(&d, "vram_gb"), 14.8);
+        d.release(1);
+        let t = d.pop(t0).unwrap();
+        assert!(t.loads.is_empty() && t.evicts.is_empty(), "the idle instance is reused");
+        assert_eq!(loaded(&d), vec![("gemma".to_string(), 2)]);
+    }
+
+    #[test]
+    fn unload_begin_keeps_the_memory_used_and_unload_done_frees_it() {
+        let mut d = two_models(1, 0);
+        d.unload_begin("gemma").unwrap();
+        assert_eq!(loaded(&d)[0], ("gemma".to_string(), 0));
+        assert_eq!(in_use(&d, "vram_gb"), 7.4, "the instance is still in memory");
+        let t0 = Instant::now();
+        d.push(task(1, "t", "q"), t0);
+        assert!(d.pop(t0).is_none(), "nothing to evict and the memory is not free yet");
+        d.unload_done("gemma").unwrap();
+        assert_eq!(in_use(&d, "vram_gb"), 0.0);
+        let t = d.pop(t0).unwrap();
+        assert_eq!((t.loads, t.evicts), (vec!["tts".to_string()], vec![]));
+    }
+
+    #[test]
+    fn unload_calls_reject_what_cannot_be_unloaded() {
+        let mut d = two_models(1, 0);
+        let bad = |r: Result<()>| matches!(r, Err(Error::Config(_)));
+        assert!(bad(d.unload_begin("nope")));
+        assert!(bad(d.unload_done("nope")));
+        assert!(bad(d.unload_begin("tts")), "nothing loaded");
+        assert!(bad(d.unload_done("gemma")), "no unload in progress");
+        d.unload_begin("gemma").unwrap();
+        assert!(bad(d.unload_begin("gemma")), "only one instance was loaded");
+        d.unload_done("gemma").unwrap();
+        assert!(bad(d.unload_done("gemma")), "freed once");
+        assert_eq!(in_use(&d, "vram_gb"), 0.0);
+        let mut eager = with_res(&res(&[("gpu", 1.0), ("pool:m", 1.0)], &[]));
+        assert!(bad(eager.unload_begin("m")), "not a lazy pool");
+        assert!(bad(eager.unload_done("m")));
+    }
+
+    #[test]
+    fn ready_queue_unload_done_wakes_a_blocked_receiver() {
+        let q = Arc::new(ReadyQueue::new(two_models(1, 0)));
+        q.push(task(1, "g", "q"), Instant::now());
+        assert_eq!(q.recv_timeout(Duration::from_secs(1)).map(|t| t.token), Some(1));
+        q.unload_begin("gemma").unwrap(); // the task is discarding its instance
+        q.release(1);
+        q.push(task(2, "t", "q"), Instant::now());
+        assert!(q.recv_timeout(100 * MS).is_none(), "the discarded instance still holds the memory");
+
+        let q2 = q.clone();
+        let h = std::thread::spawn(move || q2.recv_timeout(Duration::from_secs(5)).map(|t| t.token));
+        std::thread::sleep(50 * MS);
+        let t = Instant::now();
+        q.unload_done("gemma").unwrap();
+        assert_eq!(h.join().unwrap(), Some(2));
+        assert!(t.elapsed() < Duration::from_secs(1));
+        assert_eq!(q.lazy_usage(), vec![("gemma".to_string(), 0), ("tts".to_string(), 1)]);
+    }
+
+    #[test]
+    fn ready_queue_release_wakes_waiters_in_a_lazy_worker() {
+        // The ready queue of a lazy worker takes the lock on release.
+        let q = Arc::new(ReadyQueue::new(two_models(0, 0)));
+        q.push(task(1, "g", "q"), Instant::now());
+        q.push(task(2, "g", "q"), Instant::now());
+        assert_eq!(q.recv_timeout(Duration::from_secs(1)).map(|t| t.token), Some(1));
+        let q2 = q.clone();
+        let h = std::thread::spawn(move || q2.recv_timeout(Duration::from_secs(5)).map(|t| t.token));
+        std::thread::sleep(50 * MS);
+        q.release(1);
+        assert_eq!(h.join().unwrap(), Some(2));
+    }
+
+    /// vram 16, two gemma instances (14.8) and a tts needing 9.0: tts must evict both. The gemma task 3
+    /// arrives `late` after the others.
+    fn reservation_setup(t0: Instant, late: Duration) -> Dispatcher {
+        let mut d = lazy(
+            &[("vram_gb", 16.0), ("pool:gemma", 2.0), ("pool:tts", 1.0)],
+            &[("g", &[("pool:gemma", 1.0)]), ("t", &[("pool:tts", 1.0)])],
+            &[("gemma", &[("vram_gb", 7.4)], 2), ("tts", &[("vram_gb", 9.0)], 0)],
+        );
+        d.push(task(1, "g", "q"), t0);
+        assert!(d.pop(t0).is_some()); // one gemma instance is running, the other idle
+        d.push(task(2, "t", "q"), t0); // the head: needs both gemma instances gone
+        d.push(task(3, "g", "q"), t0 + late);
+        d
+    }
+
+    #[test]
+    fn before_the_reservation_gemma_tasks_keep_backfilling() {
+        let t0 = Instant::now();
+        let mut d = reservation_setup(t0, Duration::ZERO);
+        assert_eq!(d.pop(t0 + RESERVE_AFTER - MS).map(|t| t.token), Some(3));
+        assert!(d.pop(t0 + RESERVE_AFTER - MS).is_none(), "the head still waits");
+    }
+
+    #[test]
+    fn the_reserved_head_stops_tasks_that_would_keep_a_victim_busy() {
+        let t0 = Instant::now();
+        // A resident task outranks a swap for `OLDEST_BONUS`, so the tts head is the head only once it is older.
+        let late = OLDEST_BONUS + MS;
+        let mut d = reservation_setup(t0, late);
+        let reserved = t0 + late;
+        assert!(d.pop(reserved).is_none(), "gemma task 3 would keep the idle instance busy");
+        d.release(1);
+        let t = d.pop(reserved).unwrap();
+        assert_eq!(t.token, 2);
+        assert_eq!((t.loads, t.evicts), (vec!["tts".to_string()], vec!["gemma".to_string(), "gemma".to_string()]));
+        assert_eq!(in_use(&d, "vram_gb"), 9.0);
+    }
+
+    #[test]
+    fn a_head_waiting_for_its_own_busy_pool_does_not_hold_back_other_models() {
+        // Room for both models: gemma's single instance is busy, so the gemma head waits for pool:gemma only.
+        let mut d = lazy(
+            &[("vram_gb", 16.0), ("pool:gemma", 1.0), ("pool:tts", 1.0)],
+            &[("g", &[("pool:gemma", 1.0)]), ("t", &[("pool:tts", 1.0)])],
+            &[("gemma", &[("vram_gb", 7.4)], 1), ("tts", &[("vram_gb", 7.2)], 1)],
+        );
+        let t0 = Instant::now();
+        d.push(task(1, "g", "q"), t0);
+        assert!(d.pop(t0).is_some());
+        d.push(task(2, "g", "q"), t0);
+        d.push(task(3, "t", "q"), t0);
+        let reserved = t0 + RESERVE_AFTER;
+        let t = d.pop(reserved).unwrap();
+        assert_eq!(t.token, 3, "tts shares nothing the gemma head waits for");
+        assert!(t.loads.is_empty() && t.evicts.is_empty());
+    }
+
+    #[test]
+    fn preloaded_instances_count_in_the_ledger_from_the_start() {
+        let d = two_models(1, 0);
+        assert_eq!(in_use(&d, "vram_gb"), 7.4);
+        assert_eq!(in_use(&d, "pool:gemma"), 0.0, "idle: no task holds the pool");
+        assert_eq!(loaded(&d), vec![("gemma".to_string(), 1), ("tts".to_string(), 0)]);
+    }
+
+    #[test]
+    fn rejects_unusable_lazy_pools() {
+        let bad = |r: Resources| {
+            let schedule = if r.lazy.is_empty() { Schedule::Fifo } else { Schedule::Oldest };
+            matches!(Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r, schedule), Err(Error::Config(_)))
+        };
+        let caps = [("vram_gb", 7.5), ("pool:gemma", 1.0), ("pool:tts", 1.0)];
+        let gemma: &[(&str, f64)] = &[("vram_gb", 7.4)];
+        let tts: &[(&str, f64)] = &[("vram_gb", 7.2)];
+        assert!(bad(lazy_res(&caps, &[], &[("gemma", gemma, 1), ("tts", tts, 1)])), "preload does not fit together");
+        assert!(bad(lazy_res(&caps, &[], &[("gemma", gemma, 2)])), "more loaded than pool:gemma allows");
+        assert!(bad(lazy_res(&[("vram_gb", 7.5)], &[], &[("gemma", gemma, 0)])), "pool:gemma is not declared");
+        assert!(bad(lazy_res(&caps, &[], &[("gemma", &[("cpu", 1.0)], 0)])), "undeclared claim resource");
+        assert!(bad(lazy_res(&caps, &[], &[("gemma", &[("vram_gb", 0.0)], 0)])), "zero claim");
+        assert!(bad(lazy_res(&caps, &[], &[("gemma", &[("vram_gb", 8.0)], 1)])), "claim over capacity");
+        assert!(!bad(lazy_res(&caps, &[], &[("gemma", gemma, 1), ("tts", tts, 0)])));
+    }
+
+    #[test]
+    fn a_non_lazy_worker_hands_out_empty_plans() {
+        let mut d = with_res(&res(&[("gpu", 1.0)], &[("g", &[("gpu", 0.5)])]));
+        let t0 = Instant::now();
+        d.push(task(1, "g", "q"), t0);
+        let t = d.pop(t0).unwrap();
+        assert!(t.loads.is_empty() && t.evicts.is_empty());
+        assert!(d.lazy_usage().is_empty());
+    }
+
+    // ---- scheduling ----
+
+    fn lazy_sched(schedule: Schedule) -> Dispatcher {
+        Dispatcher::new(
+            &qs(&["q"]), false, &HashMap::new(),
+            &lazy_res(
+                &[("vram_gb", 7.5), ("pool:gemma", 1.0), ("pool:tts", 1.0)],
+                &[("g", &[("pool:gemma", 1.0)]), ("t", &[("pool:tts", 1.0)])],
+                &[("gemma", &[("vram_gb", 7.4)], 1), ("tts", &[("vram_gb", 7.2)], 0)],
+            ),
+            schedule,
+        ).unwrap()
+    }
+
+    /// An instant far enough from the clock's epoch to subtract a day from.
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(48 * 3600)
+    }
+
+    fn in_workflow(token: u64, name: &str, started_ms: u64) -> ReadyTask {
+        ReadyTask { workflow_started_ms: Some(started_ms), ..task(token, name, "q") }
+    }
+
+    #[test]
+    fn throughput_groups_resident_tasks_before_a_swap() {
+        let mut d = lazy_sched(Schedule::Throughput);
+        let t0 = Instant::now();
+        for (tok, name) in [(1, "g"), (2, "t"), (3, "g"), (4, "t"), (5, "g"), (6, "t")] {
+            d.push(task(tok, name, "q"), t0);
+        }
+        let mut order = Vec::new();
+        while let Some(t) = d.pop(t0) {
+            order.push(t.token);
+            assert_eq!(d.pop(t0).map(|t| t.token), None, "the model is busy: nothing else can start");
+            d.release(t.token);
+        }
+        assert_eq!(order, vec![1, 3, 5, 2, 4, 6]);
+    }
+
+    #[test]
+    fn throughput_resident_bonus_is_bounded_by_the_wait() {
+        let first = |gap: Duration| {
+            let mut d = lazy_sched(Schedule::Throughput);
+            let t0 = Instant::now();
+            d.push(task(1, "t", "q"), t0);
+            d.push(task(2, "g", "q"), t0 + gap);
+            d.pop(t0 + gap).unwrap().token
+        };
+        assert_eq!(first(THROUGHPUT_BONUS - MS), 2, "t arrived less than the bonus before g");
+        assert_eq!(first(THROUGHPUT_BONUS + MS), 1, "t waited longer than the bonus");
+    }
+
+    #[test]
+    fn oldest_runs_an_older_workflow_before_a_younger_resident_task() {
+        let mut d = lazy_sched(Schedule::Oldest);
+        let t0 = far();
+        let wall = now_ms();
+        d.push(in_workflow(1, "g", wall - 1_000), t0);
+        d.push(in_workflow(2, "t", wall - 600_000), t0);
+        let t = d.pop(t0).unwrap();
+        assert_eq!((t.token, t.evicts), (2, vec!["gemma".to_string()]));
+    }
+
+    #[test]
+    fn oldest_prefers_a_resident_task_over_a_swap_that_is_only_slightly_older() {
+        let first = |t_started_ago: u64| {
+            let mut d = lazy_sched(Schedule::Oldest);
+            let t0 = far();
+            let wall = now_ms();
+            d.push(in_workflow(1, "t", wall - t_started_ago), t0);
+            d.push(in_workflow(2, "g", wall - 10_000), t0);
+            d.pop(t0).unwrap().token
+        };
+        assert_eq!(first(14_000), 2, "4 s older is less than the bonus");
+        assert_eq!(first(30_000), 1, "20 s older is more");
+    }
+
+    #[test]
+    fn oldest_ranks_tasks_outside_workflows_by_arrival() {
+        let first = |gap: Duration| {
+            let mut d = lazy_sched(Schedule::Oldest);
+            let t0 = Instant::now();
+            d.push(task(1, "t", "q"), t0);
+            d.push(task(2, "g", "q"), t0 + gap);
+            d.pop(t0 + gap).unwrap().token
+        };
+        assert_eq!(first(OLDEST_BONUS - MS), 2);
+        assert_eq!(first(OLDEST_BONUS + MS), 1);
+    }
+
+    #[test]
+    fn strict_priority_still_beats_scoring() {
+        for schedule in [Schedule::Throughput, Schedule::Oldest] {
+            let mut d = Dispatcher::new(
+                &qs(&["hi", "lo"]), true, &HashMap::new(),
+                &lazy_res(
+                    &[("vram_gb", 7.5), ("pool:gemma", 1.0), ("pool:tts", 1.0)],
+                    &[("g", &[("pool:gemma", 1.0)]), ("t", &[("pool:tts", 1.0)])],
+                    &[("gemma", &[("vram_gb", 7.4)], 1), ("tts", &[("vram_gb", 7.2)], 0)],
+                ),
+                schedule,
+            ).unwrap();
+            let t0 = far();
+            // The gemma task is resident but in the lower queue; the tts one needs a swap and is far older.
+            d.hold(ReadyTask { queue: "lo".into(), ..in_workflow(1, "g", now_ms() - 1_000) }, t0);
+            d.hold(ReadyTask { queue: "hi".into(), ..in_workflow(2, "t", now_ms() - 600_000) }, t0);
+            assert_eq!(d.pop(t0).unwrap().token, 2, "{schedule:?}");
+        }
+    }
+
+    #[test]
+    fn a_task_that_cannot_start_does_not_block_others_when_scoring() {
+        let mut d = lazy(
+            &[("vram_gb", 7.5), ("pool:gemma", 1.0)],
+            &[("g", &[("pool:gemma", 1.0)]), ("p", &[("vram_gb", 0.5)])],
+            &[("gemma", &[("vram_gb", 7.4)], 0)],
+        );
+        let t0 = Instant::now();
+        d.push(task(1, "g", "q"), t0);
+        assert!(d.pop(t0).is_some());
+        d.push(task(2, "g", "q"), t0);
+        d.push(task(3, "plain", "q"), t0);
+        assert_eq!(d.pop(t0).unwrap().token, 3, "the second gemma task waits for pool:gemma");
+    }
+
+    #[test]
+    fn schedule_and_lazy_pools_must_agree() {
+        let lazy_r = lazy_res(
+            &[("vram_gb", 7.5), ("pool:gemma", 1.0)], &[], &[("gemma", &[("vram_gb", 7.4)], 0)],
+        );
+        let new = |r: &Resources, s| Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), r, s).map(|_| ());
+        assert!(matches!(new(&lazy_r, Schedule::Fifo), Err(Error::Config(_))));
+        assert!(new(&lazy_r, Schedule::Throughput).is_ok() && new(&lazy_r, Schedule::Oldest).is_ok());
+        let plain = res(&[("gpu", 1.0)], &[]);
+        assert!(matches!(new(&plain, Schedule::Throughput), Err(Error::Config(_))));
+        assert!(matches!(new(&plain, Schedule::Oldest), Err(Error::Config(_))));
+        assert!(new(&plain, Schedule::Fifo).is_ok());
+    }
+
+    #[test]
+    fn only_the_oldest_schedule_looks_at_the_workflow_start() {
+        let origin_age = |schedule| {
+            let mut d = lazy_sched(schedule);
+            let t0 = far();
+            d.push(in_workflow(1, "g", now_ms() - 30_000), t0);
+            t0 - d.held[0].origin
+        };
+        assert_eq!(origin_age(Schedule::Throughput), Duration::ZERO);
+        let age = origin_age(Schedule::Oldest);
+        assert!(age >= Duration::from_secs(29) && age <= Duration::from_secs(31), "{age:?}");
+    }
+
+    #[test]
+    fn origin_clamps_a_future_start_and_a_very_old_one() {
+        let at = far();
+        assert_eq!(origin_of(at, 5_000, 4_000), at, "started in the future (clock skew)");
+        assert_eq!(origin_of(at, 5_000, 5_000), at);
+        assert_eq!(origin_of(at, 1_000, 11_000), at - Duration::from_secs(10));
+        assert_eq!(origin_of(at, 0, u64::MAX), at - MAX_ORIGIN_AGE, "capped at a day");
+    }
+
+    #[test]
+    fn origin_falls_back_to_at_when_the_instant_cannot_go_back() {
+        // An Instant can't be moved before the clock's epoch; a task held right after boot must not panic.
+        let at = Instant::now();
+        let origin = origin_of(at, 0, 3_600_000);
+        assert!(origin == at || at - origin == Duration::from_secs(3600));
     }
 }

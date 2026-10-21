@@ -210,6 +210,54 @@ its outcome is reported.
   carries it anyway, only possible with `app.send` by name, has its keyword value overwritten by
   the instance, and a positional one fails the task with a duplicate-argument `TypeError`.
 
+### Lazy pools (models that don't fit together)
+
+Eager pools (the default, described above) load everything at startup and keep it. If the models
+don't fit in memory together, run the worker in lazy mode: it loads a model when a task needs it and
+closes idle ones to make room.
+
+```bash
+mayu worker tasks:app --queues gpu --pools gemma=1,tts=1 --pool-mode lazy --schedule throughput \
+    --preload gemma --resources gpu=1,vram_gb=7.5 --prefetch-multiplier 1
+# or MAYU_POOL_MODE=lazy, MAYU_SCHEDULE, MAYU_PRELOAD
+```
+
+Here `gemma` and `tts` don't fit in 7.5 GB together, so only one is in memory at a time. The pool
+code and the tasks are the same as for eager pools; `--pools gemma=1` is now the most instances
+loaded at once, and nothing is reserved for it at startup. `--pool-mode` applies to every pool of
+the worker.
+
+- **Loading and eviction:** a pool's resources are held only while an instance is loaded. A task
+  that finds no idle instance of its pool has the worker build one, after closing idle instances
+  (least recently used first) until it fits. Only idle instances are closed, never one a task is
+  using. A task without a pool may close an idle model too, if it has no room beside it. Loading and
+  closing happen before the task's time limits start.
+- **`--preload gemma,tts`:** load one instance of each at startup, in that order. They must fit
+  together, or the worker refuses to start. Without it the first task for a model pays the load.
+- **`--schedule`:** a worker holds back tasks that don't fit, and lazy mode lets it prefer ones whose
+  model is already loaded. Queue priority still comes first; this only orders tasks within a
+  priority. `throughput` (fewest swaps) lets a task with a loaded model run ahead of other work that
+  arrived up to 60 seconds before it. `oldest` (the default in lazy mode) orders by the start of the
+  workflow, and by arrival for tasks outside one, so a workflow already under way finishes first; a
+  loaded model is worth 10 seconds, about one model load. A task that needs a swap is passed only by
+  loaded-model tasks that arrived (or started) less than that bound after it, so none waits forever.
+  The bounds are not configurable.
+- **Only prefetched tasks are reordered:** the worker chooses among tasks it has already claimed
+  from Redis. Run GPU queues with a small `--prefetch-multiplier` (the default is 2): a larger
+  buffer gives it more to choose from but claims more tasks before they can run.
+- **Startup checks:** `--schedule` and `--preload` need `--pool-mode lazy`. A worker refuses to start
+  if a task's own resources plus one instance of each pool it uses exceed what `--resources`
+  declares, or if the preloaded pools don't fit together.
+- **Broken instances:** `DiscardInstance` and `discard_on` close the instance after the outcome is
+  reported, as with eager pools, but nothing is rebuilt: the next task that needs the model loads it.
+- **Failed loads:** if a factory raises while loading for a task, that task fails with
+  `RuntimeError("pool 'gemma' failed to load: ...")`, so `retry_on` applies, and the worker keeps
+  running. Instances closed to make room for it stay closed. A failing `--preload` stops the worker
+  at startup, as in eager mode.
+- **Zombies:** as with eager pools, a task past its hard time limit keeps its instance, so the pool
+  shrinks by one for good. Its memory also stays counted as in use until the worker recycles.
+- **Close:** `@pool.close` runs on evicted and discarded instances and at shutdown, as above.
+
 ## Queue priority
 
 ```bash
@@ -359,6 +407,8 @@ processes listen on 9100–9103, so scrape all four. `MAYU_METRICS_PORT` sets th
 | `mayu_resource_capacity`, `mayu_resource_in_use` | gauge | `resource` (only with `--resources`) |
 | `mayu_pool_size`, `mayu_pool_busy` | gauge | `pool` (only with `--pools`; instances in the pool, and held by running tasks) |
 | `mayu_pool_rebuilds_total` | counter | `pool` (instances replaced after `DiscardInstance` or `discard_on`) |
+| `mayu_pool_loaded` | gauge | `pool` (only with `--pool-mode lazy`; instances in memory, idle or busy) |
+| `mayu_pool_loads_total`, `mayu_pool_evictions_total` | counter | `pool` (lazy instances built, preloads included, and closed to make room) |
 
 Pools are counted in the resource ledger as `pool:<name>`, but they appear only as `mayu_pool_*`, never under
 `mayu_resource_*`.

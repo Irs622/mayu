@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use mayu_core::{Error, Header, MemoryBroker, Outcome, Resources, RetryPolicy, Runtime, RuntimeConfig};
+use mayu_core::{Error, Header, MemoryBroker, Outcome, Resources, RetryPolicy, Runtime, RuntimeConfig, Schedule};
 
 fn cfg(concurrency: usize, prefetch: usize) -> RuntimeConfig {
     RuntimeConfig {
@@ -177,6 +177,7 @@ fn gpu_cfg() -> RuntimeConfig {
         resources: Resources {
             capacity: [("gpu".to_string(), 1.0)].into(),
             requests: [("g".to_string(), [("gpu".to_string(), 0.5)].into())].into(),
+            ..Default::default()
         },
         ..cfg(4, 2)
     }
@@ -214,5 +215,59 @@ fn a_task_taken_after_stop_gives_its_resources_back() {
     rt.stop_fetching();
     assert!(rt.recv_timeout(Duration::from_secs(1)).is_none(), "not started while stopping");
     assert_eq!(value(&scrape(&rt), r#"mayu_resource_in_use{resource="gpu"}"#), Some(0.0));
+    rt.shutdown(Duration::from_secs(1));
+}
+
+fn lazy_cfg() -> RuntimeConfig {
+    use mayu_core::dispatch::LazyPool;
+    RuntimeConfig {
+        resources: Resources {
+            capacity: [("vram_gb".to_string(), 7.5), ("pool:gemma".to_string(), 1.0), ("pool:tts".to_string(), 1.0)].into(),
+            requests: [
+                ("g".to_string(), [("pool:gemma".to_string(), 1.0)].into()),
+                ("t".to_string(), [("pool:tts".to_string(), 1.0)].into()),
+            ].into(),
+            lazy: [
+                ("gemma".to_string(), LazyPool { claim: [("vram_gb".to_string(), 7.4)].into(), loaded: 1 }),
+                ("tts".to_string(), LazyPool { claim: [("vram_gb".to_string(), 7.2)].into(), loaded: 0 }),
+            ].into(),
+        },
+        schedule: Schedule::Oldest,
+        ..cfg(4, 2)
+    }
+}
+
+#[test]
+fn lazy_pool_gauge_follows_loads_and_unloads() {
+    let mem = MemoryBroker::default();
+    mem.push(&Header::new("t", "q", 0, "ct"), b"");
+    let rt = start(&mem, lazy_cfg());
+    let body = scrape(&rt);
+    assert_eq!(value(&body, r#"mayu_pool_loaded{pool="gemma"}"#), Some(1.0));
+    assert_eq!(value(&body, r#"mayu_pool_loaded{pool="tts"}"#), Some(0.0));
+    let t = rt.recv_timeout(RECV).unwrap();
+    assert_eq!((t.loads, t.evicts), (vec!["tts".to_string()], vec!["gemma".to_string()]));
+    rt.pool_evicted("gemma");
+    rt.pool_loaded("tts");
+    let body = scrape(&rt);
+    assert_eq!(value(&body, r#"mayu_pool_loaded{pool="gemma"}"#), Some(0.0));
+    assert_eq!(value(&body, r#"mayu_pool_loaded{pool="tts"}"#), Some(1.0));
+    assert_eq!(value(&body, r#"mayu_pool_loads_total{pool="tts"}"#), Some(1.0));
+    assert_eq!(value(&body, r#"mayu_pool_evictions_total{pool="gemma"}"#), Some(1.0));
+    rt.unload_begin("tts").unwrap();
+    assert_eq!(value(&scrape(&rt), r#"mayu_pool_loaded{pool="tts"}"#), Some(0.0));
+    assert_eq!(value(&scrape(&rt), r#"mayu_resource_in_use{resource="vram_gb"}"#), Some(7.2));
+    rt.complete(t.token, Outcome::Success { result: None, links: vec![] });
+    rt.unload_done("tts").unwrap();
+    assert_eq!(value(&scrape(&rt), r#"mayu_resource_in_use{resource="vram_gb"}"#), Some(0.0));
+    assert!(matches!(rt.unload_done("tts"), Err(Error::Config(_))));
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn eager_workers_have_no_lazy_pool_families() {
+    let mem = MemoryBroker::default();
+    let rt = start(&mem, gpu_cfg());
+    assert!(!scrape(&rt).contains("mayu_pool_loaded"));
     rt.shutdown(Duration::from_secs(1));
 }

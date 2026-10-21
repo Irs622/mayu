@@ -57,6 +57,8 @@ struct Counters {
     reclaimed: BTreeMap<String, u64>,
     broker_errors: BTreeMap<&'static str, u64>,
     pool_rebuilds: BTreeMap<String, u64>,
+    pool_loads: BTreeMap<String, u64>,
+    pool_evictions: BTreeMap<String, u64>,
 }
 
 /// Sampled when `/metrics` is scraped.
@@ -71,6 +73,8 @@ pub struct Gauges {
     pub queues: Vec<(String, QueueStats)>,
     /// (resource, capacity, in use); empty when the worker declares no resources.
     pub resources: Vec<(String, f64, f64)>,
+    /// (pool, instances loaded) for each lazy pool; empty unless the worker runs pools lazily.
+    pub loaded: Vec<(String, u32)>,
 }
 
 #[derive(Default)]
@@ -119,6 +123,14 @@ impl Metrics {
         *self.c.lock().unwrap().pool_rebuilds.entry(pool.to_string()).or_default() += 1;
     }
 
+    pub fn pool_loaded(&self, pool: &str) {
+        *self.c.lock().unwrap().pool_loads.entry(pool.to_string()).or_default() += 1;
+    }
+
+    pub fn pool_evicted(&self, pool: &str) {
+        *self.c.lock().unwrap().pool_evictions.entry(pool.to_string()).or_default() += 1;
+    }
+
     pub fn render(&self, g: &Gauges) -> String {
         let c = self.c.lock().unwrap();
         let mut out = String::with_capacity(4096);
@@ -157,6 +169,18 @@ impl Metrics {
             family(&mut out, "mayu_pool_rebuilds_total", "counter", "Pool instances replaced after being discarded.");
             for (p, n) in &c.pool_rebuilds {
                 sample(&mut out, "mayu_pool_rebuilds_total", &[("pool", p)], n);
+            }
+        }
+        if !c.pool_loads.is_empty() {
+            family(&mut out, "mayu_pool_loads_total", "counter", "Lazy pool instances built, preloads included.");
+            for (p, n) in &c.pool_loads {
+                sample(&mut out, "mayu_pool_loads_total", &[("pool", p)], n);
+            }
+        }
+        if !c.pool_evictions.is_empty() {
+            family(&mut out, "mayu_pool_evictions_total", "counter", "Lazy pool instances closed to make room.");
+            for (p, n) in &c.pool_evictions {
+                sample(&mut out, "mayu_pool_evictions_total", &[("pool", p)], n);
             }
         }
         drop(c);
@@ -199,6 +223,12 @@ impl Metrics {
             family(&mut out, "mayu_pool_busy", "gauge", "Pool instances held by running tasks.");
             for (r, _, busy) in &pools {
                 sample(&mut out, "mayu_pool_busy", &[("pool", r.strip_prefix(POOL_PREFIX).unwrap_or(r))], busy);
+            }
+        }
+        if !g.loaded.is_empty() {
+            family(&mut out, "mayu_pool_loaded", "gauge", "Instances of each lazy pool in memory, idle or busy.");
+            for (p, n) in &g.loaded {
+                sample(&mut out, "mayu_pool_loaded", &[("pool", p)], n);
             }
         }
         out
@@ -295,6 +325,7 @@ mod tests {
                 ("b".into(), QueueStats { stream: 1, pending: 3, delayed: 0, dead: 0 }), // racy read
             ],
             resources: vec![("gpu".into(), 1.0, 0.5)],
+            ..Gauges::default()
         };
         let b = Metrics::default().render(&g);
         assert_eq!(value(&b, "mayu_worker_concurrency"), Some(8.0));
@@ -377,5 +408,37 @@ mod tests {
         let g = Gauges { resources: vec![("gpu".into(), 1.0, 0.0)], ..Gauges::default() };
         let b = Metrics::default().render(&g);
         assert!(!b.contains("mayu_pool"), "{b}");
+    }
+
+    #[test]
+    fn loaded_gauge_is_rendered_for_lazy_pools_only() {
+        let g = Gauges {
+            resources: vec![("pool:gemma".into(), 1.0, 0.0), ("pool:tts".into(), 1.0, 0.0), ("pool:eager".into(), 1.0, 0.0)],
+            loaded: vec![("gemma".into(), 1), ("tts".into(), 0)],
+            ..Gauges::default()
+        };
+        let b = Metrics::default().render(&g);
+        assert!(b.contains("# TYPE mayu_pool_loaded gauge"), "{b}");
+        assert_eq!(value(&b, r#"mayu_pool_loaded{pool="gemma"}"#), Some(1.0));
+        assert_eq!(value(&b, r#"mayu_pool_loaded{pool="tts"}"#), Some(0.0));
+        assert_eq!(value(&b, r#"mayu_pool_loaded{pool="eager"}"#), None);
+        let eager_only = Gauges { resources: vec![("pool:eager".into(), 1.0, 0.0)], ..Gauges::default() };
+        assert!(!Metrics::default().render(&eager_only).contains("mayu_pool_loaded"));
+    }
+
+    #[test]
+    fn loads_and_evictions_are_counted_per_pool_and_only_emitted_once_seen() {
+        let m = Metrics::default();
+        let b = m.render(&Gauges::default());
+        assert!(!b.contains("mayu_pool_loads_total") && !b.contains("mayu_pool_evictions_total"), "{b}");
+        m.pool_loaded("gemma");
+        m.pool_loaded("gemma");
+        m.pool_loaded("tts");
+        m.pool_evicted("gemma");
+        let b = m.render(&Gauges::default());
+        assert_eq!(value(&b, r#"mayu_pool_loads_total{pool="gemma"}"#), Some(2.0));
+        assert_eq!(value(&b, r#"mayu_pool_loads_total{pool="tts"}"#), Some(1.0));
+        assert_eq!(value(&b, r#"mayu_pool_evictions_total{pool="gemma"}"#), Some(1.0));
+        assert_eq!(value(&b, r#"mayu_pool_evictions_total{pool="tts"}"#), None);
     }
 }

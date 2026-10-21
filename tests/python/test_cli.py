@@ -7,7 +7,7 @@ import sys
 import pytest
 
 from mayu import App
-from mayu.cli import load_app, parse_gpus, parse_pools
+from mayu.cli import load_app, parse_gpus, parse_pools, parse_preload
 
 HERE = pathlib.Path(__file__).parent
 
@@ -236,6 +236,70 @@ def test_worker_cli_loads_pools_from_the_environment(tmp_path, redis_url, queue)
         producer = App(broker=redis_url, result_ttl=60, default_queue=queue)
 
         @producer.declare(name="pool.use")
+        def use(model=producer.use("gemma")): ...
+
+        assert use.send().result(timeout=30) == "gemma-0"
+    finally:
+        _stop(proc)
+
+
+LAZY_APP = (
+    "from mayu import App\n"
+    "app = App(result_ttl=60)\n"
+    "@app.pool('gemma', vram_gb=7.4)\n"
+    "def gemma(ctx):\n"
+    "    return f'gemma-{ctx.index}'\n"
+    "@app.task(name='lazy.use')\n"
+    "def use(model=app.use('gemma')):\n"
+    "    return model\n"
+)
+
+
+@pytest.mark.parametrize("text,expected", [
+    (None, None), ("", None), ("  ", None), ("gemma", ["gemma"]), ("tts, gemma ", ["tts", "gemma"]),
+])
+def test_parse_preload(text, expected):
+    assert parse_preload(text) == expected
+
+
+@pytest.mark.parametrize("text", ["gemma,", ",gemma", "gemma,,tts", "ge mma", "gemma=1", "gemma,gemma"])
+def test_parse_preload_rejects_malformed_input(text):
+    with pytest.raises(ValueError, match="--preload"):
+        parse_preload(text)
+
+
+@pytest.mark.parametrize("extra,env,message", [
+    (("--preload", "gemma"), None, "--preload needs --pool-mode lazy"),
+    (("--schedule", "oldest"), None, "--schedule needs --pool-mode lazy"),
+    ((), {"MAYU_PRELOAD": "gemma"}, "--preload needs --pool-mode lazy"),
+    ((), {"MAYU_SCHEDULE": "throughput"}, "--schedule needs --pool-mode lazy"),
+    ((), {"MAYU_POOL_MODE": "sometimes"}, "pool_mode must be 'eager' or 'lazy'"),
+    ((), {"MAYU_POOL_MODE": "lazy", "MAYU_SCHEDULE": "fastest"}, "schedule must be 'throughput' or 'oldest'"),
+    (("--pool-mode", "lazy", "--preload", "gemma,,tts"), None, "mayu: bad --preload 'gemma,,tts'"),
+    (("--pool-mode", "lazy", "--pools", "gemma=1", "--resources", "vram_gb=5"), None,
+     "task 'lazy.use' needs vram_gb=7.4 (gemma 7.4) but this worker has vram_gb=5"),
+])
+def test_worker_cli_rejects_bad_lazy_options(tmp_path, redis_url, queue, extra, env, message):
+    r = _run_worker(tmp_path, redis_url, queue, LAZY_APP, *extra, env=env)
+    assert r.returncode == 2 and message in r.stderr, r.stderr
+
+
+def test_worker_cli_rejects_a_bad_pool_mode_flag(tmp_path, redis_url, queue):
+    r = _run_worker(tmp_path, redis_url, queue, LAZY_APP, "--pool-mode", "sometimes")
+    assert r.returncode == 2 and "--pool-mode" in r.stderr, r.stderr
+
+
+def test_worker_cli_runs_lazy_pools_from_flags_and_the_environment(tmp_path, redis_url, queue):
+    (tmp_path / "res_app.py").write_text(LAZY_APP)
+    env = {**_env(redis_url, queue), "PYTHONPATH": str(tmp_path), "MAYU_POOLS": "gemma=1",
+           "MAYU_RESOURCES": "vram_gb=7.5", "MAYU_POOL_MODE": "lazy", "MAYU_SCHEDULE": "throughput",
+           "MAYU_PRELOAD": "gemma"}
+    proc = subprocess.Popen([sys.executable, "-m", "mayu", "worker", "res_app:app", "--mode", "thread",
+                             "--threads", "2"], env=env, stderr=subprocess.PIPE, text=True)
+    try:
+        producer = App(broker=redis_url, result_ttl=60, default_queue=queue)
+
+        @producer.declare(name="lazy.use")
         def use(model=producer.use("gemma")): ...
 
         assert use.send().result(timeout=30) == "gemma-0"
