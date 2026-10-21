@@ -62,6 +62,19 @@ def parse_pools(text: str | None) -> dict[str, int] | None:
     return out
 
 
+def parse_preload(text: str | None) -> list[str] | None:
+    """'gemma,tts' -> ['gemma', 'tts'] (order kept); None or '' -> None."""
+    if not text or not text.strip():
+        return None
+    names = [n.strip() for n in text.split(",")]
+    if not all(names) or any(any(c.isspace() for c in n) or "=" in n for n in names):
+        raise ValueError(f"bad --preload {text!r}: use comma-separated pool names like gemma,tts")
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise ValueError(f"bad --preload {text!r}: {', '.join(dupes)} listed more than once")
+    return names
+
+
 def parse_gpus(text: str | None) -> list[str] | None:
     """'0,1' -> ['0', '1']. Ids are opaque (indexes or UUIDs like 'GPU-abc'): they go to CUDA_VISIBLE_DEVICES."""
     if not text or not text.strip():
@@ -89,7 +102,8 @@ def _build_runner(app, args, threads: int):
                         max_tasks_per_process=args.max_tasks_per_process,
                         max_memory_per_process=args.max_memory_per_process,
                         metrics_port=args.metrics_port, metrics_host=args.metrics_host,
-                        resources=args.resources, pools=args.pools, thp=args.thp)
+                        resources=args.resources, pools=args.pools, thp=args.thp,
+                        pool_mode=args.pool_mode, schedule=args.schedule, preload=args.preload)
 
 
 def _cmd_worker(args) -> int:
@@ -107,6 +121,11 @@ def _cmd_worker(args) -> int:
         return 2
     try:
         args.pools = parse_pools(args.pools)
+    except ValueError as e:
+        print(f"mayu: {e}", file=sys.stderr)
+        return 2
+    try:
+        args.preload = parse_preload(args.preload)
     except ValueError as e:
         print(f"mayu: {e}", file=sys.stderr)
         return 2
@@ -305,6 +324,17 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--pools", default=os.environ.get("MAYU_POOLS") or None, metavar="NAME=COUNT,...",
                    help="instances of each model pool to load in each worker process, e.g. gemma=2,tts=3 "
                         "(pools are declared in code with @app.pool)")
+    w.add_argument("--pool-mode", default=os.environ.get("MAYU_POOL_MODE") or "eager", metavar="{eager,lazy}",
+                   choices=("eager", "lazy"),
+                   help="eager (default) loads every pool instance at startup and holds its resources for good; "
+                        "lazy loads a model when a task needs it and evicts idle ones (least recently used) "
+                        "when another task needs the room")
+    w.add_argument("--schedule", default=os.environ.get("MAYU_SCHEDULE") or None, metavar="{throughput,oldest}",
+                   choices=("throughput", "oldest"),
+                   help="with --pool-mode lazy: prefer tasks whose model is loaded. throughput: fewest model swaps; "
+                        "oldest: oldest workflow first (default in lazy mode)")
+    w.add_argument("--preload", default=os.environ.get("MAYU_PRELOAD") or None, metavar="NAME,...",
+                   help="with --pool-mode lazy: pools to load one instance of at startup, e.g. gemma")
     w.add_argument("--gpus", default=None, metavar="ID,...",
                    help="one worker process per listed GPU, each with CUDA_VISIBLE_DEVICES set to its id")
     w.add_argument("--thp", default=os.environ.get("MAYU_THP") or "python", metavar="{python,keep,off}",
