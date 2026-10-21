@@ -13,7 +13,7 @@ import pytest
 
 from mayu import gpu as gpu_mod
 from mayu.cli import parse_resources
-from mayu.gpu import GIB, TUNE_COOLDOWN, TUNE_WINDOW, Gpu, Guard, Sampler, Tuner, UnderDeclared, resolve_auto, visible
+from mayu.gpu import GIB, TUNE_COOLDOWN, TUNE_MEMORY, TUNE_WINDOW, Gpu, Guard, Sampler, Tuner, UnderDeclared, resolve_auto, visible
 from mayu.worker import WorkerRunner
 
 # monkeypatch swaps mayu.gpu attributes that every thread of a pytest-run-parallel run shares
@@ -339,6 +339,35 @@ class TestTuner:
         feed(t, 0.95)
         assert feed(t, 0.3, blocked=1, ticks=TUNE_COOLDOWN * TUNE_WINDOW) == [0] * TUNE_COOLDOWN * TUNE_WINDOW
         assert feed(t, 0.3, blocked=1)[-1] == 0.25
+
+    def test_a_saturated_gpu_keeps_a_level_whose_lower_one_left_it_idle(self):
+        # one bursty task keeps the GPU 60% busy, two saturate it: two get more done, so stay at two
+        t = Tuner(1.0, 0.25, 0.25, cooldown=0)
+        feed(t, 0.99, blocked=4, ticks=3 * TUNE_WINDOW)
+        assert t.capacity == 0.25
+        assert feed(t, 0.6, blocked=4)[-1] == 0.25
+        assert feed(t, 1.0, blocked=4, ticks=4 * TUNE_WINDOW) == [0] * 4 * TUNE_WINDOW
+        assert t.capacity == 0.5
+
+    def test_a_lower_level_counts_only_when_it_was_full(self):
+        # 40% with nothing waiting says nothing about what that level does under load
+        t = Tuner(1.0, 0.25, 0.25, cooldown=0)
+        feed(t, 0.99, blocked=4)
+        assert t.capacity == 0.75
+        feed(t, 0.4, blocked=0)
+        feed(t, 0.99, blocked=4, ticks=2 * TUNE_WINDOW)
+        assert t.capacity == 0.25  # 0.75 → 0.5 → 0.25: nothing recorded at 0.5 or 0.25 stopped it
+
+    def test_an_old_reading_of_the_lower_level_expires(self):
+        now = [0.0]
+        t = Tuner(1.0, 0.25, 0.25, cooldown=0, clock=lambda: now[0])
+        feed(t, 0.99, blocked=4, ticks=3 * TUNE_WINDOW)
+        feed(t, 0.6, blocked=4)
+        assert t.capacity == 0.5
+        now[0] = TUNE_MEMORY - 1
+        assert feed(t, 1.0, blocked=4)[-1] == 0
+        now[0] = TUNE_MEMORY + 1  # the workload may have changed since 0.25 was measured
+        assert feed(t, 1.0, blocked=4)[-1] == -0.25
 
     @pytest.mark.parametrize("ceiling,floor,step", [(1.0, 2.0, 0.5), (1.0, 0.5, 0), (1.0, 0, 0.5), (1.0, 0.5, -1)])
     def test_bad_bounds(self, ceiling, floor, step):
