@@ -122,6 +122,35 @@ fresh entry, so its crash-redelivery count (`--max-deliveries`) starts over. Def
 spaced for the worker that deferred them, so adding workers doesn't speed up a backlog that is
 already deferred.
 
+## Resources
+
+```python
+@app.task(resources={"gpu": 0.3, "vram_gb": 1.2})
+def embed(texts): ...
+```
+
+```bash
+mayu worker tasks:app --resources gpu=1,vram_gb=7.5     # or MAYU_RESOURCES
+mayu worker tasks:app --gpus 0,1 --resources gpu=1      # one worker process per GPU
+```
+
+A worker starts a task only when everything it requests fits in what is left of what the worker
+declared, so three of the tasks above run side by side on one GPU and a fourth waits for a
+finisher. Amounts are in whatever unit you pick (GPUs, GB, cores), down to 0.001. A worker
+refuses to start if a task on a queue it serves requests a resource it didn't declare, or more
+than it has; tasks on other queues are ignored. Tasks without `resources=` are never held back.
+
+- **No starvation:** if the oldest, highest-priority waiting task has been due for 5 seconds,
+  later tasks may start only if they request none of the resources it is waiting for.
+- **Per process:** each worker process counts only its own tasks. Several processes sharing a
+  GPU each think they own it, so run one process per GPU and size `--resources` for that
+  process. `--gpus 0,1` does this: it starts one process per id with `CUDA_VISIBLE_DEVICES`
+  set to it, before your app is imported (ids are opaque, so `GPU-abc...` UUIDs work).
+  `--processes`, if given, must equal the number of ids.
+- **Zombies:** resources are released when a task's outcome is reported. A task past its hard
+  time limit is reported as failed while its thread keeps running, so until the worker
+  recycles, a zombie can use a GPU that a new task has already been given.
+
 ## Queue priority
 
 ```bash
@@ -210,6 +239,7 @@ processes listen on 9100–9103, so scrape all four. `MAYU_METRICS_PORT` sets th
 | `mayu_broker_errors_total` | counter | `op` |
 | `mayu_worker_concurrency`, `mayu_tasks_inflight`, `mayu_tasks_running` | gauge | |
 | `mayu_queue_ready`, `mayu_queue_pending`, `mayu_queue_delayed`, `mayu_queue_dead` | gauge | `queue` |
+| `mayu_resource_capacity`, `mayu_resource_in_use` | gauge | `resource` (only with `--resources`) |
 
 Queue gauges are read from Redis on each scrape, so every worker reports the same values: use
 `max by (queue) (mayu_queue_ready)`. If Redis cannot be read, the scrape still answers without them.

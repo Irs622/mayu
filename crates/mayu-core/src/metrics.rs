@@ -62,6 +62,8 @@ pub struct Gauges {
     pub running: usize,
     /// Per-queue broker state; empty when the broker could not be read.
     pub queues: Vec<(String, QueueStats)>,
+    /// (resource, capacity, in use); empty when the worker declares no resources.
+    pub resources: Vec<(String, f64, f64)>,
 }
 
 #[derive(Default)]
@@ -160,6 +162,16 @@ impl Metrics {
                 sample(&mut out, name, &[("queue", q)], get(s));
             }
         }
+        if !g.resources.is_empty() {
+            family(&mut out, "mayu_resource_capacity", "gauge", "What this worker process declared for each resource.");
+            for (r, cap, _) in &g.resources {
+                sample(&mut out, "mayu_resource_capacity", &[("resource", r)], cap);
+            }
+            family(&mut out, "mayu_resource_in_use", "gauge", "Resource amounts held by tasks running in this process.");
+            for (r, _, used) in &g.resources {
+                sample(&mut out, "mayu_resource_in_use", &[("resource", r)], used);
+            }
+        }
         out
     }
 }
@@ -253,6 +265,7 @@ mod tests {
                 ("a".into(), QueueStats { stream: 10, pending: 4, delayed: 2, dead: 1 }),
                 ("b".into(), QueueStats { stream: 1, pending: 3, delayed: 0, dead: 0 }), // racy read
             ],
+            resources: vec![("gpu".into(), 1.0, 0.5)],
         };
         let b = Metrics::default().render(&g);
         assert_eq!(value(&b, "mayu_worker_concurrency"), Some(8.0));
@@ -263,6 +276,14 @@ mod tests {
         assert_eq!(value(&b, r#"mayu_queue_delayed{queue="a"}"#), Some(2.0));
         assert_eq!(value(&b, r#"mayu_queue_dead{queue="a"}"#), Some(1.0));
         assert_eq!(value(&b, r#"mayu_queue_ready{queue="b"}"#), Some(0.0));
+        assert_eq!(value(&b, r#"mayu_resource_capacity{resource="gpu"}"#), Some(1.0));
+        assert_eq!(value(&b, r#"mayu_resource_in_use{resource="gpu"}"#), Some(0.5));
+    }
+
+    #[test]
+    fn resource_gauges_are_absent_without_resources() {
+        let b = Metrics::default().render(&Gauges::default());
+        assert!(!b.contains("mayu_resource"), "{b}");
     }
 
     #[test]

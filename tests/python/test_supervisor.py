@@ -139,3 +139,23 @@ def test_watch_parent_quiet_while_parent_lives(monkeypatch):
 def test_watch_parent_noop_without_env(monkeypatch):
     monkeypatch.delenv("MAYU_PARENT_PID", raising=False)
     assert watch_parent(lambda: None) is None
+
+
+def test_per_child_env_is_merged_over_the_base_env_and_survives_restarts(tmp_path):
+    child = [sys.executable, "-c",
+             "import os, pathlib, sys, time\n"
+             "pathlib.Path(sys.argv[1], f\"{os.environ['GPU']}-{os.environ['KEEP']}-{os.getpid()}\").touch()\n"
+             "time.sleep(60)", str(tmp_path)]
+    sup = ProcessSupervisor(child, 2, shutdown_grace=1, min_backoff=0.1,
+                            env={**os.environ, "GPU": "base", "KEEP": "yes"},
+                            per_child_env=lambda i: {"GPU": f"g{i}"})
+    th, _ = _start(sup)
+    try:
+        _wait_for(lambda: len(sup.pids()) == 2 and len(list(tmp_path.iterdir())) == 2, 10, "two children")
+        assert sorted(p.name.rsplit("-", 1)[0] for p in tmp_path.iterdir()) == ["g0-yes", "g1-yes"]
+        os.kill(sup.pids()[0], signal.SIGKILL)
+        _wait_for(lambda: len(list(tmp_path.iterdir())) == 3, 10, "a replacement")
+        assert sorted({p.name.rsplit("-", 1)[0] for p in tmp_path.iterdir()}) == ["g0-yes", "g1-yes"]
+    finally:
+        sup.stop()
+        th.join(15)

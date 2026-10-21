@@ -231,9 +231,10 @@ impl<B: Broker> Runtime<B> {
                 };
                 let (b, m, inf, queues, concurrency) =
                     (broker.clone(), metrics.clone(), inflight.clone(), cfg.queues.clone(), cfg.concurrency);
+                let ready = ready.clone();
                 let render: crate::http::Render = Arc::new(move || {
-                    let (b, m, inf, queues) = (b.clone(), m.clone(), inf.clone(), queues.clone());
-                    Box::pin(async move { scrape(&*b, &m, &inf, &queues, concurrency).await })
+                    let (b, m, inf, queues, ready) = (b.clone(), m.clone(), inf.clone(), queues.clone(), ready.clone());
+                    Box::pin(async move { scrape(&*b, &m, &inf, &ready, &queues, concurrency).await })
                 });
                 // Not `critical`: a broken metrics endpoint must not take the worker down.
                 (Some(rt.spawn(crate::http::serve(l, render))), Some(addr))
@@ -746,7 +747,14 @@ async fn heartbeat_loop<B: Broker>(
 }
 
 /// One `/metrics` body: counters, process gauges, and queue depths if the broker answers in time.
-async fn scrape<B: Broker>(broker: &B, metrics: &Metrics, inflight: &Inflight, queues: &[String], concurrency: usize) -> String {
+async fn scrape<B: Broker>(
+    broker: &B,
+    metrics: &Metrics,
+    inflight: &Inflight,
+    ready: &ReadyQueue,
+    queues: &[String],
+    concurrency: usize,
+) -> String {
     let (n, running) = {
         let m = inflight.lock().unwrap();
         (m.len(), m.values().filter(|f| f.started.is_some()).count())
@@ -766,5 +774,5 @@ async fn scrape<B: Broker>(broker: &B, metrics: &Metrics, inflight: &Inflight, q
             }
         }
     }
-    metrics.render(&Gauges { concurrency, inflight: n, running, queues: stats })
+    metrics.render(&Gauges { concurrency, inflight: n, running, queues: stats, resources: ready.usage() })
 }

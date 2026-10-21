@@ -274,6 +274,11 @@ impl ReadyQueue {
         self.cv.notify_one();
     }
 
+    /// (resource, capacity, in use), for metrics.
+    pub(crate) fn usage(&self) -> Vec<(String, f64, f64)> {
+        self.inner.lock().unwrap().usage()
+    }
+
     /// Frees what `token` held and wakes the waiters, several of which may now fit.
     pub(crate) fn release(&self, token: u64) {
         if self.gated && self.inner.lock().unwrap().release(token) {

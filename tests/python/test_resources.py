@@ -1,4 +1,5 @@
 import threading
+import urllib.request
 import time
 
 import pytest
@@ -222,3 +223,49 @@ def test_parse_resources(text, expected):
 def test_parse_resources_rejects_malformed_input(text):
     with pytest.raises(ValueError, match="--resources"):
         parse_resources(text)
+
+
+def _metrics(port: int) -> str:
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5) as r:
+        return r.read().decode()
+
+
+def _gauge(body: str, series: str):
+    for line in body.splitlines():
+        if line.startswith(series + " "):
+            return float(line.rsplit(" ", 1)[1])
+    return None
+
+
+def test_metrics_report_resource_capacity_and_use(app, running):
+    gate, started = threading.Event(), threading.Event()
+
+    @app.task(resources={"gpu": 0.5, "vram_gb": 1.5})
+    def work():
+        started.set()
+        gate.wait(20)
+
+    with running(app, threads=2, resources={"gpu": 1, "vram_gb": 7.5}, metrics_port=0,
+                 metrics_host="127.0.0.1") as w:
+        body = _metrics(w.metrics_port)
+        assert _gauge(body, 'mayu_resource_capacity{resource="gpu"}') == 1.0
+        assert _gauge(body, 'mayu_resource_capacity{resource="vram_gb"}') == 7.5
+        assert _gauge(body, 'mayu_resource_in_use{resource="gpu"}') == 0.0
+        h = work.send()
+        try:
+            assert started.wait(10)
+            body = _metrics(w.metrics_port)
+            assert _gauge(body, 'mayu_resource_in_use{resource="gpu"}') == 0.5
+            assert _gauge(body, 'mayu_resource_in_use{resource="vram_gb"}') == 1.5
+        finally:
+            gate.set()
+        h.result(timeout=10)
+        deadline = time.monotonic() + 5
+        while _gauge(_metrics(w.metrics_port), 'mayu_resource_in_use{resource="gpu"}') != 0.0:
+            assert time.monotonic() < deadline, "resources were not released"
+            time.sleep(0.01)
+
+
+def test_metrics_have_no_resource_gauges_without_resources(app, running):
+    with running(app, threads=1, metrics_port=0, metrics_host="127.0.0.1") as w:
+        assert "mayu_resource" not in _metrics(w.metrics_port)
