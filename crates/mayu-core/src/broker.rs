@@ -2,6 +2,7 @@ use std::future::Future;
 
 use crate::envelope::Header;
 use crate::error::Result;
+use crate::workflow::{WorkflowSpec, WorkflowState};
 
 #[derive(Debug, Clone)]
 pub struct Delivery {
@@ -64,9 +65,16 @@ pub trait Broker: Send + Sync + 'static {
         -> impl Future<Output = Result<Vec<Delivery>>> + Send;
     /// Acks `d` and enqueues `follow_ups` (link callbacks) in one atomic step. The follow-ups are
     /// enqueued only if this call is the one that acks `d`, so a repeated ack adds no duplicates.
+    ///
+    /// When `d.header.workflow_id` is set, `d` is a workflow node: the same step also marks the node
+    /// done and enqueues every child whose parents are now all done, each at most once however many
+    /// times the node is acked. `follow_ups` must be empty for a node (`Error::Broker` otherwise).
+    /// In a cancelled workflow the node is marked cancelled and nothing is released.
     fn ack(&self, d: &Delivery, result: Option<StoredResult>, follow_ups: &[(Header, Vec<u8>)])
         -> impl Future<Output = Result<()>> + Send;
     fn retry(&self, d: &Delivery, header: &Header) -> impl Future<Output = Result<()>> + Send;
+    /// Moves `d` to the dead letters. A workflow node that isn't done yet is marked dead in the
+    /// same step, which keeps its descendants waiting.
     fn dead_letter(&self, d: &Delivery, error: &str, result: Option<StoredResult>)
         -> impl Future<Output = Result<()>> + Send;
     fn requeue(&self, d: &Delivery) -> impl Future<Output = Result<()>> + Send;
@@ -83,4 +91,12 @@ pub trait Broker: Send + Sync + 'static {
     fn unregister(&self, worker_id: &str) -> impl Future<Output = Result<()>> + Send;
     /// Removes consumers with no pending entries, idle at least `min_idle_ms`, and no heartbeat.
     fn prune_consumers(&self, queue: &str, min_idle_ms: u64) -> impl Future<Output = Result<usize>> + Send;
+    /// Writes the workflow's DAG and enqueues its root nodes in one atomic step. Fails if a
+    /// workflow with this id exists.
+    fn submit_workflow(&self, wf: &WorkflowSpec) -> impl Future<Output = Result<()>> + Send;
+    fn workflow(&self, id: &str) -> impl Future<Output = Result<Option<WorkflowState>>> + Send;
+    /// Stops the workflow from releasing further nodes. False if it is unknown or every node is done.
+    fn cancel_workflow(&self, id: &str) -> impl Future<Output = Result<bool>> + Send;
+    /// The subset of `ids` that are cancelled, in order.
+    fn cancelled_workflows(&self, ids: &[String]) -> impl Future<Output = Result<Vec<String>>> + Send;
 }

@@ -17,6 +17,12 @@ pub struct Header {
     #[serde(default)]
     pub trace_ctx: Option<String>,
     pub content_type: String,
+    /// Set on workflow nodes only; absent from every ordinary header's bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+    /// The node's index in its workflow, as a decimal string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
 }
 
 impl Header {
@@ -36,6 +42,8 @@ impl Header {
             created_at: now_ms(),
             trace_ctx: None,
             content_type: content_type.into(),
+            workflow_id: None,
+            node: None,
         }
     }
 }
@@ -94,11 +102,67 @@ mod tests {
         assert_eq!(back, h);
     }
 
+    /// `Header` as it was before workflows, to pin the wire format.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct OldHeader {
+        id: String,
+        task: String,
+        queue: String,
+        attempt: u32,
+        max_retries: u32,
+        eta: Option<u64>,
+        created_at: u64,
+        #[serde(default)]
+        trace_ctx: Option<String>,
+        content_type: String,
+    }
+
+    fn old_of(h: &Header) -> OldHeader {
+        OldHeader {
+            id: h.id.clone(),
+            task: h.task.clone(),
+            queue: h.queue.clone(),
+            attempt: h.attempt,
+            max_retries: h.max_retries,
+            eta: h.eta,
+            created_at: h.created_at,
+            trace_ctx: h.trace_ctx.clone(),
+            content_type: h.content_type.clone(),
+        }
+    }
+
+    #[test]
+    fn plain_header_bytes_match_the_old_layout() {
+        let mut h = Header::new("app.add", "default", 3, "application/msgpack");
+        h.trace_ctx = Some("00-abc-def-01".into());
+        assert_eq!(encode_header(&h), rmp_serde::to_vec_named(&old_of(&h)).unwrap());
+    }
+
+    #[test]
+    fn old_bytes_decode_without_workflow_fields() {
+        let h = Header::new("t", "q", 1, "ct");
+        let back = decode_header(&rmp_serde::to_vec_named(&old_of(&h)).unwrap()).unwrap();
+        assert_eq!((back.workflow_id.as_deref(), back.node.as_deref()), (None, None));
+        assert_eq!(back, h);
+    }
+
+    #[test]
+    fn workflow_header_roundtrips_and_old_readers_ignore_it() {
+        let mut h = Header::new("t", "q", 1, "ct");
+        h.workflow_id = Some("01WF".into());
+        h.node = Some("3".into());
+        let bytes = encode_header(&h);
+        assert_eq!(decode_header(&bytes).unwrap(), h);
+        let old: OldHeader = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(old, old_of(&h));
+    }
+
     #[test]
     fn header_new_defaults() {
         let h = Header::new("t", "q", 5, "ct");
         assert_eq!(h.attempt, 0);
         assert_eq!(h.eta, None);
+        assert_eq!((h.workflow_id, h.node), (None, None));
         assert_eq!(h.id.len(), 26, "ULID string is 26 chars");
         assert!(h.created_at > 0);
         assert_ne!(Header::new("t", "q", 5, "ct").id, h.id);

@@ -379,12 +379,31 @@ struct FetchCtx<B> {
     metrics: Arc<Metrics>,
 }
 
+/// How long shutdown waits for the acks of skipped (cancelled-workflow) deliveries still being written.
+const SKIP_DRAIN: Duration = Duration::from_secs(5);
+
 async fn fetch_loop<B: Broker>(mut c: FetchCtx<B>) {
+    let mut skips = JoinSet::new();
+    fetch_batches(&mut c, &mut skips).await;
+    let drain = async {
+        while let Some(done) = skips.join_next().await {
+            reap(done);
+        }
+    };
+    if tokio::time::timeout(SKIP_DRAIN, drain).await.is_err() {
+        tracing::warn!("acks of skipped workflow tasks did not finish at shutdown; they will be reclaimed");
+    }
+}
+
+async fn fetch_batches<B: Broker>(c: &mut FetchCtx<B>, skips: &mut JoinSet<()>) {
     let mut next_token: u64 = 1;
     let mut next_reclaim = Instant::now();
     let mut cursors: HashMap<String, String> = HashMap::new();
     let mut order = c.queues.clone();
     loop {
+        while let Some(done) = skips.try_join_next() {
+            reap(done);
+        }
         let permit = tokio::select! {
             p = c.sem.clone().acquire_owned() => match p { Ok(p) => p, Err(_) => return },
             _ = c.stop.wait_for(|s| *s) => return,
@@ -400,7 +419,7 @@ async fn fetch_loop<B: Broker>(mut c: FetchCtx<B>) {
         let mut got: Vec<Delivery> = Vec::new();
         if Instant::now() >= next_reclaim {
             next_reclaim = Instant::now() + c.reclaim_interval;
-            got = reclaim_due(&c, &mut cursors, n).await;
+            got = reclaim_due(c, &mut cursors, n).await;
         }
         if got.is_empty() {
             if !c.strict_priority {
@@ -423,6 +442,12 @@ async fn fetch_loop<B: Broker>(mut c: FetchCtx<B>) {
         }
         c.sem.add_permits(n.saturating_sub(got.len()));
         let overshoot = got.len().saturating_sub(n);
+        // Only a batch with workflow nodes pays for the cancelled check.
+        let got = if got.iter().any(|d| d.header.workflow_id.is_some()) {
+            skip_cancelled(c, skips, got).await
+        } else {
+            got
+        };
         for d in got {
             c.metrics.received(&d.queue, &d.header.task);
             let token = next_token;
@@ -430,7 +455,7 @@ async fn fetch_loop<B: Broker>(mut c: FetchCtx<B>) {
             let task = ReadyTask::from_delivery(token, &d);
             c.inflight.lock().unwrap().insert(token, InFlight { delivery: d, last_claim: Instant::now(), lost: false, started: None });
             if let Admit::Defer { task, delay } = c.ready.push(task, Instant::now()) {
-                defer(&c, task, delay).await;
+                defer(c, task, delay).await;
             }
         }
         if overshoot > 0 {
@@ -446,6 +471,48 @@ async fn fetch_loop<B: Broker>(mut c: FetchCtx<B>) {
         }
         if *c.stop.borrow() { return; }
     }
+}
+
+/// Splits off the deliveries of cancelled workflows and acks them without running them. If the
+/// cancelled check fails, everything is dispatched (running a cancelled node is allowed; losing one
+/// is not). A skipped delivery keeps its prefetch permit until its ack is written, like a completion.
+async fn skip_cancelled<B: Broker>(c: &FetchCtx<B>, skips: &mut JoinSet<()>, got: Vec<Delivery>) -> Vec<Delivery> {
+    let mut ids: Vec<String> = Vec::new();
+    for id in got.iter().filter_map(|d| d.header.workflow_id.as_ref()) {
+        if !ids.contains(id) {
+            ids.push(id.clone());
+        }
+    }
+    let cancelled = match c.broker.cancelled_workflows(&ids).await {
+        Ok(v) if v.is_empty() => return got,
+        Ok(v) => v,
+        Err(e) => {
+            c.metrics.broker_error("cancelled");
+            tracing::warn!(error = %e, "checking for cancelled workflows failed; dispatching normally");
+            return got;
+        }
+    };
+    let (skip, run): (Vec<_>, Vec<_>) =
+        got.into_iter().partition(|d| d.header.workflow_id.as_ref().is_some_and(|id| cancelled.contains(id)));
+    for d in skip {
+        c.metrics.received(&d.queue, &d.header.task);
+        let stored = c.result_ttl.map(|ttl_secs| StoredResult {
+            id: d.header.id.clone(),
+            record: ResultRecord::failure("workflow cancelled", "", &d.header.content_type).encode(),
+            ttl_secs,
+        });
+        let (broker, metrics, sem) = (c.broker.clone(), c.metrics.clone(), c.sem.clone());
+        let deadline = Duration::from_millis(c.visibility_ms);
+        skips.spawn(async move {
+            let rec = Record::Ack(stored, Vec::new());
+            if record_retrying(&*broker, &d, &rec, deadline, &metrics).await {
+                metrics.settled(&d.queue, &d.header.task, Settled::Cancelled, None);
+                tracing::info!(task_id = %d.header.id, task = %d.header.task, "skipped a task of a cancelled workflow");
+            }
+            sem.add_permits(1);
+        });
+    }
+    run
 }
 
 /// Returns a throttled task to the broker's delayed set (attempt unchanged), freeing its slot.
@@ -528,6 +595,30 @@ async fn record<B: Broker>(broker: &B, d: &Delivery, r: &Record) -> Result<()> {
     }
 }
 
+/// Writes `r`, retrying with backoff while the broker errors, for at most `deadline`. False if it
+/// gave up: the message is then reclaimed and runs again.
+async fn record_retrying<B: Broker>(broker: &B, d: &Delivery, r: &Record, deadline: Duration, metrics: &Metrics) -> bool {
+    let began = Instant::now();
+    let mut delay = Duration::from_millis(100);
+    loop {
+        match record(broker, d, r).await {
+            Ok(()) => return true,
+            Err(e) if began.elapsed() + delay < deadline => {
+                metrics.broker_error("record");
+                tracing::warn!(error = %e, task_id = %d.header.id, "recording outcome failed; retrying");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(5));
+            }
+            Err(e) => {
+                metrics.broker_error("record");
+                tracing::error!(error = %e, task_id = %d.header.id,
+                    "giving up recording outcome; the message will be reclaimed and run again");
+                return false;
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn completion_loop<B: Broker>(
     broker: Arc<B>,
@@ -596,28 +687,9 @@ async fn completion_loop<B: Broker>(
         // Buffer through broker outages (bounded by the prefetch permits this message holds).
         let (broker, metrics, sem) = (broker.clone(), metrics.clone(), sem.clone());
         writes.spawn(async move {
-            let began = Instant::now();
-            let mut delay = Duration::from_millis(100);
-            loop {
-                match record(&*broker, &d, &rec).await {
-                    Ok(()) => {
-                        metrics.settled(&d.queue, &d.header.task, how, started.map(|s| s.elapsed()));
-                        log_settled(&d, &rec);
-                        break;
-                    }
-                    Err(e) if began.elapsed() + delay < record_deadline => {
-                        metrics.broker_error("record");
-                        tracing::warn!(error = %e, task_id = %d.header.id, "recording outcome failed; retrying");
-                        tokio::time::sleep(delay).await;
-                        delay = (delay * 2).min(Duration::from_secs(5));
-                    }
-                    Err(e) => {
-                        metrics.broker_error("record");
-                        tracing::error!(error = %e, task_id = %d.header.id,
-                            "giving up recording outcome; the message will be reclaimed and run again");
-                        break;
-                    }
-                }
+            if record_retrying(&*broker, &d, &rec, record_deadline, &metrics).await {
+                metrics.settled(&d.queue, &d.header.task, how, started.map(|s| s.elapsed()));
+                log_settled(&d, &rec);
             }
             sem.add_permits(1);
         });

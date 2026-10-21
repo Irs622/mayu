@@ -6,6 +6,7 @@ from . import _native
 from .handle import TaskHandle
 from .serializers import PICKLE, get_serializer
 from .task import Task, _enqueue
+from .workflow import Workflow
 
 _TASK_OPTIONS = frozenset({"name", "queue", "max_retries", "retry_on", "soft_time_limit", "hard_time_limit",
                            "threadsafe", "rate_limit", "resources"})
@@ -94,3 +95,7 @@ class App:
         if task is not None:
             return task.send(*args, countdown=countdown, eta=eta, queue=queue, link=link, **kwargs)
         return _enqueue(self, name, queue or self.default_queue, self.max_retries, args, kwargs, countdown, eta, link)
+
+    def workflow(self, name: str, *, ttl: float = 7 * 86400) -> Workflow:
+        """A builder for a DAG of tasks sent as one unit; its state expires ``ttl`` seconds after the last progress."""
+        return Workflow(self, name, ttl)

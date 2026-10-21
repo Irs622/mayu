@@ -280,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
                    type=str.upper, default=(os.environ.get("MAYU_LOG_LEVEL") or "INFO").upper())
     w.set_defaults(func=_cmd_worker)
 
-    i = sub.add_parser("inspect", help="show queue depths and live workers")
+    i = sub.add_parser("inspect", help="show queue depths, live workers and unfinished workflows")
     i.add_argument("app")
     i.add_argument("--queues", default=None, help="comma-separated; default: the app's queues and any found in Redis")
     i.add_argument("--json", action="store_true")

@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use mayu_core::{
-    Broker, Delivery, Error, Header, QueueStats, Reclaimed, Result, StoredResult, WorkerInfo, decode_header,
-    encode_delayed_member, encode_header, now_ms,
+    Broker, Delivery, Error, Header, NodeInfo, NodeState, QueueStats, Reclaimed, Result, StoredResult, WorkerInfo,
+    WorkflowSpec, WorkflowState, decode_header, encode_delayed_member, encode_header, now_ms,
 };
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::streams::StreamReadReply;
@@ -21,12 +21,50 @@ pub fn dead_key(q: &str) -> String { format!("mayu:{{{q}}}:dead") }
 pub fn result_key(id: &str) -> String { format!("mayu:result:{id}") }
 const WORKER_KEY_PREFIX: &str = "mayu:workers:";
 pub fn worker_key(id: &str) -> String { format!("{WORKER_KEY_PREFIX}{id}") }
+const WORKFLOW_KEY_PREFIX: &str = "mayu:wf:";
+pub fn workflow_key(id: &str) -> String { format!("{WORKFLOW_KEY_PREFIX}{id}") }
 
 fn queue_from_stream_key(k: &str) -> &str {
     k.strip_prefix("mayu:{").and_then(|s| s.strip_suffix("}:stream")).unwrap_or(k)
 }
 
 fn be(e: impl std::fmt::Display) -> Error { Error::Broker(e.to_string()) }
+
+/// Splits the metadata `HMGET` of a workflow hash into (node count, name, created_at, status).
+fn parse_workflow_meta(id: &str, meta: Vec<Option<String>>) -> Result<(usize, String, u64, String)> {
+    let [Some(nodes), Some(name), Some(created_at), Some(status)] = <[Option<String>; 4]>::try_from(meta)
+        .map_err(|_| be("malformed HMGET reply"))?
+    else {
+        return Err(be(format!("workflow {id} is missing its metadata")));
+    };
+    let bad = |what: &str| be(format!("workflow {id} has a malformed {what}"));
+    let count: usize = nodes.parse().map_err(|_| bad("node count"))?;
+    let created_at: u64 = created_at.parse().map_err(|_| bad("created_at"))?;
+    Ok((count, name, created_at, status))
+}
+
+/// Builds a `WorkflowState` from the per-node `HMGET` (id, task, queue, state for each of `count` nodes).
+fn parse_workflow_nodes(
+    id: &str, name: String, created_at: u64, cancelled: bool, count: usize, vals: &[Option<String>],
+) -> Result<WorkflowState> {
+    if vals.len() != count * 4 {
+        return Err(be(format!("workflow {id} has a malformed node list")));
+    }
+    let mut nodes = Vec::with_capacity(count);
+    for (i, f) in vals.chunks(4).enumerate() {
+        let [Some(task_id), Some(task), Some(queue), Some(state)] = f else {
+            return Err(be(format!("workflow {id} node {i} is missing fields")));
+        };
+        nodes.push(NodeInfo {
+            node: i.to_string(),
+            task_id: task_id.clone(),
+            task: task.clone(),
+            queue: queue.clone(),
+            state: NodeState::parse(state)?,
+        });
+    }
+    Ok(WorkflowState { id: id.to_string(), name, created_at, cancelled, nodes })
+}
 
 struct Scripts {
     ack: Script,
@@ -39,6 +77,9 @@ struct Scripts {
     prune: Script,
     fetch: Script,
     replay: Script,
+    submit: Script,
+    release: Script,
+    cancel: Script,
 }
 
 async fn manager(client: &redis::Client, response_timeout: Duration) -> Result<ConnectionManager> {
@@ -119,6 +160,9 @@ impl RedisBroker {
                 prune: Script::new(include_str!("lua/prune.lua")),
                 fetch: Script::new(include_str!("lua/fetch.lua")),
                 replay: Script::new(include_str!("lua/replay.lua")),
+                submit: Script::new(include_str!("lua/submit.lua")),
+                release: Script::new(include_str!("lua/release.lua")),
+                cancel: Script::new(include_str!("lua/cancel.lua")),
             },
         })
     }
@@ -129,10 +173,15 @@ impl RedisBroker {
             Some(r) => ("1", r.id, r.record, r.ttl_secs),
             None => ("0", String::new(), Vec::new(), 0),
         };
-        self.scripts.dead
-            .key(stream_key(queue)).key(dead_key(queue)).key(result_key(&id))
-            .arg(GROUP).arg(stream_id).arg(h).arg(p).arg(error).arg(flag).arg(record).arg(ttl)
-            .invoke_async::<i64>(&mut self.conn.clone()).await.map_err(be)?;
+        // A workflow node is marked dead in the same script; an undecodable header has none.
+        let header = decode_header(h).ok();
+        let node = header.as_ref().and_then(|h| h.workflow_id.as_deref().zip(h.node.as_deref()));
+        let mut inv = self.scripts.dead.prepare_invoke();
+        inv.key(stream_key(queue)).key(dead_key(queue)).key(result_key(&id));
+        if let Some((wf, _)) = node { inv.key(workflow_key(wf)); }
+        inv.arg(GROUP).arg(stream_id).arg(h).arg(p).arg(error).arg(flag).arg(record).arg(ttl);
+        if let Some((_, n)) = node { inv.arg(n); }
+        inv.invoke_async::<i64>(&mut self.conn.clone()).await.map_err(be)?;
         Ok(())
     }
 
@@ -280,7 +329,13 @@ impl RedisBroker {
         let mut inv = self.scripts.replay.prepare_invoke();
         inv.key(dead_key(queue)).key(stream_key(queue));
         for (_, h, _) in &picked { inv.key(result_key(&h.id)); }
-        for (id, h, p) in &picked { inv.arg(id).arg(encode_header(h)).arg(p); }
+        for (_, h, _) in &picked {
+            if let (Some(wf), Some(_)) = (&h.workflow_id, &h.node) { inv.key(workflow_key(wf)); }
+        }
+        for (id, h, p) in &picked {
+            let node = if h.workflow_id.is_some() { h.node.as_deref().unwrap_or("") } else { "" };
+            inv.arg(id).arg(encode_header(h)).arg(p).arg(node);
+        }
         inv.invoke_async::<usize>(&mut self.conn.clone()).await.map_err(be)
     }
 
@@ -310,6 +365,48 @@ impl RedisBroker {
             }
         }
         Ok(out)
+    }
+
+    /// Workflows that have a hash in Redis, oldest first. Skips ones that expire mid-scan and ones whose hash
+    /// is malformed (with a warning), so one bad key can't break the listing.
+    pub async fn workflows(&self) -> Result<Vec<WorkflowState>> {
+        let mut out = Vec::new();
+        for key in self.scan_keys(&format!("{WORKFLOW_KEY_PREFIX}*")).await? {
+            let id = key.strip_prefix(WORKFLOW_KEY_PREFIX).unwrap_or(&key);
+            match self.read_workflow(id).await? {
+                Some(Ok(w)) => out.push(w),
+                Some(Err(e)) => tracing::warn!(key = %key, error = %e, "skipping a malformed workflow hash"),
+                None => {}
+            }
+        }
+        out.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        Ok(out)
+    }
+
+    /// Reads one workflow. The outer error is a Redis failure; the inner one means the hash is malformed.
+    async fn read_workflow(&self, id: &str) -> Result<Option<Result<WorkflowState>>> {
+        let key = workflow_key(id);
+        let mut c = self.conn.clone();
+        let meta: Vec<Option<String>> = redis::cmd("HMGET").arg(&key)
+            .arg("nodes").arg("name").arg("created_at").arg("status")
+            .query_async(&mut c).await.map_err(be)?;
+        if meta.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        let (count, name, created_at, status) = match parse_workflow_meta(id, meta) {
+            Ok(m) => m,
+            Err(e) => return Ok(Some(Err(e))),
+        };
+        let mut cmd = redis::cmd("HMGET");
+        cmd.arg(&key);
+        for i in 0..count {
+            cmd.arg(format!("n:{i}:id")).arg(format!("n:{i}:t")).arg(format!("n:{i}:q")).arg(format!("n:{i}:s"));
+        }
+        let vals: Vec<Option<String>> = cmd.query_async(&mut c).await.map_err(be)?;
+        if vals.len() == count * 4 && vals.iter().all(Option::is_none) {
+            return Ok(None); // expired between the two reads
+        }
+        Ok(Some(parse_workflow_nodes(id, name, created_at, status == "cancelled", count, &vals)))
     }
 
     /// Queues that have a stream, delayed set or dead stream in Redis, sorted.
@@ -475,6 +572,25 @@ impl Broker for RedisBroker {
             Some(r) => ("1", r.id, r.record, r.ttl_secs),
             None => ("0", String::new(), Vec::new(), 0),
         };
+        if let Some(wf) = &d.header.workflow_id {
+            if !follow_ups.is_empty() {
+                return Err(be("a workflow node can't have link follow-ups"));
+            }
+            let node = d.header.node.as_deref().and_then(|n| n.parse::<usize>().ok()).ok_or_else(|| {
+                be(format!("task {} has a workflow id but no valid node", d.header.id))
+            })?;
+            let released = self.scripts.release
+                .key(stream_key(&d.queue)).key(result_key(&id)).key(workflow_key(wf))
+                .arg(GROUP).arg(&d.stream_id).arg(flag).arg(record).arg(ttl).arg(node)
+                .invoke_async::<i64>(&mut self.conn.clone()).await.map_err(be)?;
+            if released < 0 {
+                tracing::warn!(
+                    task_id = %d.header.id, workflow_id = %wf,
+                    "workflow state is gone (expired?); acked without releasing its children"
+                );
+            }
+            return Ok(());
+        }
         let mut inv = self.scripts.ack.prepare_invoke();
         inv.key(stream_key(&d.queue)).key(result_key(&id));
         for (h, _) in follow_ups { inv.key(stream_key(&h.queue)); }
@@ -588,5 +704,69 @@ impl Broker for RedisBroker {
             .key(stream_key(queue))
             .arg(GROUP).arg(min_idle_ms).arg(WORKER_KEY_PREFIX)
             .invoke_async(&mut self.conn.clone()).await.map_err(be)
+    }
+
+    async fn submit_workflow(&self, wf: &WorkflowSpec) -> Result<()> {
+        wf.validate()?;
+        let children = wf.children();
+        let mut fields: Vec<(String, Vec<u8>)> = vec![
+            ("name".into(), wf.name.clone().into_bytes()),
+            ("created_at".into(), now_ms().to_string().into_bytes()),
+            ("ttl".into(), wf.ttl_secs.to_string().into_bytes()),
+            ("status".into(), b"running".to_vec()),
+            ("nodes".into(), wf.nodes.len().to_string().into_bytes()),
+            ("done".into(), b"0".to_vec()),
+        ];
+        let list = |ids: &mut dyn Iterator<Item = usize>| {
+            ids.map(|i| i.to_string()).collect::<Vec<_>>().join(",").into_bytes()
+        };
+        let mut roots = Vec::new();
+        for (i, (n, down)) in wf.nodes.iter().zip(&children).enumerate() {
+            let root = n.parents.is_empty();
+            let h = encode_header(&n.header);
+            fields.push((format!("n:{i}:id"), n.header.id.clone().into_bytes()));
+            fields.push((format!("n:{i}:t"), n.header.task.clone().into_bytes()));
+            fields.push((format!("n:{i}:q"), n.header.queue.clone().into_bytes()));
+            fields.push((format!("n:{i}:s"), if root { b"queued".to_vec() } else { b"waiting".to_vec() }));
+            fields.push((format!("n:{i}:up"), list(&mut n.parents.iter().copied())));
+            fields.push((format!("n:{i}:down"), list(&mut down.iter().copied())));
+            if root {
+                roots.push((stream_key(&n.header.queue), h, &n.payload));
+            } else {
+                fields.push((format!("n:{i}:h"), h));
+                fields.push((format!("n:{i}:b"), n.payload.clone()));
+            }
+        }
+        let mut inv = self.scripts.submit.prepare_invoke();
+        inv.key(workflow_key(&wf.id));
+        for (k, _, _) in &roots { inv.key(k); }
+        inv.arg(wf.ttl_secs).arg(fields.len());
+        for (k, v) in &fields { inv.arg(k).arg(v); }
+        for (_, h, p) in &roots { inv.arg(h).arg(*p); }
+        let created: i64 = inv.invoke_async(&mut self.conn.clone()).await.map_err(be)?;
+        if created == 0 {
+            return Err(Error::Broker(format!("workflow {} already exists", wf.id)));
+        }
+        Ok(())
+    }
+
+    async fn workflow(&self, id: &str) -> Result<Option<WorkflowState>> {
+        self.read_workflow(id).await?.transpose()
+    }
+
+    async fn cancel_workflow(&self, id: &str) -> Result<bool> {
+        let r: i64 = self.scripts.cancel.key(workflow_key(id))
+            .invoke_async(&mut self.conn.clone()).await.map_err(be)?;
+        Ok(r == 1)
+    }
+
+    async fn cancelled_workflows(&self, ids: &[String]) -> Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pipe = redis::pipe();
+        for id in ids { pipe.cmd("HGET").arg(workflow_key(id)).arg("status"); }
+        let statuses: Vec<Option<String>> = pipe.query_async(&mut self.conn.clone()).await.map_err(be)?;
+        Ok(ids.iter().zip(statuses).filter(|(_, s)| s.as_deref() == Some("cancelled")).map(|(id, _)| id.clone()).collect())
     }
 }

@@ -9,6 +9,7 @@ use tokio::sync::Notify;
 use crate::broker::{Broker, Delivery, QueueStats, Reclaimed, StoredResult, WorkerInfo};
 use crate::envelope::{Header, decode_header, encode_header, now_ms};
 use crate::error::{Error, Result};
+use crate::workflow::{NodeInfo, NodeState, WorkflowSpec, WorkflowState};
 
 #[derive(Debug, Clone)]
 pub struct DeadEntry {
@@ -35,6 +36,26 @@ struct Pending {
 /// (eta ms, header, payload)
 type DelayedEntry = (u64, Vec<u8>, Vec<u8>);
 
+struct MemNode {
+    task_id: String,
+    task: String,
+    queue: String,
+    state: NodeState,
+    parents: Vec<usize>,
+    children: Vec<usize>,
+    /// Encoded header and payload of a non-root node, enqueued when its parents are done.
+    held: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+struct MemWorkflow {
+    name: String,
+    created_at: u64,
+    cancelled: bool,
+    /// Nodes in state `Done`; `cancel_workflow` is a no-op once it reaches the node count.
+    done: usize,
+    nodes: Vec<MemNode>,
+}
+
 #[derive(Default)]
 struct State {
     seq: u64,
@@ -44,6 +65,7 @@ struct State {
     dead: Vec<DeadEntry>,
     results: HashMap<String, Vec<u8>>,
     workers: HashMap<String, (WorkerInfo, Instant)>,
+    workflows: HashMap<String, MemWorkflow>,
 }
 
 impl State {
@@ -55,6 +77,48 @@ impl State {
 
     fn bury(&mut self, queue: &str, error: String) {
         self.dead.push(DeadEntry { queue: queue.to_string(), header: None, error });
+    }
+
+    /// Marks node `i` done and enqueues the children it was the last missing parent of. Does
+    /// nothing for a node already done or cancelled, so a duplicate run releases nothing, and in
+    /// a cancelled workflow it marks the node cancelled instead. False when nothing was enqueued.
+    /// An expired (unknown) workflow releases nothing, like `release.lua` finding no hash.
+    fn release(&mut self, wf_id: &str, i: usize) -> Result<bool> {
+        let Some(wf) = self.workflows.get_mut(wf_id) else { return Ok(false) };
+        let Some(state) = wf.nodes.get(i).map(|n| n.state) else {
+            return Err(Error::Broker(format!("workflow {wf_id} has no node {i}")));
+        };
+        if matches!(state, NodeState::Done | NodeState::Cancelled) {
+            return Ok(false);
+        }
+        if wf.cancelled {
+            wf.nodes[i].state = NodeState::Cancelled;
+            return Ok(false);
+        }
+        let mut ready = Vec::new();
+        for &c in &wf.nodes[i].children {
+            let child = &wf.nodes[c];
+            let parents_done = child.parents.iter().all(|&p| p == i || wf.nodes[p].state == NodeState::Done);
+            if child.state == NodeState::Waiting && parents_done {
+                if child.held.is_none() {
+                    return Err(Error::Broker(format!("workflow {wf_id} node {c} has no stored task")));
+                }
+                ready.push(c);
+            }
+        }
+        wf.nodes[i].state = NodeState::Done;
+        wf.done += 1;
+        let mut out = Vec::new();
+        for c in ready {
+            let child = &mut wf.nodes[c];
+            child.state = NodeState::Queued;
+            out.extend(child.held.take().map(|(h, p)| (child.queue.clone(), h, p)));
+        }
+        let released = !out.is_empty();
+        for (q, h, p) in out {
+            self.push_stream(&q, h, p);
+        }
+        Ok(released)
     }
 
     fn take(&mut self, queues: &[String], count: usize, consumer: &str) -> Vec<Delivery> {
@@ -94,6 +158,7 @@ pub struct MemoryBroker {
     notify: Arc<Notify>,
     failing: Arc<AtomicBool>,
     fail_retries: Arc<AtomicBool>,
+    fail_cancelled: Arc<AtomicBool>,
     fetch_extra: Arc<AtomicUsize>,
     record_delay_ns: Arc<AtomicU64>,
     consumer: String,
@@ -114,6 +179,11 @@ impl MemoryBroker {
     /// broker that rejects deferring a task.
     pub fn fail_retries(&self, on: bool) {
         self.fail_retries.store(on, Ordering::SeqCst);
+    }
+
+    /// Test aid: while set, only `cancelled_workflows` fails.
+    pub fn fail_cancelled_checks(&self, on: bool) {
+        self.fail_cancelled.store(on, Ordering::SeqCst);
     }
 
     /// Test aid: lets `fetch` return up to `n` entries beyond the requested `count`, like a
@@ -179,6 +249,14 @@ impl MemoryBroker {
         s.workers.get(id).filter(|(_, expires)| *expires > Instant::now()).map(|(w, _)| w.clone())
     }
 
+    /// The workflow id and node index of a delivery, if it is a workflow node.
+    fn workflow_node(d: &Delivery) -> Result<Option<(&str, usize)>> {
+        let Some(wf) = d.header.workflow_id.as_deref() else { return Ok(None) };
+        d.header.node.as_deref().and_then(|n| n.parse().ok()).map(|i| Some((wf, i))).ok_or_else(|| {
+            Error::Broker(format!("task {} has a workflow id but no valid node", d.header.id))
+        })
+    }
+
     fn store(s: &mut State, r: Option<StoredResult>) {
         if let Some(r) = r { s.results.insert(r.id, r.record); }
     }
@@ -209,8 +287,17 @@ impl Broker for MemoryBroker {
     async fn ack(&self, d: &Delivery, result: Option<StoredResult>, follow_ups: &[(Header, Vec<u8>)]) -> Result<()> {
         self.record_delay().await;
         self.check()?;
-        let acked = {
+        let node = Self::workflow_node(d)?;
+        if node.is_some() && !follow_ups.is_empty() {
+            return Err(Error::Broker("a workflow node can't have link follow-ups".into()));
+        }
+        let wake = {
             let mut s = self.state.lock().unwrap();
+            // First, because it is the only step that can fail and nothing has changed yet.
+            let released = match node {
+                Some((wf, i)) => s.release(wf, i)?,
+                None => false,
+            };
             let acked = s.pending.remove(&d.stream_id).is_some();
             Self::store(&mut s, result);
             if acked {
@@ -218,9 +305,9 @@ impl Broker for MemoryBroker {
                     s.push_stream(&h.queue, encode_header(h), p.clone());
                 }
             }
-            acked
+            released || (acked && !follow_ups.is_empty())
         };
-        if acked && !follow_ups.is_empty() {
+        if wake {
             self.notify.notify_waiters();
         }
         Ok(())
@@ -246,6 +333,12 @@ impl Broker for MemoryBroker {
         s.pending.remove(&d.stream_id);
         s.dead.push(DeadEntry { queue: d.queue.clone(), header: Some(d.header.clone()), error: error.into() });
         Self::store(&mut s, result);
+        if let Ok(Some((wf, i))) = Self::workflow_node(d)
+            && let Some(n) = s.workflows.get_mut(wf).and_then(|w| w.nodes.get_mut(i))
+            && n.state != NodeState::Done
+        {
+            n.state = NodeState::Dead;
+        }
         Ok(())
     }
 
@@ -359,6 +452,88 @@ impl Broker for MemoryBroker {
     async fn prune_consumers(&self, _queue: &str, _min_idle_ms: u64) -> Result<usize> {
         self.check()?;
         Ok(0)
+    }
+
+    async fn submit_workflow(&self, wf: &WorkflowSpec) -> Result<()> {
+        self.check()?;
+        wf.validate()?;
+        {
+            let mut s = self.state.lock().unwrap();
+            if s.workflows.contains_key(&wf.id) {
+                return Err(Error::Broker(format!("workflow {} already exists", wf.id)));
+            }
+            let children = wf.children();
+            let mut nodes = Vec::with_capacity(wf.nodes.len());
+            let mut roots = Vec::new();
+            for (n, children) in wf.nodes.iter().zip(children) {
+                let h = encode_header(&n.header);
+                let root = n.parents.is_empty();
+                let held = if root { None } else { Some((h.clone(), n.payload.clone())) };
+                if root {
+                    roots.push((n.header.queue.clone(), h, n.payload.clone()));
+                }
+                nodes.push(MemNode {
+                    task_id: n.header.id.clone(),
+                    task: n.header.task.clone(),
+                    queue: n.header.queue.clone(),
+                    state: if root { NodeState::Queued } else { NodeState::Waiting },
+                    parents: n.parents.clone(),
+                    children,
+                    held,
+                });
+            }
+            for (q, h, p) in roots {
+                s.push_stream(&q, h, p);
+            }
+            s.workflows.insert(wf.id.clone(), MemWorkflow {
+                name: wf.name.clone(),
+                created_at: now_ms(),
+                cancelled: false,
+                done: 0,
+                nodes,
+            });
+        }
+        self.notify.notify_waiters();
+        Ok(())
+    }
+
+    async fn workflow(&self, id: &str) -> Result<Option<WorkflowState>> {
+        self.check()?;
+        let s = self.state.lock().unwrap();
+        Ok(s.workflows.get(id).map(|w| WorkflowState {
+            id: id.to_string(),
+            name: w.name.clone(),
+            created_at: w.created_at,
+            cancelled: w.cancelled,
+            nodes: w.nodes.iter().enumerate().map(|(i, n)| NodeInfo {
+                node: i.to_string(),
+                task_id: n.task_id.clone(),
+                task: n.task.clone(),
+                queue: n.queue.clone(),
+                state: n.state,
+            }).collect(),
+        }))
+    }
+
+    async fn cancel_workflow(&self, id: &str) -> Result<bool> {
+        self.check()?;
+        let mut s = self.state.lock().unwrap();
+        match s.workflows.get_mut(id) {
+            Some(w) if w.done < w.nodes.len() => {
+                w.cancelled = true;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn cancelled_workflows(&self, ids: &[String]) -> Result<Vec<String>> {
+        self.check()?;
+        if self.fail_cancelled.load(Ordering::SeqCst) {
+            return Err(Error::Broker("injected cancelled-check failure".into()));
+        }
+        let s = self.state.lock().unwrap();
+        Ok(ids.iter().filter(|id| s.workflows.get(*id).is_some_and(|w| w.cancelled)).cloned().collect())
     }
 }
 

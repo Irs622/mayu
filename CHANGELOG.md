@@ -10,6 +10,12 @@ All notable changes to mayu are documented here. The format follows
 
 - `app.declare` / `task.implement` and `app.send(name, ...)` to enqueue tasks without importing their code; workers serve only queues whose tasks they implement.
 - Resource admission: `resources={"gpu": 0.3}` on tasks, `--resources` on workers, `--gpus` for one worker process per GPU, and `mayu_resource_capacity` / `mayu_resource_in_use` gauges.
+- Workflows: `app.workflow()` builds a DAG of tasks (`wf.add(sig, after=[...])`) that `send()` submits atomically; each node's ack releases the children whose parents are all done. `WorkflowHandle` has `status()`, `wait()` and `cancel()`, a dead-lettered node blocks its descendants until `mayu dead replay`, `mayu inspect` lists unfinished workflows, and skipped nodes count as `outcome="cancelled"` in `mayu_tasks_settled_total`.
+
+### Changed
+
+- `Signature` arguments are checked when used (at `send()` for `link=`, at `wf.add()` for workflows), not in `task.s()`.
+- The envelope header gains optional `workflow_id` and `node` fields. Old workers ignore them but can't release workflow children: upgrade workers before submitting workflows.
 
 ## [0.1.0] - 2026-10-12
 
