@@ -1,4 +1,4 @@
-"""Render bench/results/*.jsonl as markdown: python bench/report.py FILE > bench/RESULTS.md"""
+"""Render bench/results/*.jsonl as markdown: python bench/report.py FILE [MIXED_FILE] > bench/RESULTS.md"""
 import json
 import os
 import pathlib
@@ -20,6 +20,7 @@ METHOD = """\
 - Every system runs at concurrency 64 with its defaults; only results and retries are off. Delivery semantics
   differ: Celery acknowledges a task before running it by default, mayu after it finishes.
 - mayu thread mode runs on free-threaded CPython 3.14t; everything else runs on CPython 3.14 with the GIL.
+- mayu is a release build (`maturin develop --release`).
 - Memory is the peak over the run of the whole worker process tree, sampled every 250 ms. PSS shares pages
   fairly between forked children; RSS counts shared pages once per process.
 - RQ runs `SimpleWorker` processes. Its default worker forks a work horse per job and reconnects to Redis each
@@ -32,7 +33,50 @@ def _median(rows, key):
     return statistics.median(r[key] for r in rows)
 
 
-def render(records, machine) -> str:
+MIXED_DESCRIPTION = """\
+One 3.14t producer pre-fills the queue, then three worker groups start at the same moment: 3.14t in thread mode,
+3.14 and 3.13 (both with the GIL) in process mode. Completions are read from each worker's `/metrics`. Groups on
+a shared queue split the tasks by whichever reader is blocked when a task arrives, so the queue is pre-filled
+to keep every group busy; the routed layout gives each group its own queue and an equal share of the tasks.
+"""
+
+
+def _mixed_section(mixed) -> list:
+    """Per layout: tasks/s (share of tasks) per worker group, then peak memory, medians over the repeats."""
+    out = ["## Mixed Python versions", "", MIXED_DESCRIPTION]
+    for layout in ("shared", "routed"):
+        runs = {wl: [r for r in mixed if r["layout"] == layout and r["workload"] == wl]
+                for wl in ("noop", "realistic")}
+        runs = {wl: rows for wl, rows in runs.items() if rows}
+        if not runs:
+            continue
+        names = {}  # group name -> its first record, in the order the groups first appear; absent groups get no column
+        for rows in runs.values():
+            for r in rows:
+                for g in r["groups"]:
+                    names.setdefault(g["name"], g)
+        out += ["### Shared queue" if layout == "shared" else "### Queue per group", "",
+                *[f"- {n}: Python {g['python']}, {g['layout']}" for n, g in names.items()], "",
+                "| workload | " + " | ".join(names) + " | total tasks/s |",
+                "|---|" + "---:|" * (len(names) + 1)]
+        memory = []
+        for wl, rows in runs.items():
+            cells, mem = [], []
+            for n in names:
+                gs = [g for r in rows for g in r["groups"] if g["name"] == n]
+                if not gs:
+                    cells.append("—")
+                    mem.append("—")
+                    continue
+                cells.append(f"{_median(gs, 'rate'):.0f} ({_median(gs, 'share'):.0f} %)")
+                mem.append(f"{_median(gs, 'peak_pss_mb'):.0f} / {_median(gs, 'peak_rss_mb'):.0f}")
+            out.append(f"| {wl} | " + " | ".join(cells) + f" | {_median(rows, 'rate'):.0f} |")
+            memory.append(f"| peak PSS / RSS MB, {wl} | " + " | ".join(mem) + " | |")
+        out += [*memory, ""]
+    return out
+
+
+def render(records, machine, mixed=()) -> str:
     groups = {}
     for r in records:
         groups.setdefault((r["workload"], r["system"]), []).append(r)
@@ -62,6 +106,8 @@ def render(records, machine) -> str:
                 f"- mayu, {mt[0]['layout']}: **{m:.0f} MB**",
                 f"- Celery, {ce[0]['layout']}: **{c:.0f} MB**",
                 f"- Celery uses {c / m:.1f}× the memory of mayu.", ""]
+    if mixed:
+        out += _mixed_section(mixed)
     return "\n".join(out)
 
 
@@ -79,11 +125,15 @@ def _machine() -> dict:
     return {"cpu": cpu, "cores": os.cpu_count(), "redis": ver}
 
 
+def _load(path) -> list:
+    return [json.loads(line) for line in pathlib.Path(path).read_text().splitlines() if line.strip()]
+
+
 def main(argv=None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-    records = [json.loads(line) for line in pathlib.Path(argv[0]).read_text().splitlines() if line.strip()]
-    print(render(records, _machine()))
+    records = _load(argv[0])
+    print(render(records, _machine(), _load(argv[1]) if len(argv) > 1 else ()))
     return 0
 
 
