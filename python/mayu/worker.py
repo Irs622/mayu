@@ -94,6 +94,9 @@ class WorkerRunner:
                     raise ValueError(f"queue {q!r} has tasks declared but not implemented in this process: "
                                      f"{', '.join(stubs)}; import their implementations or don't serve that queue")
         self.queues = list(queues or app.queues(implemented=True))
+        if not self.queues:
+            raise ValueError("no queue to serve: every queue has tasks declared but not implemented in this process; "
+                             "import their implementations or pass queues")
         self.strict_priority = bool(queues)  # only a non-empty explicit list is a priority order
         self.prefetch_multiplier = prefetch_multiplier
         self.shutdown_grace = shutdown_grace

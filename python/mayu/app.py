@@ -42,8 +42,11 @@ class App:
 
     def queues(self, *, implemented: bool = False) -> list[str]:
         """Every queue the app uses, or with ``implemented=True`` only those whose tasks this process can run."""
-        tasks = [t for t in self.registry.values() if t.implemented or not implemented]
-        return sorted({self.default_queue, *(t.queue for t in tasks)})
+        if not implemented:
+            return sorted({self.default_queue, *(t.queue for t in self.registry.values())})
+        # A queue holding a stub belongs to the workers that implement it, the default queue included.
+        stubbed = {t.queue for t in self.registry.values() if not t.implemented}
+        return sorted({self.default_queue, *(t.queue for t in self.registry.values() if t.implemented)} - stubbed)
 
     def task(self, fn=None, /, *, name: str | None = None, queue: str | None = None,
              max_retries: int | None = None, retry_on=(),

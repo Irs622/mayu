@@ -162,14 +162,15 @@ def _(text: str, *, normalize: bool = True):
     return model.encode(text, normalize=normalize)
 
 embed.send("hello")                     # producer: arguments are checked against the declaration
-app.send("ml.embed", "hello")           # or enqueue by name alone, with no registration and no checking
+app.send("ml.embed", "hello")           # by name: checked if registered here, sent as-is if not
 ```
 
 `implement` must match the declaration's parameter names, kinds and defaults (annotations are ignored)
 and returns the task. Calling a declared task that isn't implemented raises `TypeError`.
 
-A worker without `--queues` serves only the queues whose tasks it can run. With `--queues`, naming a
-queue that has an unimplemented task is an error (`mayu: queue 'gpu' has tasks declared but not
+A worker without `--queues` serves only queues where it implements every task (the default queue
+included), so it never takes work meant for another worker. With `--queues`, naming a queue that has
+an unimplemented task is an error (`mayu: queue 'gpu' has tasks declared but not
 implemented in this process: ...`, exit 2). If a delivery for an unimplemented task still arrives, it
 fails with "not implemented" instead of running the stub.
 

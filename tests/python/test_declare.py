@@ -248,3 +248,26 @@ def test_worker_refuses_explicit_queue_with_unimplemented_tasks(app, queue):
     with pytest.raises(ValueError, match=rf"queue '{gpu}' has tasks declared but not implemented.*decl\.a, decl\.b"):
         WorkerRunner(worker, threads=1, queues=[gpu])
     WorkerRunner(worker, threads=1, queues=[queue])
+
+
+def test_default_queue_with_declared_only_task_is_not_served_by_default(app, queue):
+    worker = _worker_app(app)
+
+    @worker.declare(name="decl.default_stub")
+    def stub(): ...
+
+    @worker.task(name="decl.other", queue=f"{queue}-cpu")
+    def other(): ...
+
+    assert worker.queues(implemented=True) == [f"{queue}-cpu"]
+    assert WorkerRunner(worker, threads=1).queues == [f"{queue}-cpu"]
+
+
+def test_worker_with_only_declarations_refuses_to_start(app):
+    worker = _worker_app(app)
+
+    @worker.declare(name="decl.only")
+    def only(): ...
+
+    with pytest.raises(ValueError, match="no queue to serve"):
+        WorkerRunner(worker, threads=1)
