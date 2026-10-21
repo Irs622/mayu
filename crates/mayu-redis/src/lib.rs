@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use mayu_core::{
-    Broker, Delivery, Error, Header, QueueStats, Reclaimed, Result, StoredResult, WorkerInfo, decode_header,
-    encode_delayed_member, encode_header, now_ms,
+    Broker, Delivery, Error, Header, QueueStats, Reclaimed, Result, StoredResult, WorkerInfo, WorkflowSpec,
+    WorkflowState, decode_header, encode_delayed_member, encode_header, now_ms,
 };
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::streams::StreamReadReply;
@@ -588,5 +588,22 @@ impl Broker for RedisBroker {
             .key(stream_key(queue))
             .arg(GROUP).arg(min_idle_ms).arg(WORKER_KEY_PREFIX)
             .invoke_async(&mut self.conn.clone()).await.map_err(be)
+    }
+
+    // Replaced by the workflow scripts in the next task.
+    async fn submit_workflow(&self, _wf: &WorkflowSpec) -> Result<()> {
+        Err(Error::Broker("workflows not implemented".into()))
+    }
+
+    async fn workflow(&self, _id: &str) -> Result<Option<WorkflowState>> {
+        Err(Error::Broker("workflows not implemented".into()))
+    }
+
+    async fn cancel_workflow(&self, _id: &str) -> Result<bool> {
+        Err(Error::Broker("workflows not implemented".into()))
+    }
+
+    async fn cancelled_workflows(&self, _ids: &[String]) -> Result<Vec<String>> {
+        Err(Error::Broker("workflows not implemented".into()))
     }
 }

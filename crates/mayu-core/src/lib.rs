@@ -8,6 +8,7 @@ pub mod metrics;
 pub mod policy;
 pub mod result;
 pub mod runtime;
+pub mod workflow;
 
 pub use broker::{Broker, Delivery, QueueStats, Reclaimed, StoredResult, WorkerInfo};
 pub use dispatch::{Admit, Dispatcher, HOLD_HORIZON, RESERVE_AFTER, Resources};
@@ -20,3 +21,4 @@ pub use metrics::{DURATION_BUCKETS, Gauges, Metrics, Settled};
 pub use policy::{Action, Link, Outcome, RetryPolicy, backoff_ms, decide, full_jitter};
 pub use result::{ResultRecord, wait_result};
 pub use runtime::{ReadyTask, Runtime, RuntimeConfig};
+pub use workflow::{NodeInfo, NodeState, WorkflowNode, WorkflowSpec, WorkflowState, WorkflowSummary};
