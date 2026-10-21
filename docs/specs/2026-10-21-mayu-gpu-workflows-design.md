@@ -201,6 +201,9 @@ mayu worker app:app --pools gemma=1,tts=1 --pool-mode lazy --resources gpu=1,vra
   - a task whose model is loaded beats one that would force a swap;
   - older workflows go first (each video finishes as early as possible);
   - wait aging bounds every preference, so a stream of same-model tasks can't starve others.
+- The weights are a worker option (`--schedule throughput|oldest`): `throughput` lets the resident bonus
+  dominate (fewest model swaps, for batch and single-user setups), `oldest` lets workflow age dominate
+  (each workflow finishes as early as possible). Per-tenant fair share belongs with hosting (§9).
 - Example: video A's encode runs; video B's agents finish. When A's encode ends, B's encode (encoder
   loaded) runs before A's voicing (needs a swap); then both videos are voiced on one TTS load.
 - Optional `linger=` keeps an idle model loaded when the workflow DAG shows more of its tasks pending
