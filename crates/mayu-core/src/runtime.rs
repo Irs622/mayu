@@ -8,7 +8,7 @@ use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 
-use crate::dispatch::{Admit, Dispatcher, ReadyQueue};
+use crate::dispatch::{Admit, Dispatcher, ReadyQueue, Resources};
 use crate::broker::{Broker, Delivery, StoredResult, WorkerInfo};
 use crate::envelope::{Header, now_ms};
 use crate::error::{Error, Result};
@@ -41,6 +41,8 @@ pub struct RuntimeConfig {
     pub strict_priority: bool,
     /// Task name -> starts per second, per worker process.
     pub rate_limits: HashMap<String, f64>,
+    /// What this worker process has and what its tasks use; a task starts only when its request fits.
+    pub resources: Resources,
     /// Serve Prometheus metrics here (`GET /metrics`). Port 0 picks a free port.
     pub metrics_addr: Option<SocketAddr>,
 }
@@ -62,6 +64,7 @@ impl Default for RuntimeConfig {
             max_deliveries: 5,
             strict_priority: false,
             rate_limits: HashMap::new(),
+            resources: Resources::default(),
             metrics_addr: None,
         }
     }
@@ -145,7 +148,7 @@ impl<B: Broker> Runtime<B> {
         if cfg.visibility_timeout_ms == 0 || cfg.reclaim_interval_ms == 0 || cfg.heartbeat_interval_ms == 0 {
             return Err(Error::Config("visibility, reclaim and heartbeat intervals must be > 0".into()));
         }
-        let dispatcher = Dispatcher::new(&cfg.queues, cfg.strict_priority, &cfg.rate_limits)?;
+        let dispatcher = Dispatcher::new(&cfg.queues, cfg.strict_priority, &cfg.rate_limits, &cfg.resources)?;
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("mayu-rt")
@@ -263,6 +266,7 @@ impl<B: Broker> Runtime<B> {
     pub fn recv_timeout(&self, timeout: Duration) -> Option<ReadyTask> {
         let task = self.ready.recv_timeout(timeout)?;
         if *self.stop_tx.borrow() {
+            self.ready.release(task.token);
             // Fetched by a read that was already in flight when fetching stopped: don't start new
             // work while stopping; give it back to the queue (as `shutdown` does for the rest).
             let f = self.inflight.lock().unwrap().remove(&task.token);
@@ -281,6 +285,8 @@ impl<B: Broker> Runtime<B> {
     }
 
     pub fn complete(&self, token: u64, outcome: Outcome) {
+        // Before the outcome is sent: the code has stopped running, so its resources are free now.
+        self.ready.release(token);
         if let Some(tx) = self.complete_tx.read().unwrap().as_ref() {
             let _ = tx.send((token, outcome));
         }
