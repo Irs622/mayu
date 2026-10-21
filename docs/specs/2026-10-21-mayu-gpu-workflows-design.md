@@ -29,7 +29,7 @@ never wait on GPU capacity.
 ### Goals
 
 1. Enqueue a task without importing its implementation (a web API must not import torch).
-2. Run on Python 3.11 and 3.12 (ML stacks pin older interpreters).
+2. Run stages with different dependency stacks in separate envs, without lowering mayu's 3.13+ floor.
 3. Admit tasks by declared resource use (`gpu`, `vram_gb`, `cpu`, user-defined), so tasks that each
    under-use a GPU run concurrently and tasks that don't fit wait.
 4. Workflows: a DAG of tasks where a node is enqueued only when all of its parents succeeded.
@@ -78,10 +78,18 @@ def _(out_dir):
 
 No wire change.
 
-## 4. Python 3.11 and 3.12 (Plan 9)
+## 4. Environments (no plan: dropped)
 
-Lower `requires-python` to `>=3.11`, add `py311`/`py312` legs to `scripts/matrix.sh` and CI, build
-wheels for them. These are GIL builds: process mode by default, thread mode by `--mode thread`.
+mayu stays on 3.13+ and is built for 3.14t; it does not add 3.11/3.12 support. A stage with a heavy ML
+stack runs in its own env with its own worker on its own queue, which already works:
+
+- Orchestration and CPU stages: 3.14t, thread mode.
+- GPU stages: whatever Python the ML stack supports among 3.13/3.14 GIL builds, run with `--mode thread`
+  (one process owns the GPU; its tasks are GPU- or subprocess-bound, so the GIL costs little).
+
+Stages that should share a GPU (and its ledger, §5) belong in the same GPU env. Checked for the driving
+example: its TTS stack (torch 2.8) and renderer (manimgl) both install on 3.13; the orchestration stack is
+GIL-free on 3.14t.
 
 ## 5. Resource admission (Plan 10)
 
@@ -171,8 +179,8 @@ key layout.
 
 | # | Plan | Depends on | Needs measurement |
 |---|---|---|---|
-| 8 | Declarations, `implement`, send by name | — | no |
-| 9 | Python 3.11 / 3.12 | — | no |
+| 8 | Declarations, `implement`, send by name (done) | — | no |
+| ~~9~~ | ~~Python 3.11 / 3.12~~: dropped, see §4 | | |
 | 10 | Resource admission, `--resources`, `--gpus`, capacity requeue | — | defaults only |
 | 11 | Workflows (DAG) | — | no |
 | 12 | Resident models, residency-aware scoring, `cost=` | 10, 11 | yes: load times, VRAM |
