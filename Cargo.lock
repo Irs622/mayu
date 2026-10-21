@@ -476,6 +476,7 @@ dependencies = [
  "mayu-core",
  "redis",
  "tokio",
+ "tracing",
  "ulid",
 ]
 

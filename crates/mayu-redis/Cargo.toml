@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 mayu-core = { workspace = true }
 redis = { workspace = true }
+tracing = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
