@@ -8,6 +8,7 @@ import time
 import traceback
 
 from . import _native, otel
+from . import thp as thp_mod
 from .exceptions import DiscardInstance, Retry, SoftTimeLimitExceeded, TimeLimitExceeded
 from .limits import TimeLimits
 from .pool import PoolContext, check_pool_name
@@ -105,7 +106,8 @@ class WorkerRunner:
                  max_deliveries: int = 5, max_zombie_threads: int = 4,
                  max_tasks_per_process: int | None = None, max_memory_per_process: float | None = None,
                  metrics_port: int | None = None, metrics_host: str = "0.0.0.0",
-                 resources: dict[str, float] | None = None, pools: dict[str, int] | None = None):
+                 resources: dict[str, float] | None = None, pools: dict[str, int] | None = None,
+                 thp: str = "python"):
         if threads < 1:
             raise ValueError("threads must be >= 1")
         if visibility_timeout <= 0 or heartbeat_interval <= 0:
@@ -120,6 +122,7 @@ class WorkerRunner:
             raise ValueError("max_memory_per_process must be positive (MB)")
         if metrics_port is not None and not 0 <= metrics_port <= 65535:
             raise ValueError("metrics_port must be between 0 and 65535")
+        self.thp = thp_mod.check(thp)
         self.app = app
         self.threads = threads
         if queues:
@@ -256,6 +259,7 @@ class WorkerRunner:
         return None if self.native is None else self.native.metrics_port
 
     def start(self) -> None:
+        thp_mod.apply(self.thp)  # before any thread exists, so every heap starts in the advised arena
         rate_limits = {t.name: t.rate_per_sec for t in self.app.registry.values() if t.rate_per_sec is not None}
         self._load_pools()  # before the native worker: it starts fetching as soon as it exists
         try:

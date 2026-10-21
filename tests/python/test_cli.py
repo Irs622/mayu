@@ -241,3 +241,25 @@ def test_worker_cli_loads_pools_from_the_environment(tmp_path, redis_url, queue)
         assert use.send().result(timeout=30) == "gemma-0"
     finally:
         _stop(proc)
+
+
+@pytest.mark.parametrize("extra,env", [(("--thp", "bad"), None), ((), {"MAYU_THP": "bad"})])
+def test_worker_cli_rejects_a_bad_thp_mode(tmp_path, redis_url, queue, extra, env):
+    r = _run_worker(tmp_path, redis_url, queue, GPU_APP, *extra, env=env)
+    assert r.returncode == 2
+    assert "mayu: bad thp mode 'bad': use one of python, keep, off" in r.stderr, r.stderr
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="THP is a Linux feature")
+@pytest.mark.parametrize("extra,env", [(("--thp", "off"), None), ((), {"MAYU_THP": "off"})])
+def test_worker_cli_applies_thp_before_the_app_is_imported(tmp_path, redis_url, queue, extra, env):
+    source = (
+        "from mayu import App\n"
+        "app = App()\n"
+        "print('IMPORT-THP', [l.split()[1] for l in open('/proc/self/status') if l.startswith('THP_enabled')])\n"
+        "raise SystemExit(0)\n"
+    )
+    r = _run_worker(tmp_path, redis_url, queue, source, *extra, env=env)
+    assert "IMPORT-THP" in r.stdout, r.stderr
+    line = [l for l in r.stdout.splitlines() if l.startswith("IMPORT-THP")][0]
+    assert line in ("IMPORT-THP ['0']", "IMPORT-THP []"), line  # [] on kernels that do not report it

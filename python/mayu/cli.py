@@ -89,10 +89,11 @@ def _build_runner(app, args, threads: int):
                         max_tasks_per_process=args.max_tasks_per_process,
                         max_memory_per_process=args.max_memory_per_process,
                         metrics_port=args.metrics_port, metrics_host=args.metrics_host,
-                        resources=args.resources, pools=args.pools)
+                        resources=args.resources, pools=args.pools, thp=args.thp)
 
 
 def _cmd_worker(args) -> int:
+    from . import thp
     from .log import configure_logging
     try:
         configure_logging(args.log_format, args.log_level)
@@ -110,6 +111,11 @@ def _cmd_worker(args) -> int:
         print(f"mayu: {e}", file=sys.stderr)
         return 2
     try:
+        thp.check(args.thp)
+    except ValueError as e:  # argparse does not check `choices` against env-provided defaults
+        print(f"mayu: {e}", file=sys.stderr)
+        return 2
+    try:
         gpus = parse_gpus(args.gpus)
     except ValueError as e:
         print(f"mayu: {e}", file=sys.stderr)
@@ -122,6 +128,7 @@ def _cmd_worker(args) -> int:
         if len(gpus) == 1:
             # Before the app is imported: user code may initialise CUDA at import time.
             os.environ["CUDA_VISIBLE_DEVICES"] = gpus[0]
+    thp.apply(args.thp)  # also before the import: objects the app creates at import time are already in the arena
     from .modes import gil_enabled, import_app_detecting_gil, resolve_mode
     from .supervisor import RESTART_EXIT_CODE, ProcessSupervisor, watch_parent
 
@@ -300,6 +307,9 @@ def main(argv: list[str] | None = None) -> int:
                         "(pools are declared in code with @app.pool)")
     w.add_argument("--gpus", default=None, metavar="ID,...",
                    help="one worker process per listed GPU, each with CUDA_VISIBLE_DEVICES set to its id")
+    w.add_argument("--thp", default=os.environ.get("MAYU_THP") or "python", metavar="{python,keep,off}",
+                   help="transparent huge pages: python (default) opts only Python's own heap out, keep leaves "
+                        "the system setting, off disables them for the whole process and its children")
     w.add_argument("--log-format", choices=("text", "json"), default=os.environ.get("MAYU_LOG_FORMAT") or "text")
     w.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"),
                    type=str.upper, default=(os.environ.get("MAYU_LOG_LEVEL") or "INFO").upper())
