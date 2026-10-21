@@ -7,8 +7,6 @@ import sysconfig
 import threading
 import time
 
-import redis
-
 URL = os.environ.get("MAYU_BENCH_REDIS", "redis://127.0.0.1:6390/15")
 DONE_KEY = "bench:done"
 IO_SECONDS = 0.005     # simulated I/O per realistic task
@@ -22,7 +20,8 @@ _local = threading.local()
 _aclients: dict = {}
 
 
-def _client() -> redis.Redis:
+def _client():
+    import redis  # lazy: the mixed-version venvs run the task bodies without the redis package
     c = getattr(_local, "client", None)
     if c is None:
         c = _local.client = redis.Redis.from_url(URL)
