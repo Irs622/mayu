@@ -26,6 +26,7 @@ few processes can do the work that Celery needs dozens of forked processes for.
 ```bash
 pip install mayu            # or: uv add mayu
 pip install "mayu[otel]"    # with OpenTelemetry tracing
+pip install "mayu[gpu]"     # with NVIDIA GPU monitoring (NVML)
 ```
 
 Requires Python 3.13+ and Redis. Use a free-threaded build (`python3.14t`, e.g.
@@ -257,6 +258,68 @@ the worker.
 - **Zombies:** as with eager pools, a task past its hard time limit keeps its instance, so the pool
   shrinks by one for good. Its memory also stays counted as in use until the worker recycles.
 - **Close:** `@pool.close` runs on evicted and discarded instances and at shutdown, as above.
+- **`linger=`:** `@app.pool("gemma", vram_gb=5.8, linger=30)` keeps an idle instance from being closed
+  for room for up to 30 seconds while a workflow still has a task to come that uses the pool, so a
+  workflow that returns to a model after a step on another doesn't pay its load twice. The time counts
+  from when the instance went idle, not from its last use. Only workflows this worker has fetched a task of
+  count, and once the time is up, or no such task is left, the instance is closed like any idle one.
+  Tasks that need the room wait meanwhile. `mayu_pool_demand` shows the count. `linger` must be above 0
+  and is ignored in eager mode.
+- **`--lookahead`:** while a workflow's current task runs, load the model its next task needs
+  (`mayu worker ... --pool-mode lazy --lookahead`, or `MAYU_LOOKAHEAD=1`), so the next task finds it
+  loaded. It is a low-priority guess: it loads only when the model fits without closing anything,
+  the pool has no idle instance and is below its `--pools` size, and the worker has nothing due to
+  run. Like `linger`, it knows only the workflows this worker has fetched a task of. A load that fails
+  is logged and the task loads the model itself later; that pool isn't tried ahead again for 60 seconds.
+  `mayu_pool_lookahead_loads_total` counts the loads. `--lookahead` needs `--pool-mode lazy`.
+
+## GPU monitoring and self-tuning
+
+```bash
+pip install "mayu[gpu]"
+mayu worker tasks:app --resources gpu=auto,vram_gb=auto --autotune gpu
+```
+
+With `mayu[gpu]` installed, the worker reads the GPUs it can see through NVIDIA's NVML every 2
+seconds. That feeds the `mayu_gpu_*` metrics, a guard that keeps `vram_gb` honest when other programs
+use the card, and optionally the tuner below. Without the extra, or on a machine without a GPU,
+nothing changes.
+
+- **`--resources gpu=auto,vram_gb=auto`:** read the amounts from the visible GPUs instead of typing
+  them: `gpu` is their number and `vram_gb` their memory in GiB minus 0.5 GiB per GPU, for the CUDA
+  context and the desktop (an 8 GiB card gives 7.5). Either can be mixed with plain numbers, like
+  `gpu=1,vram_gb=auto`. The worker refuses to start if no GPU is visible.
+- **`--gpu-monitor auto|on|off`** (`MAYU_GPU_MONITOR`): `auto` (the default) monitors when NVML works and
+  a GPU is visible, `on` refuses to start if it can't, `off` never loads NVML. `off` can't be combined with
+  `auto` resources or `--autotune`, which need the readings. `--gpu-interval SECONDS`
+  (`MAYU_GPU_INTERVAL`, default 2) sets how often the GPUs are read.
+- **Which GPUs:** only the ones `CUDA_VISIBLE_DEVICES` shows, so `--gpus 0,1` gives each process its own
+  GPU to monitor. It takes indexes and `GPU-...` UUIDs. NVML numbers GPUs as `nvidia-smi` does, which is
+  CUDA's order only with `CUDA_DEVICE_ORDER=PCI_BUS_ID`: on a machine with several different GPUs, set it
+  or use UUIDs, or an index can name a different card in CUDA than in the monitor. Other forms (`MIG-...`)
+  are an error unless monitoring is off.
+- **VRAM guard:** with `vram_gb` declared, the worker compares what the GPUs have in use with what its own
+  processes (and their children) use, and treats the difference as other programs' memory. The GPUs'
+  memory beyond `vram_gb` is slack that absorbs a small foreign user at no cost; past that, the guard
+  takes the excess out of `vram_gb`, so tasks that no longer fit wait instead of running out of memory.
+  It shrinks at once and gives memory back only after 3 samples in a row ask for less, so a desktop app
+  that comes and goes can't make admission flap. Running tasks and loaded pools are never evicted for it:
+  it only holds back new ones. Each change is logged. If NVML can't say which memory is the worker's,
+  the guard turns itself off with a warning.
+- **Under-declared warning:** if the worker's processes use more VRAM than its running tasks and loaded
+  pools declare (by more than 0.5 GiB or 10%) for 3 samples in a row, a warning says to raise `vram_gb=`
+  on them, at most once every 5 minutes. mayu can't stop a task from using more than it declared.
+- **`--autotune gpu`** (`MAYU_AUTOTUNE=gpu`): run only as many GPU tasks as help. The configured `gpu` is
+  the ceiling, the smallest `gpu` request among the tasks the worker serves is the step, and the largest is
+  the floor, so the biggest task always fits. Every 5 samples (10 seconds by default) the tuner takes the
+  mean GPU utilization. At 90% or more it removes a step of `gpu`, since more concurrency on a saturated GPU
+  only adds latency. Below 70%, with tasks waiting for `gpu` and neither the guard nor the cards' memory
+  (95% in use) under pressure, it adds a step back. After a shrink it waits 6 windows before it grows
+  again. Each change is logged. It suits work that gets faster with concurrency until the GPU saturates.
+  It needs a `gpu` capacity, a served task that requests `gpu`, and monitoring.
+
+The GPU metrics are labelled `gpu` (NVML index) and `uuid`. With several GPUs they are per GPU, and the
+tuner and the guard use their mean and sum.
 
 ## Queue priority
 
@@ -409,9 +472,15 @@ processes listen on 9100–9103, so scrape all four. `MAYU_METRICS_PORT` sets th
 | `mayu_pool_rebuilds_total` | counter | `pool` (instances replaced after `DiscardInstance` or `discard_on`) |
 | `mayu_pool_loaded` | gauge | `pool` (only with `--pool-mode lazy`; instances in memory, idle or busy) |
 | `mayu_pool_loads_total`, `mayu_pool_evictions_total` | counter | `pool` (lazy instances built, preloads included, and closed to make room) |
+| `mayu_pool_demand` | gauge | `pool` (only in lazy mode with `--lookahead` or `linger=`; tasks still to come in workflows this worker has seen) |
+| `mayu_pool_lookahead_loads_total` | counter | `pool` (lazy instances built by `--lookahead` before their task) |
+| `mayu_gpu_utilization_ratio` | gauge | `gpu`, `uuid` (0 to 1) |
+| `mayu_gpu_memory_used_bytes`, `mayu_gpu_memory_total_bytes` | gauge | `gpu`, `uuid` (used by all processes, and installed) |
+| `mayu_gpu_process_memory_bytes` | gauge | `gpu`, `uuid` (used by this worker and its children; omitted if NVML can't say) |
+| `mayu_gpu_power_watts`, `mayu_gpu_temperature_celsius` | gauge | `gpu`, `uuid` (omitted if no GPU reports them) |
 
 Pools are counted in the resource ledger as `pool:<name>`, but they appear only as `mayu_pool_*`, never under
-`mayu_resource_*`.
+`mayu_resource_*`. The `mayu_gpu_*` metrics appear only while GPU monitoring runs (see above).
 
 Queue gauges are read from Redis on each scrape, so every worker reports the same values: use
 `max by (queue) (mayu_queue_ready)`. If Redis cannot be read, the scrape still answers without them.
