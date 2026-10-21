@@ -87,10 +87,34 @@ def _eta_ms(countdown: float | None, eta: dt.datetime | None) -> int | None:
     return None
 
 
+def _shape(sig: inspect.Signature) -> list[tuple]:
+    return [(p.name, p.kind, p.default) for p in sig.parameters.values()]
+
+
+def _enqueue(app, name: str, queue: str, max_retries: int, args, kwargs, countdown, eta, link) -> TaskHandle:
+    links = _as_links(link)
+    eta_ms = _eta_ms(countdown, eta)
+    serializer = app.serializer
+    body = [list(args), kwargs]
+    if links:
+        body.append({"links": [s._wire() for s in links]})
+    payload = serializer.dumps(body)
+    span, traceparent = otel.start_send(name, queue)
+    try:
+        task_id = app.client.enqueue(name, queue, payload, serializer.content_type, max_retries, eta_ms,
+                                     trace_ctx=traceparent)
+    except BaseException as e:
+        otel.end(span, e)
+        raise
+    otel.set_message_id(span, task_id)
+    otel.end(span)
+    return TaskHandle(app, task_id)
+
+
 class Task:
     def __init__(self, app, fn, *, name: str, queue: str, max_retries: int, retry_on: tuple,
                  soft_time_limit: float | None = None, hard_time_limit: float | None = None, threadsafe: bool = True,
-                 rate_limit=None):
+                 rate_limit=None, implemented: bool = True):
         self.app = app
         self.fn = fn
         self.name = name
@@ -114,36 +138,43 @@ class Task:
         self.threadsafe = threadsafe
         self.rate_limit = rate_limit
         self.rate_per_sec = None if rate_limit is None else parse_rate(rate_limit)
+        self.implemented = implemented
+        self.declared = not implemented
         functools.update_wrapper(self, fn)
 
     def __repr__(self) -> str:
         return f"<Task {self.name}>"
 
     def __call__(self, *args, **kwargs):
+        if not self.implemented:
+            raise TypeError(f"task {self.name!r} is declared but not implemented in this process; "
+                            f"import the module that calls {self.name}.implement(...)")
         return self.fn(*args, **kwargs)
+
+    def implement(self, fn) -> "Task":
+        """Attach the code of a task made with ``app.declare``; usable as a decorator, returns the task."""
+        with self.app._registry_lock:
+            if self.implemented:
+                raise ValueError(f"task {self.name!r} is already implemented" if self.declared else
+                                 f"task {self.name!r} was made with app.task; only app.declare tasks take an "
+                                 f"implementation")
+            sig = inspect.signature(fn)
+            if _shape(sig) != _shape(self.signature):
+                raise TypeError(f"implementation of {self.name!r} must match its declaration: "
+                                f"declared {self.signature}, got {sig}")
+            is_async = inspect.iscoroutinefunction(fn)
+            if not self.threadsafe and is_async:
+                raise ValueError("threadsafe=False is for sync tasks; async tasks already run on one event-loop thread")
+            self.fn = fn
+            self.is_async = is_async
+            functools.update_wrapper(self, fn)
+            self.implemented = True
+        return self
 
     def send(self, *args, countdown: float | None = None, eta: dt.datetime | None = None,
              queue: str | None = None, link=None, **kwargs) -> TaskHandle:
         self.signature.bind(*args, **kwargs)
-        links = _as_links(link)
-        eta_ms = _eta_ms(countdown, eta)
-        serializer = self.app.serializer
-        body = [list(args), kwargs]
-        if links:
-            body.append({"links": [s._wire() for s in links]})
-        payload = serializer.dumps(body)
-        q = queue or self.queue
-        span, traceparent = otel.start_send(self.name, q)
-        try:
-            task_id = self.app.client.enqueue(
-                self.name, q, payload, serializer.content_type, self.max_retries, eta_ms, trace_ctx=traceparent
-            )
-        except BaseException as e:
-            otel.end(span, e)
-            raise
-        otel.set_message_id(span, task_id)
-        otel.end(span)
-        return TaskHandle(self.app, task_id)
+        return _enqueue(self.app, self.name, queue or self.queue, self.max_retries, args, kwargs, countdown, eta, link)
 
     def s(self, *args, **kwargs) -> Signature:
         """This task with extra arguments, as a ``link=`` callback (the result comes first)."""

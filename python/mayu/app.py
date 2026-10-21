@@ -1,9 +1,14 @@
+import datetime as dt
 import os
 import threading
 
 from . import _native
+from .handle import TaskHandle
 from .serializers import PICKLE, get_serializer
-from .task import Task
+from .task import Task, _enqueue
+
+_TASK_OPTIONS = frozenset({"name", "queue", "max_retries", "retry_on", "soft_time_limit", "hard_time_limit",
+                           "threadsafe", "rate_limit"})
 
 
 class App:
@@ -42,17 +47,28 @@ class App:
              max_retries: int | None = None, retry_on=(),
              soft_time_limit: float | None = None, hard_time_limit: float | None = None, threadsafe: bool = True,
              rate_limit=None):
+        options = dict(name=name, queue=queue, max_retries=max_retries, retry_on=retry_on,
+                       soft_time_limit=soft_time_limit, hard_time_limit=hard_time_limit, threadsafe=threadsafe,
+                       rate_limit=rate_limit)
+        return self._register(fn, options, implemented=True)
+
+    def declare(self, fn=None, /, **options):
+        """Register a task's name, options and signature without its code; attach it later with ``implement``."""
+        return self._register(fn, options, implemented=False)
+
+    def _register(self, fn, options: dict, implemented: bool):
         def register(f):
             t = Task(
                 self, f,
-                name=name or f"{f.__module__}.{f.__qualname__}",
-                queue=queue or self.default_queue,
-                max_retries=self.max_retries if max_retries is None else max_retries,
-                retry_on=tuple(retry_on),
-                soft_time_limit=soft_time_limit,
-                hard_time_limit=hard_time_limit,
-                threadsafe=threadsafe,
-                rate_limit=rate_limit,
+                name=options.get("name") or f"{f.__module__}.{f.__qualname__}",
+                queue=options.get("queue") or self.default_queue,
+                max_retries=self.max_retries if options.get("max_retries") is None else options["max_retries"],
+                retry_on=tuple(options.get("retry_on", ())),
+                soft_time_limit=options.get("soft_time_limit"),
+                hard_time_limit=options.get("hard_time_limit"),
+                threadsafe=options.get("threadsafe", True),
+                rate_limit=options.get("rate_limit"),
+                implemented=implemented,
             )
             with self._registry_lock:
                 if t.name in self.registry:
@@ -60,4 +76,15 @@ class App:
                 self.registry[t.name] = t
             return t
 
+        unknown = set(options) - _TASK_OPTIONS
+        if unknown:
+            raise TypeError(f"unknown task option(s) {sorted(unknown)}; valid options: {sorted(_TASK_OPTIONS)}")
         return register(fn) if fn is not None else register
+
+    def send(self, name: str, /, *args, countdown: float | None = None, eta: dt.datetime | None = None,
+             queue: str | None = None, link=None, **kwargs) -> TaskHandle:
+        """Enqueue a task by name; if it is registered here its arguments are validated, otherwise they are not."""
+        task = self.registry.get(name)
+        if task is not None:
+            return task.send(*args, countdown=countdown, eta=eta, queue=queue, link=link, **kwargs)
+        return _enqueue(self, name, queue or self.default_queue, self.max_retries, args, kwargs, countdown, eta, link)
