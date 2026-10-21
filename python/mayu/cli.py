@@ -24,14 +24,22 @@ def load_app(path: str) -> App:
     return obj
 
 
-def parse_resources(text: str | None) -> dict[str, float] | None:
-    """'gpu=1,vram_gb=7.5' -> {'gpu': 1.0, 'vram_gb': 7.5}; None or '' -> None."""
+def parse_resources(text: str | None) -> dict[str, float | str] | None:
+    """'gpu=1,vram_gb=7.5' -> {'gpu': 1.0, 'vram_gb': 7.5}; None or '' -> None. gpu and vram_gb also take 'auto'."""
     if not text or not text.strip():
         return None
-    out: dict[str, float] = {}
+    out: dict[str, float | str] = {}
     for item in text.split(","):
         name, sep, amount = item.partition("=")
         name = name.strip()
+        if sep and amount.strip() == "auto":
+            if name not in ("gpu", "vram_gb"):
+                raise ValueError(f"bad --resources entry {item.strip()!r}: only gpu and vram_gb can be auto; "
+                                 f"give {name or 'it'} a number")
+            if name in out:
+                raise ValueError(f"bad --resources: {name!r} given twice")
+            out[name] = "auto"
+            continue
         try:
             value = float(amount)
         except ValueError:
@@ -103,7 +111,8 @@ def _build_runner(app, args, threads: int):
                         max_memory_per_process=args.max_memory_per_process,
                         metrics_port=args.metrics_port, metrics_host=args.metrics_host,
                         resources=args.resources, pools=args.pools, thp=args.thp,
-                        pool_mode=args.pool_mode, schedule=args.schedule, preload=args.preload)
+                        pool_mode=args.pool_mode, schedule=args.schedule, preload=args.preload,
+                        gpu_monitor=args.gpu_monitor, gpu_interval=args.gpu_interval)
 
 
 def _cmd_worker(args) -> int:
@@ -320,7 +329,8 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--metrics-host", default="0.0.0.0", help="address to serve metrics on")
     w.add_argument("--resources", default=os.environ.get("MAYU_RESOURCES") or None, metavar="NAME=AMOUNT,...",
                    help="what each worker process has, e.g. gpu=1,vram_gb=7.5,cpu=12; a task starts only when "
-                        "its resources= requests fit in what is left")
+                        "its resources= requests fit in what is left. gpu=auto and vram_gb=auto read it from the "
+                        "visible GPUs (needs mayu[gpu])")
     w.add_argument("--pools", default=os.environ.get("MAYU_POOLS") or None, metavar="NAME=COUNT,...",
                    help="instances of each model pool to load in each worker process, e.g. gemma=2,tts=3 "
                         "(pools are declared in code with @app.pool)")
@@ -337,6 +347,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="with --pool-mode lazy: pools to load one instance of at startup, e.g. gemma")
     w.add_argument("--gpus", default=None, metavar="ID,...",
                    help="one worker process per listed GPU, each with CUDA_VISIBLE_DEVICES set to its id")
+    w.add_argument("--gpu-monitor", default=os.environ.get("MAYU_GPU_MONITOR") or "auto", metavar="{auto,on,off}",
+                   choices=("auto", "on", "off"),
+                   help="read the GPUs with NVML (needs mayu[gpu]) for the mayu_gpu_* metrics and the VRAM guard. "
+                        "auto (default): on when NVML works and a GPU is visible; on: error if it can't; off")
+    w.add_argument("--gpu-interval", type=float, default=os.environ.get("MAYU_GPU_INTERVAL") or 2.0, metavar="SECONDS",
+                   help="how often to read the GPUs (default 2)")
     w.add_argument("--thp", default=os.environ.get("MAYU_THP") or "python", metavar="{python,keep,off}",
                    help="transparent huge pages: python (default) opts only Python's own heap out, keep leaves "
                         "the system setting, off disables them for the whole process and its children")

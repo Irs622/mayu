@@ -41,12 +41,13 @@ Benchmarks = "https://github.com/Siddid-Soni/mayu/blob/main/bench/RESULTS.md"
 
 [project.optional-dependencies]
 otel = ["opentelemetry-api>=1.30"]
+gpu = ["nvidia-ml-py>=12"]
 
 [project.scripts]
 mayu = "mayu.cli:main"
 
 [dependency-groups]
-dev = ["maturin>=1.9,<2", "pytest>=8", "opentelemetry-sdk>=1.30", "pytest-run-parallel>=0.10"]
+dev = ["maturin>=1.9,<2", "pytest>=8", "opentelemetry-sdk>=1.30", "pytest-run-parallel>=0.10", "nvidia-ml-py>=12"]
 
 [tool.maturin]
 manifest-path = "crates/mayu-py/Cargo.toml"

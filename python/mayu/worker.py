@@ -1,6 +1,7 @@
 import asyncio
 import collections
 import logging
+import math
 import queue
 import signal
 import threading
@@ -8,6 +9,7 @@ import time
 import traceback
 
 from . import _native, otel
+from . import gpu as gpu_mod
 from . import thp as thp_mod
 from .exceptions import DiscardInstance, Retry, SoftTimeLimitExceeded, TimeLimitExceeded
 from .limits import TimeLimits
@@ -132,7 +134,7 @@ class WorkerRunner:
                  metrics_port: int | None = None, metrics_host: str = "0.0.0.0",
                  resources: dict[str, float] | None = None, pools: dict[str, int] | None = None,
                  thp: str = "python", pool_mode: str = "eager", schedule: str | None = None,
-                 preload: list[str] | None = None):
+                 preload: list[str] | None = None, gpu_monitor: str = "auto", gpu_interval: float = 2.0):
         if threads < 1:
             raise ValueError("threads must be >= 1")
         if visibility_timeout <= 0 or heartbeat_interval <= 0:
@@ -155,6 +157,11 @@ class WorkerRunner:
             raise ValueError("--schedule needs --pool-mode lazy")
         if pool_mode != "lazy" and preload:
             raise ValueError("--preload needs --pool-mode lazy")
+        if gpu_monitor not in ("auto", "on", "off"):
+            raise ValueError(f"gpu_monitor must be 'auto', 'on' or 'off', got {gpu_monitor!r}")
+        if isinstance(gpu_interval, bool) or not isinstance(gpu_interval, (int, float)) or not gpu_interval > 0 \
+                or math.isinf(gpu_interval):
+            raise ValueError(f"gpu_interval must be a positive number of seconds, got {gpu_interval!r}")
         self.thp = thp_mod.check(thp)
         self.app = app
         self.threads = threads
@@ -168,6 +175,12 @@ class WorkerRunner:
         if not self.queues:
             raise ValueError("no queue to serve: every queue has tasks declared but not implemented in this process; "
                              "import their implementations or pass queues")
+        self.gpu_interval = float(gpu_interval)
+        self._gpu_backend = self._plan_gpu_monitor(gpu_monitor, resources)
+        if gpu_mod.has_auto(resources):
+            resources = gpu_mod.resolve_auto(resources)
+            log.info("resolved resources from the visible GPUs: %s",
+                     ", ".join(f"{n}={v:g}" for n, v in resources.items() if n in gpu_mod.AUTO_RESOURCES))
         self.resources = check_resources("resources", resources, allow_zero=True)
         self.lazy = pool_mode == "lazy"
         left = self._plan_pools(pools)
@@ -193,6 +206,7 @@ class WorkerRunner:
         self._settled_lock = threading.Lock()
         self._next_memory_check = 0.0
         self.native = None
+        self._sampler: gpu_mod.Sampler | None = None
         self._running = threading.Event()
         self._stopped = threading.Event()
         self._halt = threading.Event()
@@ -212,6 +226,32 @@ class WorkerRunner:
         self._states: dict[str, _PoolState] = {}  # loaded pools in load order; only start() adds to it
         self._checked_out: dict = {}  # token -> [_Held], so the hard limit can find what a zombie holds
         self._held_lock = threading.Lock()
+
+    def _plan_gpu_monitor(self, mode: str, resources):
+        """The backend the GPU sampler will read, or None when monitoring is off or unavailable (nothing is
+        imported then). `auto` resources need the GPUs, so they turn `auto` into `on` and clash with `off`."""
+        if mode == "off":
+            if gpu_mod.has_auto(resources):
+                raise ValueError("resources with 'auto' read the GPUs through NVML, which --gpu-monitor off turns "
+                                 "away; use --gpu-monitor auto or on, or give the resources numbers")
+            return None
+        be = gpu_mod.backend()
+        if be is None:
+            if mode == "on":
+                raise ValueError("--gpu-monitor on needs NVIDIA's NVML: pip install 'mayu[gpu]'")
+            return None
+        try:
+            found = bool(be.devices())
+        except Exception as e:
+            if mode == "on":
+                raise ValueError(f"--gpu-monitor on could not read the GPUs: {e!r}") from e
+            log.debug("GPU monitoring is off: could not read the GPUs: %r", e)
+            return None
+        if not found:
+            if mode == "on":
+                raise ValueError("--gpu-monitor on found no visible GPU; check CUDA_VISIBLE_DEVICES")
+            return None
+        return be
 
     def _plan_pools(self, pools) -> dict[str, float]:
         """Checks `pools` against the served tasks; returns what each declared resource has left after reserving
@@ -358,6 +398,10 @@ class WorkerRunner:
             raise
         for name in self._preload if self.lazy else ():  # the dispatcher already counts them (lazy_pools)
             self.native.pool_loaded(name)
+        if self._gpu_backend is not None:
+            self._sampler = gpu_mod.Sampler(self.native, self._gpu_backend, self.gpu_interval,
+                                            vram_gb=self.resources.get("vram_gb"))
+            self._sampler.start()
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(target=self._loop.run_forever, name="mayu-async", daemon=True)
         self._loop_thread.start()
@@ -387,6 +431,8 @@ class WorkerRunner:
 
     def stop(self) -> None:
         self._running.clear()
+        if self._sampler is not None:
+            self._sampler.stop()
         if self.native is not None:
             self.native.stop_fetching()
         self._stopped.set()
@@ -406,6 +452,9 @@ class WorkerRunner:
             time.sleep(0.01)
         self._halt.set()
         self._supervisor.join(1.0)
+        if self._sampler is not None:
+            self._sampler.stop()
+            self._sampler.join()  # before the native worker goes: a tick uses it
         remaining_ms = int(max(0.0, deadline - time.monotonic()) * 1000)
         self.native.shutdown(max(remaining_ms, 1000))
         self._close_pools()  # what threads past the grace period still hold is not closed

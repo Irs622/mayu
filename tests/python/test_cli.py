@@ -7,14 +7,14 @@ import sys
 import pytest
 
 from mayu import App
-from mayu.cli import load_app, parse_gpus, parse_pools, parse_preload
+from mayu.cli import load_app, parse_gpus, parse_pools, parse_preload, parse_resources
 
 HERE = pathlib.Path(__file__).parent
 
 
 def _env(redis_url, queue):
     return {**os.environ, "MAYU_BROKER": redis_url, "MAYU_DEFAULT_QUEUE": queue,
-            "PYTHONPATH": str(HERE)}
+            "PYTHONPATH": str(HERE), "MAYU_GPU_MONITOR": "off"}  # off: the machine's real GPU stays out of the tests
 
 
 def test_worker_cli_runs_tasks_and_exits_cleanly_on_sigterm(redis_url, queue):
@@ -327,3 +327,57 @@ def test_worker_cli_applies_thp_before_the_app_is_imported(tmp_path, redis_url, 
     assert "IMPORT-THP" in r.stdout, r.stderr
     line = [l for l in r.stdout.splitlines() if l.startswith("IMPORT-THP")][0]
     assert line in ("IMPORT-THP ['0']", "IMPORT-THP []"), line  # [] on kernels that do not report it
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("gpu=auto", {"gpu": "auto"}),
+    ("gpu=auto,vram_gb=auto,cpu=4", {"gpu": "auto", "vram_gb": "auto", "cpu": 4.0}),
+    ("vram_gb=7.5,gpu=auto", {"vram_gb": 7.5, "gpu": "auto"}),
+])
+def test_parse_resources_takes_auto_for_gpu_and_vram_gb(text, expected):
+    assert parse_resources(text) == expected
+
+
+@pytest.mark.parametrize("text", ["cpu=auto", "=auto", "gpu=auto,gpu=1", "gpu=Auto"])
+def test_parse_resources_rejects_auto_elsewhere(text):
+    with pytest.raises(ValueError, match="--resources"):
+        parse_resources(text)
+
+
+@pytest.mark.parametrize("extra,env,message", [
+    (("--gpu-monitor", "sometimes"), None, "--gpu-monitor"),
+    ((), {"MAYU_GPU_MONITOR": "sometimes"}, "gpu_monitor must be 'auto', 'on' or 'off', got 'sometimes'"),
+    (("--gpu-interval", "0"), None, "gpu_interval must be a positive number of seconds, got 0.0"),
+    (("--gpu-interval", "fast"), None, "--gpu-interval"),
+    ((), {"MAYU_GPU_INTERVAL": "-1"}, "gpu_interval must be a positive number of seconds, got -1.0"),
+    ((), {"MAYU_GPU_INTERVAL": "soon"}, "--gpu-interval"),
+    (("--resources", "cpu=auto"), None, "mayu: bad --resources entry 'cpu=auto': only gpu and vram_gb can be auto"),
+    (("--resources", "gpu=auto", "--gpu-monitor", "off"), None, "--gpu-monitor off turns away"),
+    # no visible device: --gpu-monitor on and auto resources fail whether or not NVML is installed
+    (("--gpu-monitor", "on"), {"CUDA_VISIBLE_DEVICES": ""}, "--gpu-monitor on "),
+    (("--resources", "gpu=auto"), {"MAYU_GPU_MONITOR": "auto", "CUDA_VISIBLE_DEVICES": ""}, "gpu=auto "),
+])
+def test_worker_cli_rejects_bad_gpu_monitoring_options(tmp_path, redis_url, queue, extra, env, message):
+    r = _run_worker(tmp_path, redis_url, queue, GPU_APP, *extra, env=env)
+    assert r.returncode == 2 and message in r.stderr, r.stderr
+
+
+def test_worker_cli_runs_with_the_gpu_options_from_flags_and_the_environment(tmp_path, redis_url, queue):
+    (tmp_path / "res_app.py").write_text(
+        "from mayu import App\n"
+        "app = App(result_ttl=60)\n"
+        "@app.task(name='res.ok')\n"
+        "def ok():\n"
+        "    return 'ok'\n"
+    )
+    for extra, env in [(("--gpu-monitor", "off", "--gpu-interval", "0.5"), None),
+                       ((), {"MAYU_GPU_MONITOR": "off", "MAYU_GPU_INTERVAL": "0.5"})]:
+        proc = subprocess.Popen([sys.executable, "-m", "mayu", "worker", "res_app:app", "--mode", "thread",
+                                 "--threads", "1", *extra],
+                                env={**_env(redis_url, queue), "PYTHONPATH": str(tmp_path), **(env or {})},
+                                stderr=subprocess.PIPE, text=True)
+        try:
+            producer = App(broker=redis_url, result_ttl=60, default_queue=queue)
+            assert producer.send("res.ok").result(timeout=30) == "ok"
+        finally:
+            _stop(proc)
