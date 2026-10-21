@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{Notify, Semaphore, mpsc, watch};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 
@@ -12,9 +12,10 @@ use crate::dispatch::{Admit, Dispatcher, ReadyQueue, Resources, Schedule};
 use crate::broker::{Broker, Delivery, StoredResult, WorkerInfo};
 use crate::envelope::{Header, now_ms};
 use crate::error::{Error, Result};
-use crate::metrics::{Gauges, Metrics, Settled};
+use crate::metrics::{Gauges, GpuStat, Metrics, Settled};
 use crate::policy::{Action, Outcome, RetryPolicy, decide, full_jitter};
 use crate::result::ResultRecord;
+use crate::workflow::NodeState;
 
 /// Heartbeats between consumer-pruning passes.
 const PRUNE_EVERY_TICKS: u64 = 12;
@@ -22,6 +23,10 @@ const PRUNE_EVERY_TICKS: u64 = 12;
 const PANIC_EXIT_CODE: i32 = 70;
 /// Bound on reading queue depths for one scrape.
 const SCRAPE_BROKER_TIMEOUT: Duration = Duration::from_secs(2);
+/// Workflows remembered for demand; past this the one seen longest ago is forgotten.
+const MAX_ACTIVE_WORKFLOWS: usize = 256;
+/// How often the lookahead loop re-reads its workflows, absent a settled workflow node.
+const LOOKAHEAD_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -45,6 +50,9 @@ pub struct RuntimeConfig {
     pub resources: Resources,
     /// How tasks of a worker with lazy pools are ordered; `Fifo` exactly when there are none.
     pub schedule: Schedule,
+    /// Track the workflows this worker runs and publish how much of each lazy pool they still need.
+    /// The loop also runs, regardless of this, when a lazy pool has `linger`.
+    pub lookahead: bool,
     /// Serve Prometheus metrics here (`GET /metrics`). Port 0 picks a free port.
     pub metrics_addr: Option<SocketAddr>,
 }
@@ -68,6 +76,7 @@ impl Default for RuntimeConfig {
             rate_limits: HashMap::new(),
             resources: Resources::default(),
             schedule: Schedule::Fifo,
+            lookahead: false,
             metrics_addr: None,
         }
     }
@@ -131,7 +140,36 @@ struct Handles {
     promote: JoinHandle<()>,
     keepalive: JoinHandle<()>,
     heartbeat: JoinHandle<()>,
+    lookahead: Option<JoinHandle<()>>,
     metrics: Option<JoinHandle<()>>,
+}
+
+/// Workflows this worker has fetched a task of, for the lookahead loop.
+struct Active {
+    seen: Mutex<HashMap<String, Instant>>,
+    /// Poked when the loop should read the workflows now: a new one appeared or a node settled.
+    wake: Notify,
+}
+
+impl Active {
+    fn new() -> Self {
+        Active { seen: Mutex::new(HashMap::new()), wake: Notify::new() }
+    }
+
+    fn touch(&self, id: &str) {
+        let mut seen = self.seen.lock().unwrap();
+        let new = seen.insert(id.to_string(), Instant::now()).is_none();
+        if new && seen.len() > MAX_ACTIVE_WORKFLOWS {
+            let oldest = seen.iter().min_by_key(|(_, at)| **at).map(|(id, _)| id.clone());
+            if let Some(oldest) = oldest {
+                seen.remove(&oldest);
+            }
+        }
+        drop(seen);
+        if new {
+            self.wake.notify_one();
+        }
+    }
 }
 
 pub struct Runtime<B: Broker> {
@@ -191,6 +229,9 @@ impl<B: Broker> Runtime<B> {
         let sem = Arc::new(Semaphore::new(cap));
         let inflight: Inflight = Arc::default();
         let metrics = Arc::new(Metrics::default());
+        let lookahead = !cfg.resources.lazy.is_empty()
+            && (cfg.lookahead || cfg.resources.lazy.values().any(|p| p.linger.is_some()));
+        let active = lookahead.then(|| Arc::new(Active::new()));
 
         let fetch = rt.spawn(critical("fetch", fetch_loop(FetchCtx {
             broker: broker.clone(),
@@ -207,6 +248,7 @@ impl<B: Broker> Runtime<B> {
             max_deliveries: cfg.max_deliveries,
             result_ttl: cfg.result_ttl_secs,
             metrics: metrics.clone(),
+            active: active.clone(),
         })));
         let complete = rt.spawn(critical("completion", completion_loop(
             broker.clone(),
@@ -217,9 +259,21 @@ impl<B: Broker> Runtime<B> {
             cfg.result_ttl_secs,
             Duration::from_millis(cfg.visibility_timeout_ms),
             metrics.clone(),
+            active.clone(),
         )));
         let promote = rt.spawn(critical("promote",
-            promote_loop(broker.clone(), cfg.queues.clone(), cfg.promote_interval_ms, stop_rx, metrics.clone())));
+            promote_loop(broker.clone(), cfg.queues.clone(), cfg.promote_interval_ms, stop_rx.clone(), metrics.clone())));
+        let lookahead_task = active.map(|active| {
+            rt.spawn(critical("lookahead", lookahead_loop(LookaheadCtx {
+                broker: broker.clone(),
+                active,
+                ready: ready.clone(),
+                task_pools: task_pools(&cfg.resources),
+                pools: cfg.resources.lazy.keys().cloned().collect(),
+                stop: stop_rx,
+                metrics: metrics.clone(),
+            })))
+        });
         let keepalive = rt.spawn(critical("keepalive",
             keepalive_loop(broker.clone(), inflight.clone(), cfg.visibility_timeout_ms, metrics.clone())));
         let info = WorkerInfo {
@@ -248,7 +302,7 @@ impl<B: Broker> Runtime<B> {
                 let ready = ready.clone();
                 let render: crate::http::Render = Arc::new(move || {
                     let (b, m, inf, queues, ready) = (b.clone(), m.clone(), inf.clone(), queues.clone(), ready.clone());
-                    Box::pin(async move { scrape(&*b, &m, &inf, &ready, &queues, concurrency).await })
+                    Box::pin(async move { scrape(&*b, &m, &inf, &ready, &queues, concurrency, lookahead).await })
                 });
                 // Not `critical`: a broken metrics endpoint must not take the worker down.
                 (Some(rt.spawn(crate::http::serve(l, render))), Some(addr))
@@ -265,7 +319,9 @@ impl<B: Broker> Runtime<B> {
             inflight,
             metrics,
             metrics_addr,
-            handles: Mutex::new(Some(Handles { fetch, complete, promote, keepalive, heartbeat, metrics: metrics_task })),
+            handles: Mutex::new(Some(Handles {
+                fetch, complete, promote, keepalive, heartbeat, lookahead: lookahead_task, metrics: metrics_task,
+            })),
         })
     }
 
@@ -336,6 +392,36 @@ impl<B: Broker> Runtime<B> {
         self.metrics.pool_evicted(pool);
     }
 
+    /// A lazy pool instance was built ahead of need, in addition to `pool_loaded`.
+    pub fn pool_lookahead_loaded(&self, pool: &str) {
+        self.metrics.pool_lookahead_loaded(pool);
+    }
+
+    /// See `Dispatcher::lookahead_begin`.
+    pub fn lookahead_begin(&self) -> Option<String> {
+        self.ready.lookahead_begin()
+    }
+
+    /// See `Dispatcher::lookahead_done`.
+    pub fn lookahead_done(&self, pool: &str, ok: bool) -> Result<()> {
+        self.ready.lookahead_done(pool, ok)
+    }
+
+    /// See `Dispatcher::blocked`.
+    pub fn blocked(&self, resource: &str) -> usize {
+        self.ready.blocked(resource)
+    }
+
+    /// (resource, capacity, in use), as `/metrics` reports them.
+    pub fn usage(&self) -> Vec<(String, f64, f64)> {
+        self.ready.usage()
+    }
+
+    /// Replaces the GPU samples `/metrics` reports.
+    pub fn set_gpu_stats(&self, stats: Vec<GpuStat>) {
+        self.metrics.set_gpus(stats);
+    }
+
     pub fn stop_fetching(&self) {
         self.stop_tx.send_replace(true);
     }
@@ -350,6 +436,9 @@ impl<B: Broker> Runtime<B> {
         self.rt.block_on(async {
             let _ = h.fetch.await;
             let _ = h.promote.await;
+            if let Some(l) = h.lookahead {
+                let _ = l.await; // stops on the same signal
+            }
             let leftovers = self.ready.drain();
             for t in leftovers {
                 let f = self.inflight.lock().unwrap().remove(&t.token);
@@ -420,6 +509,8 @@ struct FetchCtx<B> {
     max_deliveries: u64,
     result_ttl: Option<u64>,
     metrics: Arc<Metrics>,
+    /// Some when the lookahead loop runs.
+    active: Option<Arc<Active>>,
 }
 
 /// How long shutdown waits for the acks of skipped (cancelled-workflow) deliveries still being written.
@@ -493,6 +584,9 @@ async fn fetch_batches<B: Broker>(c: &mut FetchCtx<B>, skips: &mut JoinSet<()>) 
         };
         for d in got {
             c.metrics.received(&d.queue, &d.header.task);
+            if let (Some(active), Some(id)) = (&c.active, &d.header.workflow_id) {
+                active.touch(id);
+            }
             let token = next_token;
             next_token += 1;
             let task = ReadyTask::from_delivery(token, &d);
@@ -672,6 +766,7 @@ async fn completion_loop<B: Broker>(
     ttl: Option<u64>,
     record_deadline: Duration,
     metrics: Arc<Metrics>,
+    active: Option<Arc<Active>>,
 ) {
     // Outcomes are decided here, in order, but written concurrently: a write is one broker round
     // trip, and awaiting each before taking the next capped a worker at 1 / RTT. Each write holds
@@ -729,10 +824,15 @@ async fn completion_loop<B: Broker>(
         };
         // Buffer through broker outages (bounded by the prefetch permits this message holds).
         let (broker, metrics, sem) = (broker.clone(), metrics.clone(), sem.clone());
+        let active = active.clone().filter(|_| d.header.workflow_id.is_some());
         writes.spawn(async move {
             if record_retrying(&*broker, &d, &rec, record_deadline, &metrics).await {
                 metrics.settled(&d.queue, &d.header.task, how, started.map(|s| s.elapsed()));
                 log_settled(&d, &rec);
+                // The workflow just changed; its remaining demand with it.
+                if let Some(active) = active {
+                    active.wake.notify_one();
+                }
             }
             sem.add_permits(1);
         });
@@ -782,6 +882,75 @@ async fn promote_loop<B: Broker>(
                 tracing::warn!(error = %e, queue = %q, "promote failed");
             }
         }
+    }
+}
+
+struct LookaheadCtx<B> {
+    broker: Arc<B>,
+    active: Arc<Active>,
+    ready: Arc<ReadyQueue>,
+    /// Served task -> the lazy pools it uses.
+    task_pools: HashMap<String, Vec<String>>,
+    /// Every lazy pool, so a pool with no demand is set to 0.
+    pools: Vec<String>,
+    stop: watch::Receiver<bool>,
+    metrics: Arc<Metrics>,
+}
+
+/// Served task -> the lazy pools its request names as `pool:<name>`; tasks using none are left out.
+fn task_pools(res: &Resources) -> HashMap<String, Vec<String>> {
+    res.requests.iter()
+        .filter_map(|(task, req)| {
+            let mut pools: Vec<String> = res.lazy.keys()
+                .filter(|p| req.contains_key(&format!("pool:{p}")))
+                .cloned()
+                .collect();
+            pools.sort();
+            (!pools.is_empty()).then(|| (task.clone(), pools))
+        })
+        .collect()
+}
+
+/// Keeps the dispatcher's per-pool demand current: workflow nodes this worker's workflows have not run yet
+/// and that use the pool. Reads workflows one at a time, only those this worker has fetched a task of.
+async fn lookahead_loop<B: Broker>(mut c: LookaheadCtx<B>) {
+    let mut tick = tokio::time::interval(LOOKAHEAD_INTERVAL);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = c.active.wake.notified() => {}
+            _ = c.stop.wait_for(|s| *s) => return,
+        }
+        let ids: Vec<String> = c.active.seen.lock().unwrap().keys().cloned().collect();
+        let mut demand: HashMap<&str, u32> = c.pools.iter().map(|p| (p.as_str(), 0)).collect();
+        let mut finished = Vec::new();
+        for id in ids {
+            match c.broker.workflow(&id).await {
+                Ok(Some(wf)) if wf.summary().state == "running" => {
+                    for n in wf.nodes.iter().filter(|n| matches!(n.state, NodeState::Waiting | NodeState::Queued)) {
+                        for p in c.task_pools.get(&n.task).into_iter().flatten() {
+                            if let Some(d) = demand.get_mut(p.as_str()) {
+                                *d += 1;
+                            }
+                        }
+                    }
+                }
+                Ok(_) => finished.push(id),
+                Err(e) => {
+                    c.metrics.broker_error("workflow");
+                    tracing::warn!(error = %e, workflow = %id, "reading a workflow for pool demand failed");
+                }
+            }
+        }
+        if !finished.is_empty() {
+            let mut seen = c.active.seen.lock().unwrap();
+            for id in &finished {
+                seen.remove(id);
+            }
+        }
+        let demand: Vec<(String, u32)> = demand.into_iter().map(|(p, n)| (p.to_string(), n)).collect();
+        c.ready.set_demand(&demand);
     }
 }
 
@@ -869,6 +1038,7 @@ async fn scrape<B: Broker>(
     ready: &ReadyQueue,
     queues: &[String],
     concurrency: usize,
+    lookahead: bool,
 ) -> String {
     let (n, running) = {
         let m = inflight.lock().unwrap();
@@ -889,7 +1059,10 @@ async fn scrape<B: Broker>(
             }
         }
     }
-    metrics.render(&Gauges { concurrency, inflight: n, running, queues: stats, resources: ready.usage(), loaded: ready.lazy_usage() })
+    let demand = if lookahead { ready.demand() } else { Vec::new() };
+    metrics.render(&Gauges {
+        concurrency, inflight: n, running, queues: stats, resources: ready.usage(), loaded: ready.lazy_usage(), demand,
+    })
 }
 
 #[cfg(test)]

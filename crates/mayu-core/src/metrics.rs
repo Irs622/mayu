@@ -59,6 +59,7 @@ struct Counters {
     pool_rebuilds: BTreeMap<String, u64>,
     pool_loads: BTreeMap<String, u64>,
     pool_evictions: BTreeMap<String, u64>,
+    pool_lookahead_loads: BTreeMap<String, u64>,
 }
 
 /// Sampled when `/metrics` is scraped.
@@ -75,11 +76,32 @@ pub struct Gauges {
     pub resources: Vec<(String, f64, f64)>,
     /// (pool, instances loaded) for each lazy pool; empty unless the worker runs pools lazily.
     pub loaded: Vec<(String, u32)>,
+    /// (pool, queued or waiting workflow nodes that use it) for each lazy pool; empty unless lookahead runs.
+    pub demand: Vec<(String, u32)>,
+}
+
+/// One GPU as last sampled by the Python side (NVML), pushed with `Runtime::set_gpu_stats`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuStat {
+    /// NVML index, as `nvidia-smi` numbers it.
+    pub index: u32,
+    pub uuid: String,
+    /// 0 to 1.
+    pub utilization: f64,
+    /// Bytes in use by all processes.
+    pub memory_used: u64,
+    pub memory_total: u64,
+    /// Bytes this worker's process tree uses; None if the driver can't attribute it.
+    pub process_memory: Option<u64>,
+    pub power_watts: Option<f64>,
+    pub temperature_c: Option<f64>,
 }
 
 #[derive(Default)]
 pub struct Metrics {
     c: Mutex<Counters>,
+    /// The last push; empty until the first.
+    gpus: Mutex<Vec<GpuStat>>,
 }
 
 fn key(queue: &str, task: &str) -> Key {
@@ -129,6 +151,16 @@ impl Metrics {
 
     pub fn pool_evicted(&self, pool: &str) {
         *self.c.lock().unwrap().pool_evictions.entry(pool.to_string()).or_default() += 1;
+    }
+
+    /// A lazy pool instance was built ahead of any task needing it (also counted by `pool_loaded`).
+    pub fn pool_lookahead_loaded(&self, pool: &str) {
+        *self.c.lock().unwrap().pool_lookahead_loads.entry(pool.to_string()).or_default() += 1;
+    }
+
+    /// Replaces the GPU samples rendered by `render`.
+    pub fn set_gpus(&self, gpus: Vec<GpuStat>) {
+        *self.gpus.lock().unwrap() = gpus;
     }
 
     pub fn render(&self, g: &Gauges) -> String {
@@ -183,6 +215,12 @@ impl Metrics {
                 sample(&mut out, "mayu_pool_evictions_total", &[("pool", p)], n);
             }
         }
+        if !c.pool_lookahead_loads.is_empty() {
+            family(&mut out, "mayu_pool_lookahead_loads_total", "counter", "Lazy pool instances built ahead of the task that needs them.");
+            for (p, n) in &c.pool_lookahead_loads {
+                sample(&mut out, "mayu_pool_lookahead_loads_total", &[("pool", p)], n);
+            }
+        }
         drop(c);
 
         family(&mut out, "mayu_worker_concurrency", "gauge", "Task threads in this worker process.");
@@ -231,7 +269,42 @@ impl Metrics {
                 sample(&mut out, "mayu_pool_loaded", &[("pool", p)], n);
             }
         }
+        if !g.demand.is_empty() {
+            family(&mut out, "mayu_pool_demand", "gauge", "Waiting or queued workflow nodes that use each lazy pool.");
+            for (p, n) in &g.demand {
+                sample(&mut out, "mayu_pool_demand", &[("pool", p)], n);
+            }
+        }
+        self.render_gpus(&mut out);
         out
+    }
+
+    /// Nothing before the first push; a field the GPU doesn't report has no sample.
+    fn render_gpus(&self, out: &mut String) {
+        let gpus = self.gpus.lock().unwrap();
+        if gpus.is_empty() {
+            return;
+        }
+        type Family = (&'static str, &'static str, fn(&GpuStat) -> Option<f64>);
+        let families: [Family; 6] = [
+            ("mayu_gpu_utilization_ratio", "GPU compute utilization, 0 to 1.", |s| Some(s.utilization)),
+            ("mayu_gpu_memory_used_bytes", "GPU memory in use by all processes.", |s| Some(s.memory_used as f64)),
+            ("mayu_gpu_memory_total_bytes", "GPU memory installed.", |s| Some(s.memory_total as f64)),
+            ("mayu_gpu_process_memory_bytes", "GPU memory used by this worker and its child processes.", |s| s.process_memory.map(|b| b as f64)),
+            ("mayu_gpu_power_watts", "GPU power draw.", |s| s.power_watts),
+            ("mayu_gpu_temperature_celsius", "GPU temperature.", |s| s.temperature_c),
+        ];
+        for (name, help, get) in families {
+            if !gpus.iter().any(|s| get(s).is_some()) {
+                continue;
+            }
+            family(out, name, "gauge", help);
+            for s in gpus.iter() {
+                if let Some(v) = get(s) {
+                    sample(out, name, &[("gpu", &s.index.to_string()), ("uuid", &s.uuid)], v);
+                }
+            }
+        }
     }
 }
 
@@ -440,5 +513,81 @@ mod tests {
         assert_eq!(value(&b, r#"mayu_pool_loads_total{pool="tts"}"#), Some(1.0));
         assert_eq!(value(&b, r#"mayu_pool_evictions_total{pool="gemma"}"#), Some(1.0));
         assert_eq!(value(&b, r#"mayu_pool_evictions_total{pool="tts"}"#), None);
+    }
+
+    fn gpu(index: u32) -> GpuStat {
+        GpuStat {
+            index,
+            uuid: format!("GPU-{index}"),
+            utilization: 0.5,
+            memory_used: 2 * 1024 * 1024 * 1024,
+            memory_total: 8 * 1024 * 1024 * 1024,
+            process_memory: Some(1024 * 1024 * 1024),
+            power_watts: Some(85.5),
+            temperature_c: Some(61.0),
+        }
+    }
+
+    #[test]
+    fn no_gpu_families_before_a_push() {
+        let b = Metrics::default().render(&Gauges::default());
+        assert!(!b.contains("mayu_gpu"), "{b}");
+    }
+
+    #[test]
+    fn gpu_families_render_per_device_with_index_and_uuid() {
+        let m = Metrics::default();
+        m.set_gpus(vec![gpu(0), GpuStat { utilization: 0.99, ..gpu(1) }]);
+        let b = m.render(&Gauges::default());
+        let l0 = r#"{gpu="0",uuid="GPU-0"}"#;
+        assert_eq!(value(&b, &format!("mayu_gpu_utilization_ratio{l0}")), Some(0.5));
+        assert_eq!(value(&b, r#"mayu_gpu_utilization_ratio{gpu="1",uuid="GPU-1"}"#), Some(0.99));
+        assert_eq!(value(&b, &format!("mayu_gpu_memory_used_bytes{l0}")), Some(2147483648.0));
+        assert_eq!(value(&b, &format!("mayu_gpu_memory_total_bytes{l0}")), Some(8589934592.0));
+        assert_eq!(value(&b, &format!("mayu_gpu_process_memory_bytes{l0}")), Some(1073741824.0));
+        assert_eq!(value(&b, &format!("mayu_gpu_power_watts{l0}")), Some(85.5));
+        assert_eq!(value(&b, &format!("mayu_gpu_temperature_celsius{l0}")), Some(61.0));
+        assert!(b.contains("# TYPE mayu_gpu_utilization_ratio gauge"), "{b}");
+    }
+
+    #[test]
+    fn gpu_fields_the_device_does_not_report_have_no_sample() {
+        let m = Metrics::default();
+        m.set_gpus(vec![gpu(0), GpuStat { process_memory: None, power_watts: None, temperature_c: None, ..gpu(1) }]);
+        let b = m.render(&Gauges::default());
+        assert!(value(&b, r#"mayu_gpu_process_memory_bytes{gpu="0",uuid="GPU-0"}"#).is_some());
+        assert!(!b.contains(r#"mayu_gpu_process_memory_bytes{gpu="1""#), "{b}");
+        assert!(!b.contains(r#"mayu_gpu_power_watts{gpu="1""#), "{b}");
+        assert!(!b.contains(r#"mayu_gpu_temperature_celsius{gpu="1""#), "{b}");
+        assert!(value(&b, r#"mayu_gpu_memory_used_bytes{gpu="1",uuid="GPU-1"}"#).is_some());
+    }
+
+    #[test]
+    fn a_later_push_replaces_the_earlier_one() {
+        let m = Metrics::default();
+        m.set_gpus(vec![gpu(0), gpu(1)]);
+        m.set_gpus(vec![gpu(1)]);
+        let b = m.render(&Gauges::default());
+        assert!(!b.contains(r#"gpu="0""#) && b.contains(r#"gpu="1""#), "{b}");
+    }
+
+    #[test]
+    fn lookahead_loads_are_counted_per_pool_and_only_emitted_once_seen() {
+        let m = Metrics::default();
+        assert!(!m.render(&Gauges::default()).contains("mayu_pool_lookahead_loads_total"));
+        m.pool_lookahead_loaded("tts");
+        m.pool_lookahead_loaded("tts");
+        let b = m.render(&Gauges::default());
+        assert_eq!(value(&b, r#"mayu_pool_lookahead_loads_total{pool="tts"}"#), Some(2.0));
+        assert_eq!(value(&b, r#"mayu_pool_lookahead_loads_total{pool="gemma"}"#), None);
+    }
+
+    #[test]
+    fn demand_gauge_is_rendered_only_when_given() {
+        assert!(!Metrics::default().render(&Gauges::default()).contains("mayu_pool_demand"));
+        let g = Gauges { demand: vec![("tts".into(), 2), ("gemma".into(), 0)], ..Gauges::default() };
+        let b = Metrics::default().render(&g);
+        assert_eq!(value(&b, r#"mayu_pool_demand{pool="tts"}"#), Some(2.0));
+        assert_eq!(value(&b, r#"mayu_pool_demand{pool="gemma"}"#), Some(0.0));
     }
 }

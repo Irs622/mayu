@@ -19,7 +19,7 @@ pub use envelope::{
 };
 pub use error::{Error, Result};
 pub use memory::{DeadEntry, MemoryBroker};
-pub use metrics::{DURATION_BUCKETS, Gauges, Metrics, Settled};
+pub use metrics::{DURATION_BUCKETS, Gauges, GpuStat, Metrics, Settled};
 pub use policy::{Action, Link, Outcome, RetryPolicy, backoff_ms, decide, full_jitter};
 pub use result::{ResultRecord, wait_result};
 pub use runtime::{ReadyTask, Runtime, RuntimeConfig};

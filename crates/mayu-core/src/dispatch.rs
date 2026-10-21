@@ -804,26 +804,22 @@ impl ReadyQueue {
     }
 
     /// See `Dispatcher::set_demand`. A pool whose demand ended may now be evicted, which waiters may need.
-    #[allow(dead_code)] // the runtime's lookahead loop calls it
     pub(crate) fn set_demand(&self, demand: &[(String, u32)]) {
         if self.inner.lock().unwrap().set_demand(demand) {
             self.cv.notify_all();
         }
     }
 
-    #[allow(dead_code)] // the runtime's metrics call it
     pub(crate) fn demand(&self) -> Vec<(String, u32)> {
         self.inner.lock().unwrap().demand()
     }
 
     /// See `Dispatcher::lookahead_begin`.
-    #[allow(dead_code)] // the runtime's lookahead binding calls it
     pub(crate) fn lookahead_begin(&self) -> Option<String> {
         self.inner.lock().unwrap().lookahead_begin(Instant::now())
     }
 
     /// See `Dispatcher::lookahead_done`. The instance may be what a waiter needs, or its room is free again.
-    #[allow(dead_code)] // the runtime's lookahead binding calls it
     pub(crate) fn lookahead_done(&self, pool: &str, ok: bool) -> Result<()> {
         self.inner.lock().unwrap().lookahead_done(pool, ok, Instant::now())?;
         self.cv.notify_all();
@@ -831,7 +827,6 @@ impl ReadyQueue {
     }
 
     /// See `Dispatcher::blocked`.
-    #[allow(dead_code)] // the runtime's tuner binding calls it
     pub(crate) fn blocked(&self, resource: &str) -> usize {
         self.inner.lock().unwrap().blocked(resource, Instant::now())
     }

@@ -379,7 +379,7 @@ class WorkerRunner:
             rate_limits=rate_limits,
             resources=self.capacity or None,
             task_resources=self.task_resources or None,
-            lazy_pools=self.lazy_pools or None,
+            lazy_pools={p: (claim, loaded, None) for p, (claim, loaded) in self.lazy_pools.items()} or None,
             schedule=self.schedule,
             metrics_addr=(None if self.metrics_port_requested is None
                           else _hostport(self.metrics_host, self.metrics_port_requested)),
