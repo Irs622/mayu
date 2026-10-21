@@ -11,7 +11,7 @@ few processes can do the work that Celery needs dozens of forked processes for.
 
 > Status: alpha. Delivery is at-least-once: **tasks must be idempotent.**
 
-- **Fast:** about 18× Celery's no-op throughput and 5× on a realistic task, with a fraction of the
+- **Fast:** about 31× Celery's no-op throughput and 5× on a realistic task, with an eighth of the
   memory ([benchmarks](https://github.com/Siddid-Soni/mayu/blob/main/bench/RESULTS.md)).
 - **Free-threaded first:** thread mode on Python 3.14t, with automatic fallback to process mode on
   GIL builds (3.13, 3.14).
@@ -413,7 +413,8 @@ changes.
 ## Benchmarks
 
 mayu vs Celery, RQ, Dramatiq and streaQ at 64 concurrent tasks: no-op throughput, a realistic task
-(JSON decode + 5 ms I/O + 1 ms CPU), and memory at equal concurrency. Results and method:
+(JSON decode + 5 ms I/O + 1 ms CPU), memory at equal concurrency, and workers on Python 3.14t, 3.14 and
+3.13 serving the same queues at once. Results and method:
 [`bench/RESULTS.md`](https://github.com/Siddid-Soni/mayu/blob/main/bench/RESULTS.md). Reproduce with `bench/setup.sh && bench/all.sh` (needs Docker and uv).
 
 ## Development
