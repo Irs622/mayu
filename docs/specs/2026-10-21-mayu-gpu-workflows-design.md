@@ -33,7 +33,8 @@ never wait on GPU capacity.
 3. Admit tasks by declared resource use (`gpu`, `vram_gb`, `cpu`, user-defined), so tasks that each
    under-use a GPU run concurrently and tasks that don't fit wait.
 4. Workflows: a DAG of tasks where a node is enqueued only when all of its parents succeeded.
-5. Resident models: load once per worker, keep loaded across tasks, evict by VRAM budget, and prefer
+5. Model pools for servers: N preloaded instances per worker, one per running task.
+6. Resident models: load once per worker, keep loaded across tasks, evict by VRAM budget, and prefer
    tasks whose model is already loaded.
 
 ### Non-goals (this design)
@@ -140,25 +141,61 @@ handle = wf.send()          # WorkflowHandle: status, per-node handles, cancel()
 - Supersedes "canvas" in the architecture spec's out-of-scope list; `link=` stays as the single-callback
   shortcut.
 
-## 7. Resident models and scheduling (Plan 12)
+## 7. Model pools (Plan 12)
+
+For servers: a fixed number of instances of an expensive object (a model, a loaded tensor set), loaded at
+worker start and kept for the worker's life. Code says how to build one; the operator says how many.
 
 ```python
-@app.resource(model="tts", vram_gb=6.9, exclusive=True)
-def tts():
+@app.pool("gemma", vram_gb=5.8)            # per instance; optional, any declared resource
+def gemma(ctx):                            # ctx.index in range(ctx.size): pick a device, a shard...
+    return load_gemma(device=f"cuda:{ctx.index % torch.cuda.device_count()}")
+
+@app.pool("tts", vram_gb=6.9)
+def tts(ctx):
     return load_tts()
 
-@tts.close
-def _(server):
-    unload(server)
-
-@voice_lines.implement
-def _(run, server=app.use(tts)): ...
+@encode_prompts.implement
+def _(run, model=app.use("gemma")): ...    # one instance, exclusively, for the task's duration
+```
+```bash
+mayu worker app:app --queues gpu --mode thread --threads 8 \
+    --pools gemma=2,tts=3 --resources gpu=1,vram_gb=40
 ```
 
-- A resource loads lazily (or at startup with `eager=True`) once per worker process, under a lock.
-  `exclusive=True` serializes tasks using it; otherwise it is shared by concurrent tasks.
-- The worker keeps loaded models within its `vram_gb` budget, evicting least-recently-used models that no
-  running task holds. It tells the dispatcher what is loaded.
+- **Admission:** pool `p` of size N is a ledger resource `pool:p` with capacity N (§5); a task that uses it
+  requests `pool:p=1` on top of its own `resources=`. So at most N such tasks run at once and checkout from
+  the pool's free list never blocks. No new dispatcher logic.
+- **Loading:** every instance is built before the worker fetches anything, one at a time (no VRAM spikes
+  from parallel loads). A failed load fails startup. Instances that declare resources reserve them for the
+  worker's life: `--pools gemma=2` with `vram_gb=5.8` takes 11.6 of the worker's `vram_gb`, and the worker
+  refuses to start if the pools don't fit.
+- **Validation:** a served task that uses a pool missing from `--pools` (or sized 0) is a startup error.
+  Tasks on other queues are ignored, as with resources.
+- **Thread safety:** each instance is used by one task at a time; the free list is a locked deque. A task
+  never sees two instances unless it asks for two pools.
+- **Broken instances:** a task that raises `mayu.DiscardInstance` (or any exception listed in the pool's
+  `discard_on=`, e.g. CUDA errors) has its instance closed (`@gemma.close`) and rebuilt before the slot
+  is handed out again; the task itself fails or retries as usual.
+- **Metrics:** `mayu_pool_size{pool}`, `mayu_pool_busy{pool}`, `mayu_pool_rebuilds_total{pool}`.
+- **Multi-GPU:** either one process per GPU (`--gpus`, pools sized per GPU) or one process with
+  `ctx.index` placing instances across devices; the ledger is per process either way.
+
+Pools are the static, server form of residency. §7.1 adds the dynamic form for small machines.
+
+## 7.1 Resident models and scheduling (Plan 13)
+
+The same `@app.pool` factories, sized lazily instead of preloaded, for machines that can't hold every
+model at once (an 8 GB card can't hold both models of the driving example):
+
+```bash
+mayu worker app:app --pools gemma=1,tts=1 --pool-mode lazy --resources gpu=1,vram_gb=7.5
+```
+
+- A lazy pool builds an instance on first use and keeps it after the task ends.
+- The worker keeps loaded instances within its `vram_gb` budget, evicting (via the pool's `close`)
+  least-recently-used idle instances when a task needs a pool that isn't loaded. It tells the dispatcher
+  what is loaded.
 - When capacity frees, the dispatcher picks among ready tasks that fit by
   `score = resident_bonus + workflow_age + wait_aging`:
   - a task whose model is loaded beats one that would force a swap;
@@ -183,10 +220,12 @@ key layout.
 | ~~9~~ | ~~Python 3.11 / 3.12~~: dropped, see §4 | | |
 | 10 | Resource admission, `--resources`, `--gpus` (done; capacity requeue on OOM deferred) | — | defaults only |
 | 11 | Workflows (DAG) | — | no |
-| 12 | Resident models, residency-aware scoring, `cost=` | 10, 11 | yes: load times, VRAM |
-| 13 | Self-tuning concurrency (NVML, optional `gpu` extra), GPU metrics, linger | 12 | yes |
+| 12 | Model pools (`@app.pool`, `--pools`, `app.use`), server form of residency | 10 | no |
+| 13 | Resident models with eviction, residency-aware scoring, `cost=` | 11, 12 | yes: load times, VRAM |
+| 14 | Self-tuning concurrency (NVML, optional `gpu` extra), GPU metrics, linger | 13 | yes |
+| later | Capacity requeue on GPU OOM without spending a retry | 10 | no |
 
-Before Plan 12: one instrumented run of the driving example on the target GPU, recording model load
+Before Plan 13: one instrumented run of the driving example on the target GPU, recording model load
 times, peak VRAM per stage, and GPU/CPU utilization with 1 vs 3 parallel renders.
 
 ## 9. Later: hosting
