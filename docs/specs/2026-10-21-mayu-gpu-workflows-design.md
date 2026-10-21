@@ -219,7 +219,7 @@ key layout.
 | 8 | Declarations, `implement`, send by name (done) | — | no |
 | ~~9~~ | ~~Python 3.11 / 3.12~~: dropped, see §4 | | |
 | 10 | Resource admission, `--resources`, `--gpus` (done; capacity requeue on OOM deferred) | — | defaults only |
-| 11 | Workflows (DAG) | — | no |
+| 11 | Workflows (DAG) (done) | — | no |
 | 12 | Model pools (`@app.pool`, `--pools`, `app.use`), server form of residency | 10 | no |
 | 13 | Resident models with eviction, residency-aware scoring, `cost=` | 11, 12 | yes: load times, VRAM |
 | 14 | Self-tuning concurrency (NVML, optional `gpu` extra), GPU metrics, linger | 13 | yes |
