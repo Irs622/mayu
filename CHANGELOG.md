@@ -11,6 +11,7 @@ All notable changes to mayu are documented here. The format follows
 - `app.declare` / `task.implement` and `app.send(name, ...)` to enqueue tasks without importing their code; workers serve only queues whose tasks they implement.
 - Resource admission: `resources={"gpu": 0.3}` on tasks, `--resources` on workers, `--gpus` for one worker process per GPU, and `mayu_resource_capacity` / `mayu_resource_in_use` gauges.
 - Workflows: `app.workflow()` builds a DAG of tasks (`wf.add(sig, after=[...])`) that `send()` submits atomically; each node's ack releases the children whose parents are all done. `WorkflowHandle` has `status()`, `wait()` and `cancel()`, a dead-lettered node blocks its descendants until `mayu dead replay`, `mayu inspect` lists unfinished workflows, and skipped nodes count as `outcome="cancelled"` in `mayu_tasks_settled_total`.
+- Model pools: `@app.pool("gemma", vram_gb=5.8)` builds a fixed number of instances of an expensive object once per worker (`--pools gemma=2` / `MAYU_POOLS`), tasks borrow one with `model=app.use("gemma")`, and `DiscardInstance` / `discard_on` replace broken ones. Adds `mayu_pool_size`, `mayu_pool_busy` and `mayu_pool_rebuilds_total`; resource names starting with `pool:` are reserved.
 
 ### Changed
 
