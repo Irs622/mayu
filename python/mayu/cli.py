@@ -112,7 +112,8 @@ def _build_runner(app, args, threads: int):
                         metrics_port=args.metrics_port, metrics_host=args.metrics_host,
                         resources=args.resources, pools=args.pools, thp=args.thp,
                         pool_mode=args.pool_mode, schedule=args.schedule, preload=args.preload,
-                        gpu_monitor=args.gpu_monitor, gpu_interval=args.gpu_interval)
+                        gpu_monitor=args.gpu_monitor, gpu_interval=args.gpu_interval,
+                        autotune=args.autotune)
 
 
 def _cmd_worker(args) -> int:
@@ -353,6 +354,10 @@ def main(argv: list[str] | None = None) -> int:
                         "auto (default): on when NVML works and a GPU is visible; on: error if it can't; off")
     w.add_argument("--gpu-interval", type=float, default=os.environ.get("MAYU_GPU_INTERVAL") or 2.0, metavar="SECONDS",
                    help="how often to read the GPUs (default 2)")
+    w.add_argument("--autotune", default=os.environ.get("MAYU_AUTOTUNE") or None, metavar="RESOURCE",
+                   help="adapt concurrency to the hardware. gpu: with --resources gpu=N as the ceiling, run fewer "
+                        "GPU tasks while the GPU is saturated and more again when it idles with tasks waiting "
+                        "(needs mayu[gpu])")
     w.add_argument("--thp", default=os.environ.get("MAYU_THP") or "python", metavar="{python,keep,off}",
                    help="transparent huge pages: python (default) opts only Python's own heap out, keep leaves "
                         "the system setting, off disables them for the whole process and its children")

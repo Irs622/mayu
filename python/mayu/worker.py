@@ -134,7 +134,8 @@ class WorkerRunner:
                  metrics_port: int | None = None, metrics_host: str = "0.0.0.0",
                  resources: dict[str, float] | None = None, pools: dict[str, int] | None = None,
                  thp: str = "python", pool_mode: str = "eager", schedule: str | None = None,
-                 preload: list[str] | None = None, gpu_monitor: str = "auto", gpu_interval: float = 2.0):
+                 preload: list[str] | None = None, gpu_monitor: str = "auto", gpu_interval: float = 2.0,
+                 autotune: str | None = None):
         if threads < 1:
             raise ValueError("threads must be >= 1")
         if visibility_timeout <= 0 or heartbeat_interval <= 0:
@@ -162,6 +163,11 @@ class WorkerRunner:
         if isinstance(gpu_interval, bool) or not isinstance(gpu_interval, (int, float)) or not gpu_interval > 0 \
                 or math.isinf(gpu_interval):
             raise ValueError(f"gpu_interval must be a positive number of seconds, got {gpu_interval!r}")
+        if autotune not in (None, "gpu"):
+            raise ValueError(f"autotune must be 'gpu' (the only resource mayu can tune), got {autotune!r}")
+        if autotune and gpu_monitor == "off":
+            raise ValueError("--autotune gpu reads the GPU's utilization through NVML, which --gpu-monitor off "
+                             "turns away; use --gpu-monitor auto or on, or drop --autotune")
         self.thp = thp_mod.check(thp)
         self.app = app
         self.threads = threads
@@ -177,6 +183,10 @@ class WorkerRunner:
                              "import their implementations or pass queues")
         self.gpu_interval = float(gpu_interval)
         self._gpu_backend = self._plan_gpu_monitor(gpu_monitor, resources)
+        if autotune and self._gpu_backend is None:
+            if gpu_mod.backend() is None:
+                raise ValueError("--autotune gpu needs NVIDIA's NVML: pip install 'mayu[gpu]'")
+            raise ValueError("--autotune gpu found no readable GPU; check CUDA_VISIBLE_DEVICES")
         if gpu_mod.has_auto(resources):
             resources = gpu_mod.resolve_auto(resources)
             log.info("resolved resources from the visible GPUs: %s",
@@ -189,6 +199,7 @@ class WorkerRunner:
         self.schedule = (schedule or "oldest") if self.lazy else None
         self.task_resources = self._served_requests(left)
         self.capacity = {**left, **{f"pool:{p}": float(n) for p, n in self._loaded.items()}}
+        self._tuner = self._plan_autotune(autotune)
         self.strict_priority = bool(queues)  # only a non-empty explicit list is a priority order
         self.prefetch_multiplier = prefetch_multiplier
         self.shutdown_grace = shutdown_grace
@@ -252,6 +263,19 @@ class WorkerRunner:
                 raise ValueError("--gpu-monitor on found no visible GPU; check CUDA_VISIBLE_DEVICES")
             return None
         return be
+
+    def _plan_autotune(self, autotune: str | None) -> gpu_mod.Tuner | None:
+        """The `gpu` tuner: the capacity the worker has is the ceiling, the smallest served request the step and the
+        largest the floor (the biggest task must still fit)."""
+        if not autotune:
+            return None
+        asks = [r["gpu"] for r in self.task_resources.values() if "gpu" in r]
+        if "gpu" not in self.capacity:
+            raise ValueError("--autotune gpu needs a gpu resource to tune: pass --resources gpu=...")
+        if not asks:
+            raise ValueError("--autotune gpu needs a served task that requests gpu: declare "
+                             "@app.task(resources={'gpu': ...}) or drop --autotune")
+        return gpu_mod.Tuner(self.capacity["gpu"], max(asks), min(asks))
 
     def _plan_pools(self, pools) -> dict[str, float]:
         """Checks `pools` against the served tasks; returns what each declared resource has left after reserving
@@ -400,7 +424,7 @@ class WorkerRunner:
             self.native.pool_loaded(name)
         if self._gpu_backend is not None:
             self._sampler = gpu_mod.Sampler(self.native, self._gpu_backend, self.gpu_interval,
-                                            vram_gb=self.resources.get("vram_gb"))
+                                            vram_gb=self.resources.get("vram_gb"), tuner=self._tuner)
             self._sampler.start()
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(target=self._loop.run_forever, name="mayu-async", daemon=True)

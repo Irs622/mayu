@@ -24,6 +24,11 @@ UNDER_MARGIN_RATIO = 0.10
 UNDER_EVERY = 300.0  # seconds between two under-declared warnings
 WARN_EVERY = 60.0  # seconds between two logs of the same sampler error
 AUTO_RESOURCES = ("gpu", "vram_gb")
+TUNE_WINDOW = 5  # ticks per tuning decision (10 s at the default interval)
+TUNE_HIGH = 0.90  # mean utilization at or above which the GPU is saturated: more concurrency only adds latency
+TUNE_LOW = 0.70  # mean utilization below which the GPU has room, if tasks are waiting for it
+TUNE_COOLDOWN = 6  # windows after a shrink before the tuner may grow again, so it can't flap between two steps
+VRAM_PRESSURE = 0.95  # share of the cards' memory in use above which the tuner won't add concurrency
 
 
 @dataclasses.dataclass
@@ -290,17 +295,75 @@ class UnderDeclared:
         return True
 
 
+class Tuner:
+    """Adaptive concurrency for the `gpu` resource: how much capacity to add or remove after each window of ticks.
+
+    `ceiling` is the configured capacity (where it starts), `step` the smallest task request and `floor` the largest
+    (the biggest task must still fit). Capacity is tracked in thousandths, like the dispatcher's, so repeated steps
+    can't drift. After a shrink it waits `cooldown` windows before growing: one task fewer can move the GPU from
+    above TUNE_HIGH to below TUNE_LOW, and without the wait it would shrink and grow on alternate windows."""
+
+    def __init__(self, ceiling: float, floor: float, step: float, cooldown: int = TUNE_COOLDOWN):
+        self._ceiling, self._floor, self._step = round(ceiling * 1000), round(floor * 1000), round(step * 1000)
+        if self._step < 1 or self._floor < 1 or self._floor > self._ceiling:
+            raise ValueError(f"tuner needs 0 < step, 0 < floor <= ceiling, got ceiling={ceiling} floor={floor} "
+                             f"step={step}")
+        self._cap = self._ceiling
+        self._cooldown = cooldown
+        self._wait = 0  # windows left before growth is allowed again
+        self._utils: list[float] = []
+        self._pressure = False
+        self.window_mean = 0.0  # the mean utilization the last decision was based on
+
+    @property
+    def capacity(self) -> float:
+        return self._cap / 1000
+
+    @property
+    def closes_window(self) -> bool:
+        """True when the next `observe` ends a window, i.e. is the only one that needs `blocked`."""
+        return len(self._utils) == TUNE_WINDOW - 1
+
+    def observe(self, util: float, blocked: int, vram_pressure: bool) -> float:
+        """One tick's mean utilization (0-1), the number of due tasks waiting on `gpu` and whether VRAM is tight.
+        Returns the capacity change to apply, 0.0 except at the end of a window."""
+        self._utils.append(util)
+        self._pressure = self._pressure or vram_pressure
+        if len(self._utils) < TUNE_WINDOW:
+            return 0.0
+        self.window_mean = mean = sum(self._utils) / len(self._utils)
+        pressure = self._pressure
+        self._utils.clear()  # one decision per window, whether or not it changes anything
+        self._pressure = False
+        cooling, self._wait = self._wait > 0, max(0, self._wait - 1)
+        if mean >= TUNE_HIGH and self._cap - self._step >= self._floor:
+            delta = -self._step
+            self._wait = self._cooldown
+        elif (mean < TUNE_LOW and blocked > 0 and not pressure and not cooling
+              and self._cap + self._step <= self._ceiling):
+            delta = self._step
+        else:
+            return 0.0
+        self._cap += delta
+        return delta / 1000
+
+    def revert(self, delta: float) -> None:
+        """Takes back a change `observe` returned that the worker could not apply."""
+        self._cap -= round(delta * 1000)
+
+
 class Sampler:
     """The `mayu-gpu` thread. Every `interval` seconds: read the GPUs, push them to the metrics, run the VRAM guard
     and the under-declared check, then the tuner hook. All its state lives on that thread (tests call `tick`)."""
 
     def __init__(self, native, be: Backend, interval: float, vram_gb: float | None = None,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, tuner: Tuner | None = None):
         self.native = native
         self.backend = be
         self.interval = interval
         self.vram_gb = vram_gb or None  # the configured capacity; the guard and the warning need a declared amount
         self._clock = clock
+        self._tuner = tuner
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._guard: Guard | None = None
@@ -396,4 +459,28 @@ class Sampler:
                         "%.1f; raise vram_gb= on them or the GPU may run out of memory", used, declared)
 
     def _tune(self, gpus: list[Gpu]) -> None:
-        """Hook for the adaptive-concurrency tuner; runs after the guard, so it can see the guard's state."""
+        """Runs after the guard, so it sees what the guard withheld."""
+        tuner = self._tuner
+        if tuner is None or not gpus:
+            return
+        util = sum(g.utilization for g in gpus) / len(gpus)
+        total = sum(g.memory_total for g in gpus)
+        pressure = self._withheld > 0 or (total > 0 and sum(g.memory_used for g in gpus) >= VRAM_PRESSURE * total)
+        blocked = self.native.blocked("gpu") if tuner.closes_window else 0  # it costs a pass over the held tasks
+        delta = tuner.observe(util, blocked, pressure)
+        if delta == 0:
+            return
+        try:
+            self.native.adjust_capacity("gpu", delta)
+        except Exception:
+            tuner.revert(delta)  # the change didn't happen; the tuner must not think it did
+            raise
+        busy, window = round(tuner.window_mean * 100), round(TUNE_WINDOW * self.interval)
+        was, now = tuner.capacity - delta, tuner.capacity
+        extra = {"gpu_utilization": round(tuner.window_mean, 2), "gpu_capacity": now, "blocked": blocked}
+        if delta < 0:
+            log.info("GPU busy %d%% over the last %d s; running fewer GPU tasks: gpu capacity %.4g \u2192 %.4g",
+                     busy, window, was, now, extra=extra)
+        else:
+            log.info("GPU only %d%% busy over the last %d s with %d tasks waiting; running more GPU tasks: "
+                     "gpu capacity %.4g \u2192 %.4g", busy, window, blocked, was, now, extra=extra)

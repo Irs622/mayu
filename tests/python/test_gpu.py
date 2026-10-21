@@ -13,7 +13,7 @@ import pytest
 
 from mayu import gpu as gpu_mod
 from mayu.cli import parse_resources
-from mayu.gpu import GIB, Gpu, Guard, Sampler, UnderDeclared, resolve_auto, visible
+from mayu.gpu import GIB, TUNE_COOLDOWN, TUNE_WINDOW, Gpu, Guard, Sampler, Tuner, UnderDeclared, resolve_auto, visible
 from mayu.worker import WorkerRunner
 
 # monkeypatch swaps mayu.gpu attributes that every thread of a pytest-run-parallel run shares
@@ -78,8 +78,8 @@ class FakeGpus:
                 setattr(self.gpus[index], k, v)
 
 
-def card(index=0, total_gib=8.0, used_gib=0.0, process_gib=0.0, **fields):
-    return Gpu(index, f"GPU-{index:04d}", "Fake RTX", int(total_gib * GIB), int(used_gib * GIB), 0.5,
+def card(index=0, total_gib=8.0, used_gib=0.0, process_gib=0.0, utilization=0.5, **fields):
+    return Gpu(index, f"GPU-{index:04d}", "Fake RTX", int(total_gib * GIB), int(used_gib * GIB), utilization,
                process_memory=None if process_gib is None else int(process_gib * GIB), **fields)
 
 
@@ -150,6 +150,41 @@ def test_worker_validates_the_monitor_options(app):
         WorkerRunner(app, threads=1, resources={"cpu": "auto"})
 
 
+def test_worker_validates_autotune(app):
+    @app.task(resources={"gpu": 0.25})
+    def small(): ...
+
+    with pytest.raises(ValueError, match="autotune must be 'gpu'.*got 'vram_gb'"):
+        WorkerRunner(app, threads=1, autotune="vram_gb", resources={"gpu": 1.0})
+    with pytest.raises(ValueError, match="--gpu-monitor off turns away"):
+        WorkerRunner(app, threads=1, autotune="gpu", gpu_monitor="off", resources={"gpu": 1.0})
+
+
+@thread_unsafe
+def test_autotune_needs_nvml_a_gpu_resource_and_a_task_that_requests_it(app, monkeypatch):
+    monkeypatch.setattr(gpu_mod, "_backend", None)
+    with pytest.raises(ValueError, match=r"--autotune gpu needs NVIDIA's NVML: pip install 'mayu\[gpu\]'"):
+        WorkerRunner(app, threads=1, autotune="gpu", resources={"gpu": 1.0})
+    monkeypatch.setattr(gpu_mod, "_backend", FakeGpus())
+    with pytest.raises(ValueError, match="--autotune gpu found no readable GPU"):
+        WorkerRunner(app, threads=1, autotune="gpu", resources={"gpu": 1.0})
+    monkeypatch.setattr(gpu_mod, "_backend", FakeGpus(card()))
+    with pytest.raises(ValueError, match="--autotune gpu needs a gpu resource to tune: pass --resources gpu="):
+        WorkerRunner(app, threads=1, autotune="gpu", resources={"cpu": 4})
+    with pytest.raises(ValueError, match="--autotune gpu needs a served task that requests gpu"):
+        WorkerRunner(app, threads=1, autotune="gpu", resources={"gpu": 1.0})
+
+    @app.task(resources={"gpu": 0.25})
+    def small(): ...
+
+    @app.task(resources={"gpu": 0.5})
+    def medium(): ...
+
+    w = WorkerRunner(app, threads=1, autotune="gpu", resources={"gpu": 1.0})
+    assert (w._tuner.capacity, w._tuner._floor, w._tuner._step) == (1.0, 500, 250)  # ceiling, largest, smallest
+    assert WorkerRunner(app, threads=1, resources={"gpu": 1.0})._tuner is None
+
+
 @thread_unsafe
 def test_monitor_on_needs_a_backend_and_a_device(app, monkeypatch):
     monkeypatch.setattr(gpu_mod, "_backend", None)
@@ -200,6 +235,117 @@ class TestGuard:
         assert Guard(0.0).observe(0.30000000000000004) == 0.3
 
 
+def feed(tuner, util, blocked=0, pressure=False, ticks=TUNE_WINDOW):
+    """The deltas `ticks` observations return."""
+    return [tuner.observe(util, blocked, pressure) for _ in range(ticks)]
+
+
+class TestTuner:
+    def test_a_saturated_window_shrinks_one_step_and_stops_at_the_floor(self):
+        t = Tuner(ceiling=1.0, floor=0.25, step=0.25)
+        assert feed(t, 0.99) == [0, 0, 0, 0, -0.25]
+        assert t.capacity == 0.75
+        assert feed(t, 0.95, ticks=2 * TUNE_WINDOW) == [0, 0, 0, 0, -0.25, 0, 0, 0, 0, -0.25]
+        assert t.capacity == 0.25
+        assert feed(t, 1.0, ticks=3 * TUNE_WINDOW) == [0] * 3 * TUNE_WINDOW  # at the floor: the biggest task fits
+
+    def test_the_floor_is_the_biggest_task_not_a_multiple_of_the_step(self):
+        t = Tuner(ceiling=1.0, floor=0.5, step=0.25)
+        feed(t, 0.99, ticks=5 * TUNE_WINDOW)
+        assert t.capacity == 0.5
+
+    def test_the_mean_decides_not_one_tick(self):
+        t = Tuner(1.0, 0.25, 0.25)
+        assert [t.observe(u, 0, False) for u in (1.0, 1.0, 1.0, 0.5, 0.8)] == [0] * 5  # mean 0.86
+        assert [t.observe(u, 0, False) for u in (1.0, 1.0, 1.0, 1.0, 0.5)] == [0, 0, 0, 0, -0.25]  # mean 0.9
+
+    def test_an_idle_gpu_with_waiting_tasks_grows_one_step_and_stops_at_the_ceiling(self):
+        t = Tuner(1.0, 0.25, 0.25, cooldown=0)
+        feed(t, 0.99, ticks=3 * TUNE_WINDOW)
+        assert t.capacity == 0.25
+        assert feed(t, 0.3, blocked=2, ticks=2 * TUNE_WINDOW) == [0, 0, 0, 0, 0.25, 0, 0, 0, 0, 0.25]
+        assert t.capacity == 0.75
+        feed(t, 0.3, blocked=2, ticks=TUNE_WINDOW)
+        assert t.capacity == 1.0
+        assert feed(t, 0.3, blocked=2, ticks=2 * TUNE_WINDOW) == [0] * 2 * TUNE_WINDOW
+
+    def test_nothing_waiting_holds(self):
+        t = Tuner(1.0, 0.25, 0.25)
+        feed(t, 0.99, ticks=TUNE_WINDOW)
+        assert feed(t, 0.1, blocked=0, ticks=3 * TUNE_WINDOW) == [0] * 3 * TUNE_WINDOW
+        assert t.capacity == 0.75
+
+    def test_the_middle_band_holds_whatever_waits(self):
+        t = Tuner(1.0, 0.25, 0.25)
+        feed(t, 0.99, ticks=TUNE_WINDOW)
+        assert feed(t, 0.8, blocked=5, ticks=3 * TUNE_WINDOW) == [0] * 3 * TUNE_WINDOW
+        assert t.capacity == 0.75
+
+    def test_blocked_counts_at_the_end_of_the_window_only(self):
+        t = Tuner(1.0, 0.25, 0.25, cooldown=0)
+        feed(t, 0.99, ticks=TUNE_WINDOW)
+        assert [t.observe(0.2, 3, False) for _ in range(4)] == [0] * 4
+        assert t.observe(0.2, 0, False) == 0  # nothing waits when the window closes
+        assert [t.observe(0.2, 0, False) for _ in range(4)] == [0] * 4
+        assert t.observe(0.2, 1, False) == 0.25
+
+    def test_vram_pressure_anywhere_in_the_window_stops_growth(self):
+        t = Tuner(1.0, 0.25, 0.25, cooldown=0)
+        feed(t, 0.99, ticks=TUNE_WINDOW)
+        assert [t.observe(0.2, 2, p) for p in (False, True, False, False, False)] == [0] * 5
+        assert t.capacity == 0.75
+        assert feed(t, 0.2, blocked=2) == [0, 0, 0, 0, 0.25]  # the pressure flag does not outlive its window
+
+    def test_pressure_does_not_stop_shrinking(self):
+        t = Tuner(1.0, 0.25, 0.25)
+        assert feed(t, 0.99, pressure=True)[-1] == -0.25
+
+    def test_one_decision_per_window_so_a_change_never_steps_twice(self):
+        t = Tuner(1.0, 0.25, 0.25)
+        deltas = feed(t, 0.99, ticks=TUNE_WINDOW + 1)
+        assert deltas[TUNE_WINDOW - 1] == -0.25 and deltas[TUNE_WINDOW] == 0  # the next window starts empty
+        assert t.capacity == 0.75
+        assert not t.closes_window
+        feed(t, 0.99, ticks=TUNE_WINDOW - 2)
+        assert t.closes_window
+
+    def test_a_hold_also_restarts_the_window(self):
+        t = Tuner(1.0, 0.25, 0.25)
+        assert feed(t, 0.8, ticks=TUNE_WINDOW) == [0] * TUNE_WINDOW
+        assert feed(t, 0.99, ticks=TUNE_WINDOW)[-1] == -0.25  # the 0.8 ticks are gone, not averaged in
+
+    def test_thousandths_do_not_drift(self):
+        t = Tuner(1.0, 0.1, 0.1, cooldown=0)
+        for _ in range(9):
+            assert feed(t, 0.99)[-1] == -0.1
+        assert t.capacity == 0.1
+        for _ in range(9):
+            assert feed(t, 0.1, blocked=1)[-1] == 0.1
+        assert t.capacity == 1.0
+
+    def test_revert_undoes_a_change_that_was_not_applied(self):
+        t = Tuner(1.0, 0.25, 0.25)
+        delta = feed(t, 0.99)[-1]
+        t.revert(delta)
+        assert t.capacity == 1.0
+        assert feed(t, 0.99)[-1] == -0.25
+
+    def test_after_a_shrink_growth_waits_out_the_cooldown(self):
+        t = Tuner(1.0, 0.25, 0.25, cooldown=2)
+        assert feed(t, 0.95)[-1] == -0.25  # four tasks saturate the GPU
+        assert feed(t, 0.68, blocked=1, ticks=2 * TUNE_WINDOW) == [0] * 2 * TUNE_WINDOW  # three leave it idle
+        assert feed(t, 0.68, blocked=1)[-1] == 0.25
+        t = Tuner(1.0, 0.25, 0.25)  # the default cooldown
+        feed(t, 0.95)
+        assert feed(t, 0.3, blocked=1, ticks=TUNE_COOLDOWN * TUNE_WINDOW) == [0] * TUNE_COOLDOWN * TUNE_WINDOW
+        assert feed(t, 0.3, blocked=1)[-1] == 0.25
+
+    @pytest.mark.parametrize("ceiling,floor,step", [(1.0, 2.0, 0.5), (1.0, 0.5, 0), (1.0, 0, 0.5), (1.0, 0.5, -1)])
+    def test_bad_bounds(self, ceiling, floor, step):
+        with pytest.raises(ValueError, match="tuner needs"):
+            Tuner(ceiling, floor, step)
+
+
 class TestUnderDeclared:
     def test_fires_after_three_ticks_over_the_margin_then_not_for_five_minutes(self):
         now = [1000.0]
@@ -230,11 +376,21 @@ class FakeNative:
         self.stats = []
         self.adjusted = []
         self.in_use = in_use
+        self.waiting = 0
+        self.blocked_calls = 0
+        self.fail_adjust = False
+
+    def blocked(self, resource):
+        assert resource == "gpu"
+        self.blocked_calls += 1
+        return self.waiting
 
     def set_gpu_stats(self, stats):
         self.stats.append(stats)
 
     def adjust_capacity(self, resource, delta):
+        if self.fail_adjust:
+            raise RuntimeError("no such resource")
         self.adjusted.append((resource, round(delta, 3)))
 
     def resource_usage(self):
@@ -355,6 +511,114 @@ def test_under_declared_vram_warns_with_both_numbers(caplog):
             "raise vram_gb= on them or the GPU may run out of memory") in caplog.text
 
 
+def _tuned(fake, native, ceiling=1.0, floor=0.25, step=0.25, vram_gb=None):
+    return Sampler(native, fake, 10.0, vram_gb=vram_gb, tuner=Tuner(ceiling, floor, step, cooldown=0))
+
+
+@log_unsafe
+def test_a_saturated_gpu_runs_fewer_gpu_tasks_and_says_so(caplog):
+    fake = FakeGpus(card(utilization=0.97))
+    native = FakeNative()
+    sampler = _tuned(fake, native)
+    with caplog.at_level(logging.INFO, logger="mayu.gpu"):
+        for _ in range(TUNE_WINDOW - 1):
+            sampler.tick()
+        assert native.adjusted == [] and native.blocked_calls == 0  # blocked is only read when the window closes
+        sampler.tick()
+    assert native.adjusted == [("gpu", -0.25)]
+    assert native.blocked_calls == 1
+    assert "GPU busy 97% over the last 50 s; running fewer GPU tasks: gpu capacity 1 \u2192 0.75" in caplog.text
+    record = next(r for r in caplog.records if "fewer GPU tasks" in r.getMessage())
+    assert (record.gpu_utilization, record.gpu_capacity) == (0.97, 0.75)
+
+
+@log_unsafe
+def test_waiting_tasks_grow_capacity_back_after_a_shrink(caplog):
+    fake = FakeGpus(card(utilization=0.99))
+    native = FakeNative()
+    sampler = _tuned(fake, native)
+    with caplog.at_level(logging.INFO, logger="mayu.gpu"):
+        for _ in range(TUNE_WINDOW):
+            sampler.tick()
+        fake.set(utilization=0.2)
+        native.waiting = 3
+        for _ in range(TUNE_WINDOW):
+            sampler.tick()
+    assert native.adjusted == [("gpu", -0.25), ("gpu", 0.25)]
+    assert "GPU only 20% busy over the last 50 s with 3 tasks waiting; running more GPU tasks: " \
+           "gpu capacity 0.75 \u2192 1" in caplog.text
+
+
+def test_the_tuner_averages_the_utilization_over_the_visible_gpus():
+    fake = FakeGpus(card(0, utilization=1.0), card(1, utilization=0.5))  # mean 0.75: neither busy nor idle
+    native = FakeNative()
+    sampler = _tuned(fake, native)
+    for _ in range(3 * TUNE_WINDOW):
+        sampler.tick()
+    assert native.adjusted == []
+    fake.set(1, utilization=0.9)  # mean 0.95
+    for _ in range(TUNE_WINDOW):
+        sampler.tick()
+    assert native.adjusted == [("gpu", -0.25)]
+
+
+def test_vram_pressure_stops_growth_but_not_shrinking():
+    fake = FakeGpus(card(utilization=0.99, total_gib=8.0, used_gib=7.7))  # 96 % full
+    native = FakeNative()
+    native.waiting = 2
+    sampler = _tuned(fake, native)
+    for _ in range(TUNE_WINDOW):
+        sampler.tick()
+    assert native.adjusted == [("gpu", -0.25)]
+    fake.set(utilization=0.2)
+    for _ in range(2 * TUNE_WINDOW):
+        sampler.tick()
+    assert native.adjusted == [("gpu", -0.25)]  # idle and waiting, but the card is full
+    fake.set(memory_used=GIB)
+    for _ in range(TUNE_WINDOW):
+        sampler.tick()
+    assert native.adjusted == [("gpu", -0.25), ("gpu", 0.25)]
+
+
+def test_a_vram_cut_by_the_guard_counts_as_pressure():
+    fake = FakeGpus(card(utilization=0.99, used_gib=2.0, process_gib=0.5))
+    native = FakeNative()
+    native.waiting = 2
+    sampler = _tuned(fake, native, vram_gb=7.5)
+    for _ in range(TUNE_WINDOW):
+        sampler.tick()
+    assert ("vram_gb", -1.0) in native.adjusted and ("gpu", -0.25) in native.adjusted
+    fake.set(utilization=0.2)
+    for _ in range(2 * TUNE_WINDOW):
+        sampler.tick()
+    assert ("gpu", 0.25) not in native.adjusted  # 1.5 GiB of foreign use is still withheld
+
+
+@log_unsafe
+def test_a_failed_gpu_adjustment_rolls_the_tuner_back(caplog):
+    fake = FakeGpus(card(utilization=0.99))
+    native = FakeNative()
+    native.fail_adjust = True
+    sampler = _tuned(fake, native)
+    with caplog.at_level(logging.WARNING, logger="mayu.gpu"):
+        for _ in range(TUNE_WINDOW):
+            sampler.tick()
+    assert sampler._tuner.capacity == 1.0
+    assert "GPU sampler step tune failed" in caplog.text
+    native.fail_adjust = False
+    for _ in range(TUNE_WINDOW):
+        sampler.tick()
+    assert native.adjusted == [("gpu", -0.25)]
+
+
+def test_without_a_tuner_the_sampler_never_asks_what_is_blocked():
+    native = FakeNative()
+    sampler = Sampler(native, FakeGpus(card(utilization=0.99)), 1.0)
+    for _ in range(2 * TUNE_WINDOW):
+        sampler.tick()
+    assert native.blocked_calls == 0 and native.adjusted == []
+
+
 def test_the_sampler_thread_reads_until_stopped():
     fake = FakeGpus(card())
     native = FakeNative()
@@ -454,6 +718,58 @@ def test_a_task_that_fits_the_reduced_capacity_still_runs(app, running, monkeypa
     with running(app, threads=1, resources={"vram_gb": 7.5}, **MONITORED) as w:
         _eventually(lambda: _series(w.metrics_port, CAPACITY) == 6.0)
         assert small.send().result(timeout=10) == "ran"
+
+
+@thread_unsafe
+def test_autotune_lowers_gpu_capacity_while_the_gpu_is_saturated(app, running, monkeypatch, caplog):
+    monkeypatch.setattr(gpu_mod, "_backend", FakeGpus(card(utilization=0.99)))
+
+    @app.task(resources={"gpu": 0.25})
+    def infer():
+        return "ran"
+
+    def gpu_capacity(w):
+        return next((cap for name, cap, _ in w.native.resource_usage() if name == "gpu"), None)
+
+    with caplog.at_level(logging.INFO, logger="mayu.gpu"):
+        with running(app, threads=4, resources={"gpu": 1.0}, autotune="gpu", **MONITORED) as w:
+            assert w._sampler is not None
+            _eventually(lambda: gpu_capacity(w) == 0.25)
+            assert infer.send().result(timeout=10) == "ran"  # the smallest request still fits
+            assert w.native.blocked("gpu") == 0
+    assert "running fewer GPU tasks: gpu capacity 0.5 \u2192 0.25" in caplog.text
+
+
+@thread_unsafe
+def test_autotune_gives_capacity_back_when_the_gpu_idles_with_tasks_waiting(app, running, monkeypatch):
+    fake = FakeGpus(card(utilization=0.99))
+    monkeypatch.setattr(gpu_mod, "_backend", fake)
+    release = threading.Event()
+    started = threading.Semaphore(0)
+
+    @app.task(resources={"gpu": 0.5})
+    def big():
+        started.release()
+        release.wait(10)
+
+    @app.task(resources={"gpu": 0.25})
+    def small():
+        return "ran"
+
+    def gpu_capacity(w):
+        return next((cap for name, cap, _ in w.native.resource_usage() if name == "gpu"), None)
+
+    with running(app, threads=4, resources={"gpu": 1.0}, autotune="gpu", **MONITORED) as w:
+        _eventually(lambda: gpu_capacity(w) == 0.5)  # the floor: the biggest task still fits
+        holder = big.send()  # takes the whole 0.5
+        assert started.acquire(timeout=10)
+        waiting = small.send()
+        _eventually(lambda: w.native.blocked("gpu") == 1)
+        fake.set(utilization=0.1)  # the GPU is idle after all
+        _eventually(lambda: gpu_capacity(w) >= 0.75)
+        assert waiting.result(timeout=10) == "ran"  # admitted next to `big` once the capacity grew
+        release.set()
+        holder.result(timeout=10)
 
 
 @thread_unsafe

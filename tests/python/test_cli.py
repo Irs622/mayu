@@ -356,6 +356,13 @@ def test_parse_resources_rejects_auto_elsewhere(text):
     # no visible device: --gpu-monitor on and auto resources fail whether or not NVML is installed
     (("--gpu-monitor", "on"), {"CUDA_VISIBLE_DEVICES": ""}, "--gpu-monitor on "),
     (("--resources", "gpu=auto"), {"MAYU_GPU_MONITOR": "auto", "CUDA_VISIBLE_DEVICES": ""}, "gpu=auto "),
+    (("--autotune", "vram_gb", "--resources", "gpu=1"), None, "autotune must be 'gpu'"),
+    ((), {"MAYU_AUTOTUNE": "cpu"}, "autotune must be 'gpu'"),
+    (("--autotune", "gpu", "--resources", "gpu=1"), None, "--gpu-monitor off turns away"),  # the helper sets off
+    # no visible device: autotune fails whether or not NVML is installed
+    (("--autotune", "gpu", "--resources", "gpu=1"), {"MAYU_GPU_MONITOR": "auto", "CUDA_VISIBLE_DEVICES": ""},
+     "--autotune gpu "),
+    ((), {"MAYU_AUTOTUNE": "gpu", "MAYU_GPU_MONITOR": "on", "CUDA_VISIBLE_DEVICES": ""}, "--gpu-monitor on "),
 ])
 def test_worker_cli_rejects_bad_gpu_monitoring_options(tmp_path, redis_url, queue, extra, env, message):
     r = _run_worker(tmp_path, redis_url, queue, GPU_APP, *extra, env=env)
