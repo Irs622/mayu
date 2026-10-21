@@ -147,7 +147,7 @@ def test_soft_limit_landing_anywhere_in_run_sync_yields_exactly_one_outcome():
         def dumps(self, value):
             return b""
 
-    app = SimpleNamespace(result_ttl=None, queues=lambda: ["q"])
+    app = SimpleNamespace(result_ttl=None, queues=lambda **kw: ["q"])
     runner = WorkerRunner(app, threads=1)
     runner.native = Native()
 

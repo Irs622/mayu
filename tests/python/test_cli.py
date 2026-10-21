@@ -50,3 +50,17 @@ def test_load_app_rejects_non_app(monkeypatch, redis_url, queue):
         load_app("sample_app:add")
     with pytest.raises(ValueError):
         load_app("sample_app")
+
+
+def test_worker_cli_rejects_queue_with_unimplemented_tasks(tmp_path, redis_url, queue):
+    (tmp_path / "decl_app.py").write_text(
+        "from mayu import App\n"
+        "app = App()\n"
+        "@app.declare(name='decl.gpu', queue='gpu-q')\n"
+        "def gpu(): ...\n"
+    )
+    cmd = [sys.executable, "-m", "mayu", "worker", "decl_app:app", "--mode", "thread", "--queues", "gpu-q"]
+    r = subprocess.run(cmd, env={**_env(redis_url, queue), "PYTHONPATH": str(tmp_path)}, capture_output=True,
+                       text=True, timeout=30)
+    assert r.returncode == 2
+    assert "mayu: queue 'gpu-q' has tasks declared but not implemented in this process: decl.gpu" in r.stderr
