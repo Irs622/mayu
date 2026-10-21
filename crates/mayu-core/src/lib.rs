@@ -10,7 +10,7 @@ pub mod result;
 pub mod runtime;
 
 pub use broker::{Broker, Delivery, QueueStats, Reclaimed, StoredResult, WorkerInfo};
-pub use dispatch::{Admit, Dispatcher, HOLD_HORIZON};
+pub use dispatch::{Admit, Dispatcher, HOLD_HORIZON, RESERVE_AFTER, Resources};
 pub use envelope::{
     Header, decode_delayed_member, decode_header, encode_delayed_member, encode_header, now_ms,
 };

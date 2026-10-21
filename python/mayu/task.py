@@ -35,6 +35,32 @@ def parse_rate(rate) -> float:
     return n / per
 
 
+def check_resources(what: str, resources, *, allow_zero: bool = False) -> dict[str, float]:
+    """Validates ``{name: amount}`` for a task's requests (amount > 0) or a worker's capacity (amount >= 0)."""
+    if resources is None:
+        return {}
+    shape = f"{what} must be a dict like {{'gpu': 0.5, 'vram_gb': 1.2}} (resource name -> amount)"
+    if not isinstance(resources, dict):
+        raise TypeError(f"{shape}, got {type(resources).__name__}")
+    out = {}
+    for name, amount in resources.items():
+        if not isinstance(name, str):
+            raise TypeError(f"{shape}; got a key {name!r}")
+        if not name:
+            raise ValueError(f"{shape}; resource names cannot be empty")
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+            raise TypeError(f"{shape}; {name!r} must be a number, got {amount!r}")
+        try:
+            milli = round(amount * 1000)
+        except (OverflowError, ValueError):  # inf, nan
+            milli = None
+        if milli is None or milli < (0 if allow_zero else 1):
+            raise ValueError(f"{shape}; {name!r} must be a finite number " +
+                             ("of at least 0" if allow_zero else "of at least 0.001") + f", got {amount!r}")
+        out[name] = float(amount)
+    return out
+
+
 _RESULT = object()  # stands in for the parent's result when checking a callback's arguments
 
 
@@ -114,7 +140,7 @@ def _enqueue(app, name: str, queue: str, max_retries: int, args, kwargs, countdo
 class Task:
     def __init__(self, app, fn, *, name: str, queue: str, max_retries: int, retry_on: tuple,
                  soft_time_limit: float | None = None, hard_time_limit: float | None = None, threadsafe: bool = True,
-                 rate_limit=None, implemented: bool = True):
+                 rate_limit=None, implemented: bool = True, resources=None):
         self.app = app
         self.fn = fn
         self.name = name
@@ -138,6 +164,7 @@ class Task:
         self.threadsafe = threadsafe
         self.rate_limit = rate_limit
         self.rate_per_sec = None if rate_limit is None else parse_rate(rate_limit)
+        self.resources = check_resources(f"resources of task {name!r}", resources)
         self.implemented = implemented
         self.declared = not implemented
         functools.update_wrapper(self, fn)

@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use mayu_core::{Error, Header, MemoryBroker, Outcome, RetryPolicy, Runtime, RuntimeConfig};
+use mayu_core::{Error, Header, MemoryBroker, Outcome, Resources, RetryPolicy, Runtime, RuntimeConfig};
 
 fn cfg(concurrency: usize, prefetch: usize) -> RuntimeConfig {
     RuntimeConfig {
@@ -169,5 +169,50 @@ fn no_metrics_addr_means_no_server() {
     c.metrics_addr = None;
     let rt = start(&mem, c);
     assert!(rt.metrics_addr().is_none());
+    rt.shutdown(Duration::from_secs(1));
+}
+
+fn gpu_cfg() -> RuntimeConfig {
+    RuntimeConfig {
+        resources: Resources {
+            capacity: [("gpu".to_string(), 1.0)].into(),
+            requests: [("g".to_string(), [("gpu".to_string(), 0.5)].into())].into(),
+        },
+        ..cfg(4, 2)
+    }
+}
+
+#[test]
+fn resource_gauges_follow_running_tasks() {
+    let mem = MemoryBroker::default();
+    mem.push(&Header::new("g", "q", 0, "ct"), b"");
+    let rt = start(&mem, gpu_cfg());
+    let body = scrape(&rt);
+    assert_eq!(value(&body, r#"mayu_resource_capacity{resource="gpu"}"#), Some(1.0));
+    assert_eq!(value(&body, r#"mayu_resource_in_use{resource="gpu"}"#), Some(0.0));
+    let t = rt.recv_timeout(RECV).unwrap();
+    assert_eq!(value(&scrape(&rt), r#"mayu_resource_in_use{resource="gpu"}"#), Some(0.5));
+    rt.complete(t.token, Outcome::Success { result: None, links: vec![] });
+    assert_eq!(value(&scrape(&rt), r#"mayu_resource_in_use{resource="gpu"}"#), Some(0.0));
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn resource_gauges_are_absent_when_none_are_configured() {
+    let mem = MemoryBroker::default();
+    let rt = start(&mem, cfg(1, 1));
+    assert!(!scrape(&rt).contains("mayu_resource"));
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn a_task_taken_after_stop_gives_its_resources_back() {
+    let mem = MemoryBroker::default();
+    mem.push(&Header::new("g", "q", 0, "ct"), b"");
+    let rt = start(&mem, gpu_cfg());
+    wait_until(|| rt.inflight() == 1);
+    rt.stop_fetching();
+    assert!(rt.recv_timeout(Duration::from_secs(1)).is_none(), "not started while stopping");
+    assert_eq!(value(&scrape(&rt), r#"mayu_resource_in_use{resource="gpu"}"#), Some(0.0));
     rt.shutdown(Duration::from_secs(1));
 }

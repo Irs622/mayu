@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
-use mayu_core::{Header, Link, MemoryBroker, Outcome, ResultRecord, RetryPolicy, Runtime, RuntimeConfig, now_ms};
+use mayu_core::{
+    Header, Link, MemoryBroker, Outcome, Resources, ResultRecord, RetryPolicy, Runtime, RuntimeConfig, now_ms,
+};
 
 fn cfg(concurrency: usize, prefetch: usize) -> RuntimeConfig {
     RuntimeConfig {
@@ -521,5 +523,48 @@ fn failure_and_retry_outcomes_still_recorded_concurrently() {
         let rec = ResultRecord::decode(&mem.result(id).expect("failure result stored")).unwrap();
         assert_eq!(rec.status, "failure");
     }
+    rt.shutdown(Duration::from_secs(1));
+}
+
+fn gpu_cfg(concurrency: usize, prefetch: usize) -> RuntimeConfig {
+    RuntimeConfig {
+        resources: Resources {
+            capacity: [("gpu".to_string(), 1.0)].into(),
+            requests: [("g".to_string(), [("gpu".to_string(), 1.0)].into())].into(),
+        },
+        ..cfg(concurrency, prefetch)
+    }
+}
+
+#[test]
+fn resource_request_holds_back_a_second_task_until_the_first_completes() {
+    let mem = MemoryBroker::default();
+    for _ in 0..2 { mem.push(&Header::new("g", "q", 0, "ct"), b""); }
+    let rt = start(&mem, gpu_cfg(4, 2));
+    let first = rt.recv_timeout(RECV).expect("first task");
+    wait_until(|| rt.inflight() == 2); // the second is claimed and waiting, not missing
+    assert!(rt.recv_timeout(Duration::from_millis(300)).is_none(), "the gpu is taken");
+    rt.complete(first.token, Outcome::Success { result: None, links: vec![] });
+    let second = rt.recv_timeout(RECV).expect("second task after release");
+    assert_ne!(second.token, first.token);
+    rt.complete(second.token, Outcome::Success { result: None, links: vec![] });
+    wait_until(|| mem.pending_len() == 0);
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn tasks_without_a_request_run_while_the_resource_is_taken() {
+    let mem = MemoryBroker::default();
+    mem.push(&Header::new("g", "q", 0, "ct"), b"");
+    mem.push(&Header::new("g", "q", 0, "ct"), b"");
+    mem.push(&Header::new("free", "q", 0, "ct"), b"");
+    let rt = start(&mem, gpu_cfg(4, 2));
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        seen.push(rt.recv_timeout(RECV).expect("a task that fits").task);
+    }
+    seen.sort();
+    assert_eq!(seen, vec!["free", "g"]);
+    assert!(rt.recv_timeout(Duration::from_millis(200)).is_none());
     rt.shutdown(Duration::from_secs(1));
 }

@@ -11,6 +11,7 @@ from .exceptions import Retry, SoftTimeLimitExceeded, TimeLimitExceeded
 from .limits import TimeLimits
 from .recycle import rss_mb
 from .serializers import for_content_type
+from .task import check_resources
 
 log = logging.getLogger("mayu.worker")
 
@@ -70,7 +71,8 @@ class WorkerRunner:
                  visibility_timeout: float = 30.0, heartbeat_interval: float = 5.0,
                  max_deliveries: int = 5, max_zombie_threads: int = 4,
                  max_tasks_per_process: int | None = None, max_memory_per_process: float | None = None,
-                 metrics_port: int | None = None, metrics_host: str = "0.0.0.0"):
+                 metrics_port: int | None = None, metrics_host: str = "0.0.0.0",
+                 resources: dict[str, float] | None = None):
         if threads < 1:
             raise ValueError("threads must be >= 1")
         if visibility_timeout <= 0 or heartbeat_interval <= 0:
@@ -97,6 +99,8 @@ class WorkerRunner:
         if not self.queues:
             raise ValueError("no queue to serve: every queue has tasks declared but not implemented in this process; "
                              "import their implementations or pass queues")
+        self.resources = check_resources("resources", resources, allow_zero=True)
+        self.task_resources = self._served_requests()
         self.strict_priority = bool(queues)  # only a non-empty explicit list is a priority order
         self.prefetch_multiplier = prefetch_multiplier
         self.shutdown_grace = shutdown_grace
@@ -131,6 +135,24 @@ class WorkerRunner:
         self._spans: dict = {}
         self._spans_lock = threading.Lock()
 
+    def _served_requests(self) -> dict[str, dict[str, float]]:
+        """Requests of the tasks on served queues, checked against what this worker has."""
+        out = {}
+        for t in sorted(self.app.registry.values(), key=lambda t: t.name):
+            if t.queue not in self.queues or not t.resources:
+                continue
+            for name, amount in sorted(t.resources.items()):
+                if name not in self.resources:
+                    raise ValueError(f"task {t.name!r} requests {name!r} but this worker declares no such resource; "
+                                     f"pass --resources {name}=...")
+                if round(amount * 1000) > round(self.resources[name] * 1000):
+                    raise ValueError(
+                        f"task {t.name!r} requests {name}={amount:g} but this worker has "
+                        f"{name}={self.resources[name]:g}; raise --resources {name}=... "
+                        f"or route the task to a bigger worker")
+            out[t.name] = dict(t.resources)
+        return out
+
     @property
     def worker_id(self) -> str | None:
         return None if self.native is None else self.native.worker_id
@@ -150,6 +172,8 @@ class WorkerRunner:
             max_deliveries=self.max_deliveries,
             strict_priority=self.strict_priority,
             rate_limits=rate_limits,
+            resources=self.resources or None,
+            task_resources=self.task_resources or None,
             metrics_addr=(None if self.metrics_port_requested is None
                           else _hostport(self.metrics_host, self.metrics_port_requested)),
         )

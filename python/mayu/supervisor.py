@@ -30,12 +30,12 @@ class _Child:
 
 
 class ProcessSupervisor:
-    """Child slot `i` (0-based, stable across restarts) runs `argv + per_child_args(i)`; argparse
-    lets a later flag override an earlier one."""
+    """Child slot `i` (0-based, stable across restarts) runs `argv + per_child_args(i)` with
+    `per_child_env(i)` merged over the base environment; argparse lets a later flag override an earlier one."""
 
     def __init__(self, argv: list[str], processes: int, *, shutdown_grace: float = 30.0,
                  env: dict | None = None, min_backoff: float = 1.0, max_backoff: float = 30.0,
-                 per_child_args=None):
+                 per_child_args=None, per_child_env=None):
         if processes < 1:
             raise ValueError("processes must be >= 1")
         self.argv = list(argv)
@@ -47,6 +47,7 @@ class ProcessSupervisor:
         self._env = {**(os.environ if env is None else env), "MAYU_PARENT_PID": str(os.getpid())}
         self._children = [_Child(i) for i in range(processes)]
         self._per_child_args = per_child_args
+        self._per_child_env = per_child_env
         self._stop = threading.Event()
 
     def pids(self) -> list[int]:
@@ -90,7 +91,8 @@ class ProcessSupervisor:
     def _spawn(self, c: _Child) -> None:
         argv = self.argv + (self._per_child_args(c.index) if self._per_child_args else [])
         try:
-            c.proc = subprocess.Popen(argv, env=self._env)
+            env = {**self._env, **self._per_child_env(c.index)} if self._per_child_env else self._env
+            c.proc = subprocess.Popen(argv, env=env)
         except OSError as exc:
             # Transient (EAGAIN/EMFILE/ENOMEM) or permanent: retry with the crash backoff.
             self.spawn_failures += 1

@@ -9,6 +9,7 @@ All notable changes to mayu are documented here. The format follows
 ### Added
 
 - `app.declare` / `task.implement` and `app.send(name, ...)` to enqueue tasks without importing their code; workers serve only queues whose tasks they implement.
+- Resource admission: `resources={"gpu": 0.3}` on tasks, `--resources` on workers, `--gpus` for one worker process per GPU, and `mayu_resource_capacity` / `mayu_resource_in_use` gauges.
 
 ## [0.1.0] - 2026-10-12
 

@@ -2,6 +2,7 @@ import argparse
 import importlib
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -23,6 +24,40 @@ def load_app(path: str) -> App:
     return obj
 
 
+def parse_resources(text: str | None) -> dict[str, float] | None:
+    """'gpu=1,vram_gb=7.5' -> {'gpu': 1.0, 'vram_gb': 7.5}; None or '' -> None."""
+    if not text or not text.strip():
+        return None
+    out: dict[str, float] = {}
+    for item in text.split(","):
+        name, sep, amount = item.partition("=")
+        name = name.strip()
+        try:
+            value = float(amount)
+        except ValueError:
+            value = float("nan")
+        if not sep or not name or not math.isfinite(value) or value < 0:
+            raise ValueError(f"bad --resources entry {item.strip()!r}: use name=amount with an amount >= 0, "
+                             f"like gpu=1,vram_gb=7.5")
+        if name in out:
+            raise ValueError(f"bad --resources: {name!r} given twice")
+        out[name] = value
+    return out
+
+
+def parse_gpus(text: str | None) -> list[str] | None:
+    """'0,1' -> ['0', '1']. Ids are opaque (indexes or UUIDs like 'GPU-abc'): they go to CUDA_VISIBLE_DEVICES."""
+    if not text or not text.strip():
+        return None
+    ids = [i.strip() for i in text.split(",")]
+    if not all(ids):
+        raise ValueError(f"bad --gpus {text!r}: use comma-separated GPU ids like 0,1")
+    dupes = sorted({i for i in ids if ids.count(i) > 1})
+    if dupes:
+        raise ValueError(f"bad --gpus {text!r}: {', '.join(dupes)} listed more than once")
+    return ids
+
+
 def _build_runner(app, args, threads: int):
     from .worker import WorkerRunner
 
@@ -36,7 +71,8 @@ def _build_runner(app, args, threads: int):
                         max_zombie_threads=args.max_zombie_threads,
                         max_tasks_per_process=args.max_tasks_per_process,
                         max_memory_per_process=args.max_memory_per_process,
-                        metrics_port=args.metrics_port, metrics_host=args.metrics_host)
+                        metrics_port=args.metrics_port, metrics_host=args.metrics_host,
+                        resources=args.resources)
 
 
 def _cmd_worker(args) -> int:
@@ -46,6 +82,24 @@ def _cmd_worker(args) -> int:
     except ValueError as e:  # argparse does not check `choices` against env-provided defaults
         print(f"mayu: {e}", file=sys.stderr)
         return 2
+    try:
+        args.resources = parse_resources(args.resources)
+    except ValueError as e:
+        print(f"mayu: {e}", file=sys.stderr)
+        return 2
+    try:
+        gpus = parse_gpus(args.gpus)
+    except ValueError as e:
+        print(f"mayu: {e}", file=sys.stderr)
+        return 2
+    if gpus and not args._child:  # a child already has its GPU in its environment
+        if args.processes is not None and args.processes != len(gpus):
+            print(f"mayu: --gpus lists {len(gpus)} GPU(s), one process each; --processes {args.processes} "
+                  f"does not match (drop --processes or list {args.processes} GPUs)", file=sys.stderr)
+            return 2
+        if len(gpus) == 1:
+            # Before the app is imported: user code may initialise CUDA at import time.
+            os.environ["CUDA_VISIBLE_DEVICES"] = gpus[0]
     from .modes import gil_enabled, import_app_detecting_gil, resolve_mode
     from .supervisor import RESTART_EXIT_CODE, ProcessSupervisor, watch_parent
 
@@ -62,6 +116,8 @@ def _cmd_worker(args) -> int:
         return 2
     threads = 1 if mode == "process" else (args.threads or os.cpu_count() or 4)
     processes = args.processes or ((os.cpu_count() or 2) if mode == "process" else 1)
+    if gpus and not args._child:
+        processes = len(gpus)
     if processes < 1:
         print("mayu: --processes must be >= 1", file=sys.stderr)
         return 2
@@ -129,8 +185,11 @@ def _cmd_worker(args) -> int:
     if args.metrics_port is not None:
         base = args.metrics_port
         per_child = lambda i: ["--metrics-port", str(base + i)]  # noqa: E731
+    per_child_env = None
+    if gpus and len(gpus) > 1:
+        per_child_env = lambda i: {"CUDA_VISIBLE_DEVICES": gpus[i]}  # noqa: E731
     return ProcessSupervisor(child, processes, shutdown_grace=args.shutdown_grace,
-                             per_child_args=per_child).run()
+                             per_child_args=per_child, per_child_env=per_child_env).run()
 
 
 def _load_or_exit(path: str):
@@ -211,6 +270,11 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--metrics-port", type=int, default=os.environ.get("MAYU_METRICS_PORT") or None,
                    help="serve Prometheus metrics on this port (process i of --processes uses port+i)")
     w.add_argument("--metrics-host", default="0.0.0.0", help="address to serve metrics on")
+    w.add_argument("--resources", default=os.environ.get("MAYU_RESOURCES") or None, metavar="NAME=AMOUNT,...",
+                   help="what each worker process has, e.g. gpu=1,vram_gb=7.5,cpu=12; a task starts only when "
+                        "its resources= requests fit in what is left")
+    w.add_argument("--gpus", default=None, metavar="ID,...",
+                   help="one worker process per listed GPU, each with CUDA_VISIBLE_DEVICES set to its id")
     w.add_argument("--log-format", choices=("text", "json"), default=os.environ.get("MAYU_LOG_FORMAT") or "text")
     w.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"),
                    type=str.upper, default=(os.environ.get("MAYU_LOG_LEVEL") or "INFO").upper())
