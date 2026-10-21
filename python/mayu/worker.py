@@ -22,6 +22,7 @@ log = logging.getLogger("mayu.worker")
 
 _RECV_TIMEOUT_MS = 100
 _SUPERVISOR_TICK = 0.05
+LOOKAHEAD_POLL = 0.25  # seconds between asks for a model to load ahead; the dispatcher backs a failed pool off itself
 
 
 def _hostport(host: str, port: int) -> str:
@@ -135,7 +136,7 @@ class WorkerRunner:
                  resources: dict[str, float] | None = None, pools: dict[str, int] | None = None,
                  thp: str = "python", pool_mode: str = "eager", schedule: str | None = None,
                  preload: list[str] | None = None, gpu_monitor: str = "auto", gpu_interval: float = 2.0,
-                 autotune: str | None = None):
+                 autotune: str | None = None, lookahead: bool = False):
         if threads < 1:
             raise ValueError("threads must be >= 1")
         if visibility_timeout <= 0 or heartbeat_interval <= 0:
@@ -158,6 +159,8 @@ class WorkerRunner:
             raise ValueError("--schedule needs --pool-mode lazy")
         if pool_mode != "lazy" and preload:
             raise ValueError("--preload needs --pool-mode lazy")
+        if pool_mode != "lazy" and lookahead:
+            raise ValueError("--lookahead needs --pool-mode lazy")
         if gpu_monitor not in ("auto", "on", "off"):
             raise ValueError(f"gpu_monitor must be 'auto', 'on' or 'off', got {gpu_monitor!r}")
         if isinstance(gpu_interval, bool) or not isinstance(gpu_interval, (int, float)) or not gpu_interval > 0 \
@@ -197,6 +200,7 @@ class WorkerRunner:
         self.lazy_pools = self._plan_preload(preload)
         self.lazy = self.lazy and bool(self._loaded)  # a lazy worker with no pools is an ordinary one
         self.schedule = (schedule or "oldest") if self.lazy else None
+        self.lookahead = bool(lookahead) and self.lazy  # like schedule: nothing to do for a worker without pools
         self.task_resources = self._served_requests(left)
         self.capacity = {**left, **{f"pool:{p}": float(n) for p, n in self._loaded.items()}}
         self._tuner = self._plan_autotune(autotune)
@@ -218,6 +222,8 @@ class WorkerRunner:
         self._next_memory_check = 0.0
         self.native = None
         self._sampler: gpu_mod.Sampler | None = None
+        self._lookahead_stop = threading.Event()
+        self._lookahead_thread: threading.Thread | None = None
         self._running = threading.Event()
         self._stopped = threading.Event()
         self._halt = threading.Event()
@@ -426,6 +432,9 @@ class WorkerRunner:
             self._sampler = gpu_mod.Sampler(self.native, self._gpu_backend, self.gpu_interval,
                                             vram_gb=self.resources.get("vram_gb"), tuner=self._tuner)
             self._sampler.start()
+        if self.lookahead:
+            self._lookahead_thread = threading.Thread(target=self._lookahead_main, name="mayu-lookahead", daemon=True)
+            self._lookahead_thread.start()
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(target=self._loop.run_forever, name="mayu-async", daemon=True)
         self._loop_thread.start()
@@ -447,14 +456,17 @@ class WorkerRunner:
             rate_limits=rate_limits,
             resources=self.capacity or None,
             task_resources=self.task_resources or None,
-            lazy_pools={p: (claim, loaded, None) for p, (claim, loaded) in self.lazy_pools.items()} or None,
+            lazy_pools={p: (claim, loaded, self.app.pools[p].linger)
+                        for p, (claim, loaded) in self.lazy_pools.items()} or None,
             schedule=self.schedule,
+            lookahead=self.lookahead,
             metrics_addr=(None if self.metrics_port_requested is None
                           else _hostport(self.metrics_host, self.metrics_port_requested)),
         )
 
     def stop(self) -> None:
         self._running.clear()
+        self._lookahead_stop.set()
         if self._sampler is not None:
             self._sampler.stop()
         if self.native is not None:
@@ -479,6 +491,9 @@ class WorkerRunner:
         if self._sampler is not None:
             self._sampler.stop()
             self._sampler.join()  # before the native worker goes: a tick uses it
+        if self._lookahead_thread is not None:  # an instance it is building still gets closed by _close_pools
+            self._lookahead_stop.set()
+            self._lookahead_thread.join(max(0.0, deadline - time.monotonic()))
         remaining_ms = int(max(0.0, deadline - time.monotonic()) * 1000)
         self.native.shutdown(max(remaining_ms, 1000))
         self._close_pools()  # what threads past the grace period still hold is not closed
@@ -628,16 +643,61 @@ class WorkerRunner:
         index = state.take_index()
         if index is None:
             raise RuntimeError(f"pool {name!r} has no free index to load into; this is a mayu bug")
+        try:
+            return index, self._build(name, state, index)
+        except Exception as e:
+            raise RuntimeError(f"pool {name!r} failed to load: {e!r}") from e
+
+    def _build(self, name: str, state: _PoolState, index: int):
+        """Builds one lazy instance into `index` and tells the dispatcher; on failure the index is given back."""
         started = time.monotonic()
         try:
             instance = state.pool.factory(PoolContext(name, index, state.target))
-        except Exception as e:
+        except BaseException:
             state.give_index(index)
-            raise RuntimeError(f"pool {name!r} failed to load: {e!r}") from e
+            raise
         self.native.pool_loaded(name)
         log.info("pool instance loaded", extra={"pool": name, "index": index, "size": state.target,
                                                 "load_seconds": round(time.monotonic() - started, 3)})
-        return index, instance
+        return instance
+
+    def _lookahead_main(self) -> None:
+        """Builds the models the dispatcher grants ahead of the tasks that will need them."""
+        while not self._lookahead_stop.is_set():
+            try:
+                name = self.native.lookahead_begin()
+            except Exception:
+                log.exception("asking for a model to load ahead failed")
+                name = None
+            if name is None:
+                self._lookahead_stop.wait(LOOKAHEAD_POLL)
+            else:
+                self._lookahead_load(name)
+
+    def _lookahead_load(self, name: str) -> None:
+        state = self._states[name]
+        index = state.take_index()
+        if index is None:  # the ledger granted a load that has no index to go into
+            log.error("lookahead load of pool %r has no free index to load into; this is a mayu bug", name,
+                      extra={"pool": name})
+            self._lookahead_done(name, False)
+            return
+        try:
+            instance = self._build(name, state, index)
+        except Exception as e:
+            log.warning("lookahead load of pool %r failed (%r); the task that needs it will load it itself", name, e,
+                        extra={"pool": name})
+            self._lookahead_done(name, False)
+            return
+        self.native.pool_lookahead_loaded(name)
+        state.push(index, instance)  # before the ledger counts it idle: a task admitted then must find it
+        self._lookahead_done(name, True)
+
+    def _lookahead_done(self, name: str, ok: bool) -> None:
+        try:
+            self.native.lookahead_done(name, ok)
+        except Exception:
+            log.exception("could not report the lookahead load of pool %r", name)
 
     def _unload_unbuilt(self, name: str) -> None:
         """Takes back a load the dispatcher counted but nothing was built for."""

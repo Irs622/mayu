@@ -113,7 +113,7 @@ def _build_runner(app, args, threads: int):
                         resources=args.resources, pools=args.pools, thp=args.thp,
                         pool_mode=args.pool_mode, schedule=args.schedule, preload=args.preload,
                         gpu_monitor=args.gpu_monitor, gpu_interval=args.gpu_interval,
-                        autotune=args.autotune)
+                        autotune=args.autotune, lookahead=args.lookahead)
 
 
 def _cmd_worker(args) -> int:
@@ -346,6 +346,10 @@ def main(argv: list[str] | None = None) -> int:
                         "oldest: oldest workflow first (default in lazy mode)")
     w.add_argument("--preload", default=os.environ.get("MAYU_PRELOAD") or None, metavar="NAME,...",
                    help="with --pool-mode lazy: pools to load one instance of at startup, e.g. gemma")
+    w.add_argument("--lookahead", action="store_true",
+                   default=(os.environ.get("MAYU_LOOKAHEAD") or "").lower() in ("1", "true", "yes"),
+                   help="with --pool-mode lazy: load the model a running workflow will need next while the "
+                        "current node runs, when it fits without evicting anything")
     w.add_argument("--gpus", default=None, metavar="ID,...",
                    help="one worker process per listed GPU, each with CUDA_VISIBLE_DEVICES set to its id")
     w.add_argument("--gpu-monitor", default=os.environ.get("MAYU_GPU_MONITOR") or "auto", metavar="{auto,on,off}",

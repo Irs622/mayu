@@ -271,6 +271,10 @@ def test_parse_preload_rejects_malformed_input(text):
 @pytest.mark.parametrize("extra,env,message", [
     (("--preload", "gemma"), None, "--preload needs --pool-mode lazy"),
     (("--schedule", "oldest"), None, "--schedule needs --pool-mode lazy"),
+    (("--lookahead",), None, "--lookahead needs --pool-mode lazy"),
+    ((), {"MAYU_LOOKAHEAD": "1"}, "--lookahead needs --pool-mode lazy"),
+    ((), {"MAYU_LOOKAHEAD": "TRUE"}, "--lookahead needs --pool-mode lazy"),
+    ((), {"MAYU_LOOKAHEAD": "Yes"}, "--lookahead needs --pool-mode lazy"),
     ((), {"MAYU_PRELOAD": "gemma"}, "--preload needs --pool-mode lazy"),
     ((), {"MAYU_SCHEDULE": "throughput"}, "--schedule needs --pool-mode lazy"),
     ((), {"MAYU_POOL_MODE": "sometimes"}, "pool_mode must be 'eager' or 'lazy'"),
@@ -282,6 +286,24 @@ def test_parse_preload_rejects_malformed_input(text):
 def test_worker_cli_rejects_bad_lazy_options(tmp_path, redis_url, queue, extra, env, message):
     r = _run_worker(tmp_path, redis_url, queue, LAZY_APP, *extra, env=env)
     assert r.returncode == 2 and message in r.stderr, r.stderr
+
+
+@pytest.mark.parametrize("env,expected", [
+    (None, False), ({"MAYU_LOOKAHEAD": "0"}, False), ({"MAYU_LOOKAHEAD": ""}, False), ({"MAYU_LOOKAHEAD": "no"}, False),
+    ({"MAYU_LOOKAHEAD": "1"}, True), ({"MAYU_LOOKAHEAD": "True"}, True), ({"MAYU_LOOKAHEAD": "YES"}, True),
+])
+@pytest.mark.thread_unsafe
+def test_lookahead_flag_defaults_from_the_environment(monkeypatch, env, expected):
+    from mayu import cli
+
+    monkeypatch.delenv("MAYU_LOOKAHEAD", raising=False)
+    for k, v in (env or {}).items():
+        monkeypatch.setenv(k, v)
+    seen = []
+    monkeypatch.setattr(cli, "_cmd_worker", lambda args: seen.append(args.lookahead) or 0)
+    assert cli.main(["worker", "x:app"]) == 0
+    assert seen == [expected]
+    assert cli.main(["worker", "x:app", "--lookahead"]) == 0 and seen[-1] is True
 
 
 def test_worker_cli_rejects_a_bad_pool_mode_flag(tmp_path, redis_url, queue):

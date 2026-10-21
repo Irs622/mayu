@@ -403,6 +403,252 @@ def test_lazy_instances_log_their_load(app, running, caplog):
     assert len(loaded) == 1 and loaded[0].pool == "gemma" and loaded[0].load_seconds >= 0
 
 
+# -- lookahead and linger -------------------------------------------------------------------------------------------
+
+
+def _count_polls(runner):
+    """Counts the idle rounds of the lookahead thread (each ends in a wait on its stop event)."""
+    n = [0]
+    original = runner._lookahead_stop.wait
+
+    def wait(timeout=None):
+        n[0] += 1
+        return original(timeout)
+
+    runner._lookahead_stop.wait = wait
+    return lambda: n[0]
+
+
+def _a_then_tts(app, release, started=None):
+    """Workflow a -> b where `a` is a plain task blocking on `release` and `b` needs the tts model."""
+    @app.task
+    def a():
+        if started is not None:
+            started.set()
+        release.wait(30)
+
+    @app.task
+    def b(m=app.use("tts")):
+        return [m.name, m.index, m.gen]
+
+    wf = app.workflow("la")
+    na = wf.add(a)
+    nb = wf.add(b, after=[na])
+    return wf, nb
+
+
+def test_lookahead_builds_the_model_while_the_previous_node_runs(app, running):
+    dev = Device(7.5)
+    dev.pool(app, "tts", 7.2)
+    release, started = threading.Event(), threading.Event()
+    wf, nb = _a_then_tts(app, release, started)
+    with running(app, threads=2, resources={"vram_gb": 7.5}, pools={"tts": 1}, lookahead=True, **LAZY) as w:
+        try:
+            handle = wf.send()
+            assert started.wait(10)
+            _eventually(lambda: len(dev.builds("tts")) == 1)  # built while `a` still blocks
+            assert not release.is_set()
+            _eventually(lambda: _series(w.metrics_port, 'mayu_pool_lookahead_loads_total{pool="tts"}') == 1.0)
+            assert _series(w.metrics_port, 'mayu_pool_loaded{pool="tts"}') == 1.0
+        finally:
+            release.set()
+        assert handle.node(nb).result(timeout=10) == ["tts", 0, 0]
+        assert len(dev.builds("tts")) == 1, "b ran on the instance built ahead of it"
+        assert _series(w.metrics_port, 'mayu_pool_loads_total{pool="tts"}') == 1.0
+        assert _series(w.metrics_port, 'mayu_pool_lookahead_loads_total{pool="tts"}') == 1.0
+    assert dev.closed == [("tts", 0)] and dev.overcommits == []
+
+
+def test_lookahead_never_evicts(app, running):
+    dev = Device(7.5)
+    dev.pool(app, "gemma", 7.4)
+    dev.pool(app, "tts", 7.2)
+
+    @app.task
+    def g(m=app.use("gemma")):
+        return m.gen
+
+    release = threading.Event()
+    wf, nb = _a_then_tts(app, release)
+    with running(app, threads=2, resources={"vram_gb": 7.5}, pools={"gemma": 1, "tts": 1}, preload=["gemma"],
+                 lookahead=True, **LAZY) as w:
+        polls = _count_polls(w)
+        try:
+            handle = wf.send()
+            _eventually(lambda: _series(w.metrics_port, 'mayu_pool_demand{pool="tts"}') == 1.0)
+            seen = polls()
+            _eventually(lambda: polls() >= seen + 3)  # the thread asked again and was told there is nothing to build
+            assert dev.builds("tts") == [] and dev.closed == []
+        finally:
+            release.set()
+        assert handle.node(nb).result(timeout=10) == ["tts", 0, 0]  # the task itself evicts, as before
+        assert dev.closed == [("gemma", 0)]
+        assert _series(w.metrics_port, 'mayu_pool_lookahead_loads_total{pool="tts"}') is None
+    assert dev.overcommits == []
+
+
+def test_a_failed_lookahead_build_is_logged_and_the_task_loads_the_model_itself(app, running, caplog):
+    dev = Device(7.5)
+    dev.pool(app, "tts", 7.2)
+    broken = threading.Event()
+    broken.set()
+    dev.fail["tts"] = broken.is_set
+    release = threading.Event()
+    wf, nb = _a_then_tts(app, release)
+    logger = logging.getLogger("mayu.worker")
+    logger.addHandler(caplog.handler)
+    caplog.set_level(logging.WARNING, logger="mayu.worker")
+    try:
+        with running(app, threads=2, resources={"vram_gb": 7.5}, pools={"tts": 1}, lookahead=True, **LAZY) as w:
+            polls = _count_polls(w)
+            try:
+                handle = wf.send()
+                _eventually(lambda: dev.failed == 1)
+                seen = polls()
+                _eventually(lambda: polls() >= seen + 3)
+                assert dev.failed == 1, "no second attempt within the backoff"
+                broken.clear()
+            finally:
+                release.set()
+            assert handle.node(nb).result(timeout=10) == ["tts", 0, 0]
+            assert len(dev.builds("tts")) == 1 and dev.failed == 1
+            assert _series(w.metrics_port, 'mayu_pool_lookahead_loads_total{pool="tts"}') is None
+    finally:
+        logger.removeHandler(caplog.handler)
+    assert any("lookahead" in r.getMessage() and r.pool == "tts" for r in caplog.records)
+    assert dev.overcommits == []
+
+
+def test_shutdown_waits_for_a_lookahead_build_and_closes_what_it_built(app, queue):
+    dev = Device(7.5)
+    gate, entered = threading.Event(), threading.Event()
+    pool = dev.pool(app, "tts", 7.2)
+    build = pool.factory
+
+    def slow(ctx):
+        entered.set()
+        gate.wait(30)
+        return build(ctx)
+
+    pool.factory = slow
+    release = threading.Event()
+    wf, _ = _a_then_tts(app, release)
+    w = WorkerRunner(app, threads=2, queues=[queue], resources={"vram_gb": 7.5}, pools={"tts": 1}, lookahead=True,
+                     shutdown_grace=20, **LAZY)
+    w.start()
+    joiner = threading.Thread(target=w.join, daemon=True)
+    try:
+        wf.send()
+        assert entered.wait(10)
+        w.stop()
+        release.set()
+        joiner.start()
+        _eventually(w._halt.is_set)  # join has got past the task threads and is waiting for the build
+        joiner.join(0.2)
+        assert joiner.is_alive() and dev.closed == []
+    finally:
+        release.set()
+        gate.set()
+    joiner.join(10)
+    assert not joiner.is_alive()
+    assert dev.closed == [("tts", 0)], "the instance built during shutdown is closed too"
+
+
+def test_linger_keeps_a_model_a_waiting_node_still_needs(app, running):
+    dev = Device(7.5)
+    dev.pool(app, "gemma", 7.4, linger=30)
+    dev.pool(app, "tts", 7.2)
+    order, lock = [], threading.Lock()
+    release = threading.Event()
+
+    @app.task
+    def gm(m=app.use("gemma")):
+        with lock:
+            order.append("g")
+
+    @app.task
+    def c():
+        release.wait(30)
+
+    @app.task
+    def tt(m=app.use("tts")):
+        with lock:
+            order.append("t")
+
+    wf = app.workflow("lg")
+    g1 = wf.add(gm)
+    nc = wf.add(c, after=[g1])
+    wf.add(gm, after=[nc])
+    with running(app, threads=3, resources={"vram_gb": 7.5}, pools={"gemma": 1, "tts": 1}, **LAZY) as w:
+        try:
+            handle = wf.send()
+            handle.node(g1).result(timeout=10)
+            _eventually(lambda: (_series(w.metrics_port, 'mayu_pool_demand{pool="gemma"}') or 0) >= 1.0)
+            lone = tt.send()
+            # `blocked("vram_gb")` cannot be the signal: it counts a task's own requests, and a pool's VRAM is not one
+            _eventually(lambda: _series(w.metrics_port, "mayu_tasks_inflight") == 2.0)  # c and the lone task
+            assert _series(w.metrics_port, "mayu_tasks_running") == 1.0
+            assert dev.builds("tts") == [] and dev.closed == []
+        finally:
+            release.set()
+        lone.result(timeout=20)
+        assert handle.wait(timeout=20) == "done"
+        assert order == ["g", "g", "t"]
+        assert len(dev.builds("gemma")) == 1 and len(dev.builds("tts")) == 1
+        assert dev.closed == [("gemma", 0)]
+    assert dev.overcommits == []
+
+
+def test_without_linger_the_same_flow_loads_the_model_twice(app, running):
+    dev, g, t = _two_models(app)
+    release = threading.Event()
+
+    @app.task
+    def c():
+        release.wait(30)
+
+    wf = app.workflow("nolg")
+    g1 = wf.add(g)
+    nc = wf.add(c, after=[g1])
+    g2 = wf.add(g, after=[nc])
+    with running(app, threads=3, resources={"vram_gb": 7.5}, pools={"gemma": 1, "tts": 1}, **LAZY):
+        try:
+            handle = wf.send()
+            handle.node(g1).result(timeout=10)
+            assert t.send().result(timeout=10) == ["tts", 0, 0]  # nothing protects gemma: it is evicted
+        finally:
+            release.set()
+        assert handle.node(g2).result(timeout=20) == ["gemma", 0, 1]
+        assert len(dev.builds("gemma")) == 2 and len(dev.builds("tts")) == 1
+    assert dev.overcommits == []
+
+
+def test_eager_mode_ignores_linger(app, running):
+    app.pool("gemma", linger=5)(lambda ctx: object())
+
+    @app.task
+    def g(m=app.use("gemma")):
+        return 1
+
+    with running(app, threads=1, pools={"gemma": 1}) as w:
+        assert g.send().result(timeout=10) == 1
+        assert w.lazy_pools == {}
+
+
+def test_lookahead_is_on_only_for_lazy_workers_with_pools(app, queue):
+    _validated(app)
+    assert _runner(app, queue, pool_mode="lazy", lookahead=True).lookahead is True
+    assert _runner(app, queue, pool_mode="lazy").lookahead is False
+
+
+def test_a_lazy_worker_without_pools_has_no_lookahead(app, queue):
+    @app.task
+    def plain(): ...
+
+    w = WorkerRunner(app, threads=1, queues=[queue], pool_mode="lazy", lookahead=True)
+    assert not w.lazy and w.lookahead is False
+
+
 # -- the pool state ---------------------------------------------------------------------------------------------
 
 
@@ -446,6 +692,7 @@ def _runner(app, queue, **kw):
     ({"pool_mode": "lazy", "schedule": "fastest"}, "schedule must be 'throughput' or 'oldest', got 'fastest'"),
     ({"schedule": "oldest"}, "--schedule needs --pool-mode lazy"),
     ({"preload": ["gemma"]}, "--preload needs --pool-mode lazy"),
+    ({"lookahead": True}, "--lookahead needs --pool-mode lazy"),
     ({"pool_mode": "lazy", "preload": ["ghost"]},
      "--preload names pool 'ghost', which this process does not define; import the module with @app.pool('ghost')"),
     ({"pool_mode": "lazy", "preload": ["spare"]},
