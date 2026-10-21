@@ -4,8 +4,9 @@ import threading
 
 from . import _native
 from .handle import TaskHandle
+from .pool import Pool, Use, check_discard_on, check_pool_name
 from .serializers import PICKLE, get_serializer
-from .task import Task, _enqueue
+from .task import Task, _enqueue, check_resources
 from .workflow import Workflow
 
 _TASK_OPTIONS = frozenset({"name", "queue", "max_retries", "retry_on", "soft_time_limit", "hard_time_limit",
@@ -29,6 +30,7 @@ class App:
         self.allow_pickle = self.serializer.content_type == PICKLE
         self.max_retries = max_retries
         self.registry: dict[str, Task] = {}
+        self.pools: dict[str, Pool] = {}
         self._client = None
         self._client_lock = threading.Lock()
         self._registry_lock = threading.Lock()
@@ -87,6 +89,26 @@ class App:
         if unknown:
             raise TypeError(f"unknown task option(s) {sorted(unknown)}; valid options: {sorted(_TASK_OPTIONS)}")
         return register(fn) if fn is not None else register
+
+    def pool(self, name: str, /, *, discard_on=(), **resources):
+        """Decorator registering ``fn(ctx)`` as the factory of a pool; resources are per instance."""
+        check_pool_name(name)
+        resources = check_resources(f"resources of pool {name!r}", resources)
+        discard_on = check_discard_on(discard_on)
+
+        def register(factory):
+            pool = Pool(self, name, factory, resources, discard_on)
+            with self._registry_lock:
+                if name in self.pools:
+                    raise ValueError(f"pool {name!r} is already registered")
+                self.pools[name] = pool
+            return pool
+
+        return register
+
+    def use(self, name: str) -> Use:
+        """A task parameter's default that is filled with an instance of the pool ``name`` on the worker."""
+        return Use(name)
 
     def send(self, name: str, /, *args, countdown: float | None = None, eta: dt.datetime | None = None,
              queue: str | None = None, link=None, **kwargs) -> TaskHandle:
