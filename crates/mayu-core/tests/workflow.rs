@@ -1,6 +1,9 @@
+use std::io::{Read, Write};
+use std::time::{Duration, Instant};
+
 use mayu_core::{
-    Broker, Delivery, Error, Header, MemoryBroker, NodeState, StoredResult, WorkflowNode, WorkflowSpec,
-    WorkflowState,
+    Broker, Delivery, Error, Header, MemoryBroker, NodeState, Outcome, ResultRecord, RetryPolicy, Runtime,
+    RuntimeConfig, StoredResult, WorkflowNode, WorkflowSpec, WorkflowState,
 };
 
 fn rt() -> tokio::runtime::Runtime {
@@ -367,4 +370,137 @@ fn summary_precedence() {
     assert_eq!(state(false, &[Done, Done]).summary().state, "done");
     assert_eq!(state(false, &[Dead, Waiting]).summary().state, "failed");
     assert_eq!(state(false, &[Done, Queued]).summary().state, "running");
+}
+
+fn runtime_cfg() -> RuntimeConfig {
+    RuntimeConfig {
+        queues: vec!["q".into()],
+        concurrency: 2,
+        prefetch_multiplier: 2,
+        result_ttl_secs: Some(60),
+        fetch_block_ms: 50,
+        promote_interval_ms: 20,
+        retry: RetryPolicy { base_ms: 10, cap_ms: 50 },
+        visibility_timeout_ms: 10_000,
+        reclaim_interval_ms: 50,
+        heartbeat_interval_ms: 50,
+        metrics_addr: Some("127.0.0.1:0".parse().unwrap()),
+        ..RuntimeConfig::default()
+    }
+}
+
+fn start(mem: &MemoryBroker, c: RuntimeConfig) -> Runtime<MemoryBroker> {
+    let m = mem.clone();
+    Runtime::start(move || async move { Ok(m) }, c).unwrap()
+}
+
+fn wait_until(mut f: impl FnMut() -> bool) {
+    let t = Instant::now();
+    while !f() {
+        assert!(t.elapsed() < Duration::from_secs(5), "condition not reached in time");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn scrape(rt: &Runtime<MemoryBroker>) -> String {
+    let mut s = std::net::TcpStream::connect(rt.metrics_addr().unwrap()).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    out.split_once("\r\n\r\n").expect("an HTTP response").1.to_string()
+}
+
+fn series(body: &str, name: &str) -> Option<f64> {
+    body.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+}
+
+const RECV: Duration = Duration::from_secs(3);
+
+#[test]
+fn runtime_acks_cancelled_workflow_nodes_without_running_them() {
+    let mem = MemoryBroker::default();
+    let wf = WorkflowSpec::new("w", 3600, vec![node("a", &[]), node("b", &[0])]);
+    let (a_id, b_id) = (wf.nodes[0].header.id.clone(), wf.nodes[1].header.id.clone());
+    rt().block_on(async {
+        mem.submit_workflow(&wf).await.unwrap();
+        assert!(mem.cancel_workflow(&wf.id).await.unwrap());
+    });
+
+    let rt = start(&mem, runtime_cfg());
+    wait_until(|| mem.result(&a_id).is_some() && mem.pending_len() == 0);
+    assert!(rt.recv_timeout(Duration::from_millis(200)).is_none(), "a cancelled node must not be dispatched");
+
+    let rec = ResultRecord::decode(&mem.result(&a_id).unwrap()).unwrap();
+    assert_eq!((rec.status.as_str(), rec.error.as_deref()), ("failure", Some("workflow cancelled")));
+    assert_eq!(rt.inflight(), 0);
+    assert_eq!(mem.stream_len("q"), 0, "node b must never be queued");
+    assert!(mem.result(&b_id).is_none());
+    let s = rt_block(&mem, &wf.id);
+    assert_eq!(states(&s), vec![Cancelled, Waiting]);
+
+    let body = scrape(&rt);
+    assert_eq!(series(&body, r#"mayu_tasks_settled_total{queue="q",task="a",outcome="cancelled"}"#), Some(1.0));
+    assert_eq!(series(&body, r#"mayu_tasks_received_total{queue="q",task="a"}"#), Some(1.0));
+    rt.shutdown(Duration::from_secs(1));
+}
+
+fn rt_block(mem: &MemoryBroker, id: &str) -> WorkflowState {
+    rt().block_on(mem.workflow(id)).unwrap().unwrap()
+}
+
+#[test]
+fn runtime_runs_ordinary_tasks_next_to_cancelled_nodes() {
+    let mem = MemoryBroker::default();
+    let wf = WorkflowSpec::new("w", 3600, vec![node("a", &[]), node("b", &[0])]);
+    let live = Header::new("live", "q", 0, "ct");
+    rt().block_on(async {
+        mem.submit_workflow(&wf).await.unwrap();
+        assert!(mem.cancel_workflow(&wf.id).await.unwrap());
+    });
+    mem.push(&live, b"");
+
+    let rt = start(&mem, runtime_cfg());
+    let t = rt.recv_timeout(RECV).expect("the ordinary task");
+    assert_eq!(t.task, "live");
+    rt.complete(t.token, Outcome::Success { result: None, links: vec![] });
+    wait_until(|| mem.pending_len() == 0);
+    assert_eq!(rt_block(&mem, &wf.id).nodes[0].state, Cancelled);
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn runtime_releases_children_of_a_live_workflow() {
+    let mem = MemoryBroker::default();
+    let wf = WorkflowSpec::new("w", 3600, vec![node("a", &[]), node("b", &[0])]);
+    rt().block_on(mem.submit_workflow(&wf)).unwrap();
+
+    let rt = start(&mem, runtime_cfg());
+    let a = rt.recv_timeout(RECV).expect("node a");
+    assert_eq!(a.task, "a");
+    rt.complete(a.token, Outcome::Success { result: None, links: vec![] });
+    let b = rt.recv_timeout(RECV).expect("node b, released by a's ack");
+    assert_eq!(b.task, "b");
+    rt.complete(b.token, Outcome::Success { result: None, links: vec![] });
+    wait_until(|| rt_block(&mem, &wf.id).summary().state == "done");
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn runtime_dispatches_normally_when_the_cancelled_check_fails() {
+    // The broker answers fetch but not cancelled_workflows.
+    let mem = MemoryBroker::default();
+    let wf = WorkflowSpec::new("w", 3600, vec![node("a", &[])]);
+    rt().block_on(async {
+        mem.submit_workflow(&wf).await.unwrap();
+        assert!(mem.cancel_workflow(&wf.id).await.unwrap());
+    });
+    mem.fail_cancelled_checks(true);
+    let rt = start(&mem, runtime_cfg());
+    let a = rt.recv_timeout(RECV).expect("dispatched despite the failed check");
+    assert_eq!(a.task, "a");
+    rt.complete(a.token, Outcome::Success { result: None, links: vec![] });
+    wait_until(|| mem.pending_len() == 0);
+    assert_eq!(rt_block(&mem, &wf.id).nodes[0].state, Cancelled);
+    rt.shutdown(Duration::from_secs(1));
 }

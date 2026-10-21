@@ -144,6 +144,7 @@ def test_unserializable_result_with_link_fails_parent(redis_url, queue, running)
 
 
 def test_link_validated_at_send(app):
+    """Signatures are checked where they are used, so `.s()` itself accepts any arguments."""
     @app.task
     def parent():
         return 1
@@ -163,7 +164,7 @@ def test_link_validated_at_send(app):
     with pytest.raises(TypeError, match="result"):
         parent.send(link=takes_nothing)
     with pytest.raises(TypeError, match="result"):
-        takes_result.s("unexpected extra")
+        parent.send(link=takes_result.s("unexpected extra"))
     with pytest.raises(TypeError, match="link"):
         parent.send(link="not a task")
     sig = takes_extra.s(object())  # valid arguments...

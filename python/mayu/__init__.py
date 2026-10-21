@@ -5,6 +5,7 @@ from .exceptions import Retry, SoftTimeLimitExceeded, TaskFailed, TimeLimitExcee
 from .handle import TaskHandle
 from .log import configure_logging
 from .task import Signature, Task
+from .workflow import Workflow, WorkflowHandle
 
 __all__ = ["App", "Retry", "Signature", "SoftTimeLimitExceeded", "Task", "TaskFailed", "TaskHandle", "TimeLimitExceeded",
-           "configure_logging"]
+           "Workflow", "WorkflowHandle", "configure_logging"]

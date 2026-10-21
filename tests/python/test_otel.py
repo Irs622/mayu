@@ -127,6 +127,28 @@ def test_link_callback_joins_the_parents_trace(app, running, spans):
     assert _one(got, "process o.child").context.trace_id == _one(got, "send o.parent").context.trace_id
 
 
+def test_workflow_nodes_join_one_send_span(app, running, spans):
+    @app.task(name="o.first")
+    def first():
+        return 1
+
+    @app.task(name="o.second")
+    def second():
+        return 2
+
+    wf = app.workflow("traced")
+    a = wf.add(first)
+    wf.add(second, after=a)
+    with running(app):
+        handle = wf.send()
+        assert handle.wait(timeout=10) == "done"
+        got = _wait_spans(spans, 3)  # one send span, two process spans
+    send = _one(got, "send workflow:traced")
+    assert send.kind == SpanKind.PRODUCER
+    for name in ("process o.first", "process o.second"):
+        assert _one(got, name).context.trace_id == send.context.trace_id
+
+
 def test_task_without_trace_context_gets_a_root_span(app, running, spans, queue):
     @app.task(name="o.bare")
     def bare():

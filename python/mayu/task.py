@@ -65,21 +65,31 @@ _RESULT = object()  # stands in for the parent's result when checking a callback
 
 
 class Signature:
-    """A task plus extra arguments, for ``link=``. The parent's result is passed first."""
+    """A task plus arguments. As ``link=`` the parent's result is passed first; as ``wf.add`` it is called as given.
+
+    The arguments are checked where the signature is used, since the two uses bind them differently.
+    """
 
     def __init__(self, task, args=(), kwargs=None):
-        kwargs = dict(kwargs or {})
-        try:
-            task.signature.bind(_RESULT, *args, **kwargs)
-        except TypeError as e:
-            raise TypeError(f"{task.name} cannot be a link callback with these arguments "
-                            f"(it receives the parent's result first): {e}") from None
         self.task = task
         self.args = tuple(args)
-        self.kwargs = kwargs
+        self.kwargs = dict(kwargs or {})
 
     def __repr__(self) -> str:
         return f"<Signature {self.task.name} args={self.args!r} kwargs={self.kwargs!r}>"
+
+    def _check_link(self) -> None:
+        try:
+            self.task.signature.bind(_RESULT, *self.args, **self.kwargs)
+        except TypeError as e:
+            raise TypeError(f"{self.task.name} cannot be a link callback with these arguments "
+                            f"(it receives the parent's result first): {e}") from None
+
+    def _check_node(self) -> None:
+        try:
+            self.task.signature.bind(*self.args, **self.kwargs)
+        except TypeError as e:
+            raise TypeError(f"{self.task.name} cannot be a workflow node with these arguments: {e}") from None
 
     def _wire(self) -> dict:
         return {"task": self.task.name, "queue": self.task.queue, "max_retries": self.task.max_retries,
@@ -93,11 +103,13 @@ def _as_links(link) -> list[Signature]:
     out = []
     for item in items:
         if isinstance(item, Signature):
-            out.append(item)
+            sig = item
         elif isinstance(item, Task):
-            out.append(Signature(item))
+            sig = Signature(item)
         else:
             raise TypeError(f"link must be a task, task.s(...), or a list of them; got {item!r}")
+        sig._check_link()
+        out.append(sig)
     return out
 
 
@@ -204,7 +216,7 @@ class Task:
         return _enqueue(self.app, self.name, queue or self.queue, self.max_retries, args, kwargs, countdown, eta, link)
 
     def s(self, *args, **kwargs) -> Signature:
-        """This task with extra arguments, as a ``link=`` callback (the result comes first)."""
+        """This task with arguments, for ``link=`` (the parent's result comes first) or ``wf.add``."""
         return Signature(self, args, kwargs)
 
     delay = send

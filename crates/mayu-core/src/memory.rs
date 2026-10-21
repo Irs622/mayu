@@ -158,6 +158,7 @@ pub struct MemoryBroker {
     notify: Arc<Notify>,
     failing: Arc<AtomicBool>,
     fail_retries: Arc<AtomicBool>,
+    fail_cancelled: Arc<AtomicBool>,
     fetch_extra: Arc<AtomicUsize>,
     record_delay_ns: Arc<AtomicU64>,
     consumer: String,
@@ -178,6 +179,11 @@ impl MemoryBroker {
     /// broker that rejects deferring a task.
     pub fn fail_retries(&self, on: bool) {
         self.fail_retries.store(on, Ordering::SeqCst);
+    }
+
+    /// Test aid: while set, only `cancelled_workflows` fails.
+    pub fn fail_cancelled_checks(&self, on: bool) {
+        self.fail_cancelled.store(on, Ordering::SeqCst);
     }
 
     /// Test aid: lets `fetch` return up to `n` entries beyond the requested `count`, like a
@@ -523,6 +529,9 @@ impl Broker for MemoryBroker {
 
     async fn cancelled_workflows(&self, ids: &[String]) -> Result<Vec<String>> {
         self.check()?;
+        if self.fail_cancelled.load(Ordering::SeqCst) {
+            return Err(Error::Broker("injected cancelled-check failure".into()));
+        }
         let s = self.state.lock().unwrap();
         Ok(ids.iter().filter(|id| s.workflows.get(*id).is_some_and(|w| w.cancelled)).cloned().collect())
     }

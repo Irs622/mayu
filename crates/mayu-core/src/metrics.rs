@@ -19,6 +19,8 @@ pub enum Settled {
     Success,
     Retry,
     Dead,
+    /// Acked without running: the task's workflow was cancelled.
+    Cancelled,
 }
 
 impl Settled {
@@ -27,6 +29,7 @@ impl Settled {
             Settled::Success => "success",
             Settled::Retry => "retry",
             Settled::Dead => "dead",
+            Settled::Cancelled => "cancelled",
         }
     }
 }

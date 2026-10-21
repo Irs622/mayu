@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use mayu_core::{Broker, Header, Link, Outcome, ReadyTask, Resources, Runtime, RuntimeConfig};
+use mayu_core::{
+    Broker, Header, Link, Outcome, ReadyTask, Resources, Runtime, RuntimeConfig, WorkflowNode, WorkflowSpec,
+    WorkflowState,
+};
 use mayu_redis::RedisBroker;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -10,6 +13,17 @@ use pyo3::types::{PyBytes, PyDict};
 fn rt_err(e: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
+
+/// Bad input (a spec the core rejects) is a `ValueError`; anything else is a `RuntimeError`.
+fn core_err(e: mayu_core::Error) -> PyErr {
+    match e {
+        mayu_core::Error::Config(m) => PyValueError::new_err(m),
+        e => rt_err(e),
+    }
+}
+
+/// (task, queue, payload, content_type, max_retries, parents, trace_ctx)
+type NodeArgs = (String, String, Vec<u8>, String, u32, Vec<usize>, Option<String>);
 
 /// Producer-side handle: enqueue tasks and read results.
 #[pyclass(frozen, module = "mayu._native")]
@@ -28,6 +42,32 @@ fn worker_dict<'py>(py: Python<'py>, w: mayu_core::WorkerInfo) -> PyResult<Bound
     d.set_item("inflight", w.inflight)?;
     d.set_item("started_at", w.started_at)?;
     d.set_item("last_seen", w.last_seen)?;
+    Ok(d)
+}
+
+fn workflow_dict<'py>(py: Python<'py>, w: WorkflowState) -> PyResult<Bound<'py, PyDict>> {
+    let sum = w.summary();
+    let d = PyDict::new(py);
+    d.set_item("id", &w.id)?;
+    d.set_item("name", &w.name)?;
+    d.set_item("created_at", w.created_at)?;
+    d.set_item("cancelled", w.cancelled)?;
+    d.set_item("state", sum.state)?;
+    d.set_item("waiting", sum.waiting)?;
+    d.set_item("queued", sum.queued)?;
+    d.set_item("done", sum.done)?;
+    d.set_item("dead", sum.dead)?;
+    d.set_item("cancelled_nodes", sum.cancelled)?;
+    let nodes = w.nodes.iter().map(|n| {
+        let nd = PyDict::new(py);
+        nd.set_item("node", &n.node)?;
+        nd.set_item("id", &n.task_id)?;
+        nd.set_item("task", &n.task)?;
+        nd.set_item("queue", &n.queue)?;
+        nd.set_item("state", n.state.as_str())?;
+        Ok(nd)
+    }).collect::<PyResult<Vec<_>>>()?;
+    d.set_item("nodes", nodes)?;
     Ok(d)
 }
 
@@ -115,6 +155,34 @@ impl Client {
 
     fn replay_dead(&self, py: Python<'_>, queue: &str, entry_ids: Vec<String>) -> PyResult<usize> {
         py.detach(|| self.rt.block_on(self.broker.replay_dead(queue, &entry_ids))).map_err(rt_err)
+    }
+
+    /// Writes the DAG and enqueues its roots in one step; returns the workflow id and each node's task id.
+    fn submit_workflow(&self, py: Python<'_>, name: String, ttl_secs: u64, nodes: Vec<NodeArgs>)
+        -> PyResult<(String, Vec<String>)> {
+        let nodes = nodes.into_iter().map(|(task, queue, payload, content_type, max_retries, parents, trace_ctx)| {
+            let mut header = Header::new(task, queue, max_retries, content_type);
+            header.trace_ctx = trace_ctx;
+            WorkflowNode { header, payload, parents }
+        }).collect();
+        let wf = WorkflowSpec::new(name, ttl_secs, nodes);
+        wf.validate().map_err(core_err)?;
+        py.detach(|| self.rt.block_on(self.broker.submit_workflow(&wf))).map_err(core_err)?;
+        Ok((wf.id.clone(), wf.nodes.iter().map(|n| n.header.id.clone()).collect()))
+    }
+
+    fn workflow<'py>(&self, py: Python<'py>, id: &str) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let w = py.detach(|| self.rt.block_on(self.broker.workflow(id))).map_err(core_err)?;
+        w.map(|w| workflow_dict(py, w)).transpose()
+    }
+
+    fn cancel_workflow(&self, py: Python<'_>, id: &str) -> PyResult<bool> {
+        py.detach(|| self.rt.block_on(self.broker.cancel_workflow(id))).map_err(core_err)
+    }
+
+    fn workflows<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let ws = py.detach(|| self.rt.block_on(self.broker.workflows())).map_err(core_err)?;
+        ws.into_iter().map(|w| workflow_dict(py, w)).collect()
     }
 
     fn queue_stats<'py>(&self, py: Python<'py>, queue: &str) -> PyResult<Bound<'py, PyDict>> {
