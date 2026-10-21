@@ -87,7 +87,13 @@ class WorkerRunner:
             raise ValueError("metrics_port must be between 0 and 65535")
         self.app = app
         self.threads = threads
-        self.queues = list(queues or app.queues())
+        if queues:
+            for q in queues:
+                stubs = sorted(t.name for t in app.registry.values() if t.queue == q and not t.implemented)
+                if stubs:
+                    raise ValueError(f"queue {q!r} has tasks declared but not implemented in this process: "
+                                     f"{', '.join(stubs)}; import their implementations or don't serve that queue")
+        self.queues = list(queues or app.queues(implemented=True))
         self.strict_priority = bool(queues)  # only a non-empty explicit list is a priority order
         self.prefetch_multiplier = prefetch_multiplier
         self.shutdown_grace = shutdown_grace
@@ -307,6 +313,11 @@ class WorkerRunner:
         task = self.app.registry.get(ready.task)
         if task is None:
             self.native.complete_failure(ready.token, f"unknown task {ready.task!r}", "")
+            self._settled()
+            return
+        if not task.implemented:  # declared elsewhere; running the stub would record a bogus success
+            self.native.complete_failure(
+                ready.token, f"task {ready.task!r} is declared but not implemented in this worker", "")
             self._settled()
             return
         span = otel.start_process(ready)

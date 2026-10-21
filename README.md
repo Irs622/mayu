@@ -146,6 +146,33 @@ that acks the parent, so it is enqueued exactly once per successful parent. Like
 can still run more than once if a worker crashes. Callbacks run on the callback task's queue
 and do not chain further (no canvas).
 
+## Declaring tasks without their code
+
+A producer often can't import a task's dependencies (a GPU model, a heavy library). Declare the task
+there with only its name, options and signature, and attach the code in the worker:
+
+```python
+# shared module, imported by producers and workers
+@app.declare(name="ml.embed", queue="gpu")
+def embed(text: str, *, normalize: bool = True): ...
+
+# worker module, imported only by workers that serve the "gpu" queue
+@embed.implement
+def _(text: str, *, normalize: bool = True):
+    return model.encode(text, normalize=normalize)
+
+embed.send("hello")                     # producer: arguments are checked against the declaration
+app.send("ml.embed", "hello")           # or enqueue by name alone, with no registration and no checking
+```
+
+`implement` must match the declaration's parameter names, kinds and defaults (annotations are ignored)
+and returns the task. Calling a declared task that isn't implemented raises `TypeError`.
+
+A worker without `--queues` serves only the queues whose tasks it can run. With `--queues`, naming a
+queue that has an unimplemented task is an error (`mayu: queue 'gpu' has tasks declared but not
+implemented in this process: ...`, exit 2). If a delivery for an unimplemented task still arrives, it
+fails with "not implemented" instead of running the stub.
+
 ## Modes
 
 ```bash

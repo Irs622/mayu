@@ -40,8 +40,10 @@ class App:
                     self._client = _native.Client(self.broker_url)
         return self._client
 
-    def queues(self) -> list[str]:
-        return sorted({self.default_queue, *(t.queue for t in self.registry.values())})
+    def queues(self, *, implemented: bool = False) -> list[str]:
+        """Every queue the app uses, or with ``implemented=True`` only those whose tasks this process can run."""
+        tasks = [t for t in self.registry.values() if t.implemented or not implemented]
+        return sorted({self.default_queue, *(t.queue for t in tasks)})
 
     def task(self, fn=None, /, *, name: str | None = None, queue: str | None = None,
              max_retries: int | None = None, retry_on=(),

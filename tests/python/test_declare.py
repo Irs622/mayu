@@ -2,7 +2,8 @@ import threading
 
 import pytest
 
-from mayu import App
+from mayu import App, TaskFailed
+from mayu.worker import WorkerRunner
 
 
 def _worker_app(app):
@@ -202,3 +203,48 @@ def test_concurrent_send_while_implementing(app, running):
 def test_declare_rejects_unknown_option(app):
     with pytest.raises(TypeError, match="unknown task option"):
         app.declare(name="decl.typo", queu="x")
+
+
+def test_worker_fails_delivery_of_unimplemented_task(app, queue):
+    worker = _worker_app(app)
+    runner = WorkerRunner(worker, threads=1, queues=[queue])  # built before the declaration, so it serves the queue
+    worker.declare(name="decl.stub", max_retries=0)(lambda: None)
+    runner.start()
+    try:
+        with pytest.raises(TaskFailed, match="not implemented"):
+            app.send("decl.stub").result(timeout=10)
+    finally:
+        runner.stop()
+        runner.join()
+
+
+def test_default_worker_queues_exclude_declared_only_tasks(app, queue):
+    gpu = f"{queue}-gpu"
+    worker = _worker_app(app)
+
+    @worker.declare(name="decl.gpu", queue=gpu)
+    def gpu_task(): ...
+
+    @worker.task(name="decl.cpu", queue=f"{queue}-cpu")
+    def cpu_task(): ...
+
+    assert worker.queues() == sorted({queue, gpu, f"{queue}-cpu"})
+    assert worker.queues(implemented=True) == sorted({queue, f"{queue}-cpu"})
+    assert WorkerRunner(worker, threads=1).queues == sorted({queue, f"{queue}-cpu"})
+    gpu_task.implement(lambda: 1)
+    assert gpu in WorkerRunner(worker, threads=1).queues
+
+
+def test_worker_refuses_explicit_queue_with_unimplemented_tasks(app, queue):
+    gpu = f"{queue}-gpu"
+    worker = _worker_app(app)
+
+    @worker.declare(name="decl.b", queue=gpu)
+    def b(): ...
+
+    @worker.declare(name="decl.a", queue=gpu)
+    def a(): ...
+
+    with pytest.raises(ValueError, match=rf"queue '{gpu}' has tasks declared but not implemented.*decl\.a, decl\.b"):
+        WorkerRunner(worker, threads=1, queues=[gpu])
+    WorkerRunner(worker, threads=1, queues=[queue])

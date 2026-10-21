@@ -6,6 +6,10 @@ All notable changes to mayu are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `app.declare` / `task.implement` and `app.send(name, ...)` to enqueue tasks without importing their code; workers serve only queues whose tasks they implement.
+
 ## [0.1.0] - 2026-10-12
 
 First public release.
