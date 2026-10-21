@@ -250,7 +250,7 @@ impl Worker {
                 capacity: resources.unwrap_or_default(),
                 requests: task_resources.unwrap_or_default(),
                 lazy: lazy_pools.unwrap_or_default().into_iter()
-                    .map(|(name, (claim, loaded))| (name, LazyPool { claim, loaded }))
+                    .map(|(name, (claim, loaded))| (name, LazyPool { claim, loaded, ..Default::default() }))
                     .collect(),
             },
             schedule,

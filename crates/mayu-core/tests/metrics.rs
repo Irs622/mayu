@@ -228,8 +228,8 @@ fn lazy_cfg() -> RuntimeConfig {
                 ("t".to_string(), [("pool:tts".to_string(), 1.0)].into()),
             ].into(),
             lazy: [
-                ("gemma".to_string(), LazyPool { claim: [("vram_gb".to_string(), 7.4)].into(), loaded: 1 }),
-                ("tts".to_string(), LazyPool { claim: [("vram_gb".to_string(), 7.2)].into(), loaded: 0 }),
+                ("gemma".to_string(), LazyPool { claim: [("vram_gb".to_string(), 7.4)].into(), loaded: 1, ..Default::default() }),
+                ("tts".to_string(), LazyPool { claim: [("vram_gb".to_string(), 7.2)].into(), loaded: 0, ..Default::default() }),
             ].into(),
         },
         schedule: Schedule::Oldest,
