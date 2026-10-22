@@ -70,6 +70,23 @@ def parse_pools(text: str | None) -> dict[str, int] | None:
     return out
 
 
+def parse_envs(text: str | None) -> dict[str, str] | None:
+    """'legacy=/opt/py313/bin/python,b=/x' -> {'legacy': '/opt/py313/bin/python', 'b': '/x'}; None or '' -> None."""
+    if not text or not text.strip():
+        return None
+    out: dict[str, str] = {}
+    for item in text.split(","):
+        name, sep, python = item.partition("=")
+        name, python = name.strip(), python.strip()
+        if not sep or not name or not python or any(c.isspace() for c in name):
+            raise ValueError(f"bad --envs entry {item.strip()!r}: use name=python_path, "
+                             f"like legacy=/opt/venvs/py313/bin/python")
+        if name in out:
+            raise ValueError(f"bad --envs: {name!r} given twice")
+        out[name] = python
+    return out
+
+
 def parse_preload(text: str | None) -> list[str] | None:
     """'gemma,tts' -> ['gemma', 'tts'] (order kept); None or '' -> None."""
     if not text or not text.strip():
@@ -113,7 +130,8 @@ def _build_runner(app, args, threads: int):
                         resources=args.resources, pools=args.pools, thp=args.thp,
                         pool_mode=args.pool_mode, schedule=args.schedule, preload=args.preload,
                         gpu_monitor=args.gpu_monitor, gpu_interval=args.gpu_interval,
-                        autotune=args.autotune, lookahead=args.lookahead)
+                        autotune=args.autotune, lookahead=args.lookahead,
+                        envs=args.envs, app_path=args.app)
 
 
 def _cmd_worker(args) -> int:
@@ -131,6 +149,11 @@ def _cmd_worker(args) -> int:
         return 2
     try:
         args.pools = parse_pools(args.pools)
+    except ValueError as e:
+        print(f"mayu: {e}", file=sys.stderr)
+        return 2
+    try:
+        args.envs = parse_envs(args.envs)
     except ValueError as e:
         print(f"mayu: {e}", file=sys.stderr)
         return 2
@@ -335,6 +358,9 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--pools", default=os.environ.get("MAYU_POOLS") or None, metavar="NAME=COUNT,...",
                    help="instances of each model pool to load in each worker process, e.g. gemma=2,tts=3 "
                         "(pools are declared in code with @app.pool)")
+    w.add_argument("--envs", default=os.environ.get("MAYU_ENVS") or None, metavar="NAME=PYTHON,...",
+                   help="Python interpreter for each env declared with app.env on this host, e.g. "
+                        "legacy=/opt/venvs/py313/bin/python; overrides the path in code")
     w.add_argument("--pool-mode", default=os.environ.get("MAYU_POOL_MODE") or "eager", metavar="{eager,lazy}",
                    choices=("eager", "lazy"),
                    help="eager (default) loads every pool instance at startup and holds its resources for good; "

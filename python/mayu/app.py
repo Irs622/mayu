@@ -3,6 +3,7 @@ import os
 import threading
 
 from . import _native
+from .env import Env, env_name
 from .handle import TaskHandle
 from .pool import Pool, Use, check_discard_on, check_linger, check_pool_name
 from .serializers import PICKLE, get_serializer
@@ -10,7 +11,7 @@ from .task import Task, _enqueue, check_resources
 from .workflow import Workflow
 
 _TASK_OPTIONS = frozenset({"name", "queue", "max_retries", "retry_on", "soft_time_limit", "hard_time_limit",
-                           "threadsafe", "rate_limit", "resources"})
+                           "threadsafe", "rate_limit", "resources", "env"})
 
 
 class App:
@@ -31,6 +32,7 @@ class App:
         self.max_retries = max_retries
         self.registry: dict[str, Task] = {}
         self.pools: dict[str, Pool] = {}
+        self.envs: dict[str, Env] = {}
         self._client = None
         self._client_lock = threading.Lock()
         self._registry_lock = threading.Lock()
@@ -47,17 +49,19 @@ class App:
         """Every queue the app uses, or with ``implemented=True`` only those whose tasks this process can run."""
         if not implemented:
             return sorted({self.default_queue, *(t.queue for t in self.registry.values())})
-        # A queue holding a stub belongs to the workers that implement it, the default queue included.
-        stubbed = {t.queue for t in self.registry.values() if not t.implemented}
-        return sorted({self.default_queue, *(t.queue for t in self.registry.values() if t.implemented)} - stubbed)
+        # A queue holding a stub belongs to the workers that implement it, the default queue included. A task with
+        # an env is implemented in the env's interpreter, so a stub of it here is as good as the code.
+        stubbed = {t.queue for t in self.registry.values() if not (t.implemented or t.env is not None)}
+        runnable = (t.queue for t in self.registry.values() if t.implemented or t.env is not None)
+        return sorted({self.default_queue, *runnable} - stubbed)
 
     def task(self, fn=None, /, *, name: str | None = None, queue: str | None = None,
              max_retries: int | None = None, retry_on=(),
              soft_time_limit: float | None = None, hard_time_limit: float | None = None, threadsafe: bool = True,
-             rate_limit=None, resources=None):
+             rate_limit=None, resources=None, env=None):
         options = dict(name=name, queue=queue, max_retries=max_retries, retry_on=retry_on,
                        soft_time_limit=soft_time_limit, hard_time_limit=hard_time_limit, threadsafe=threadsafe,
-                       rate_limit=rate_limit, resources=resources)
+                       rate_limit=rate_limit, resources=resources, env=env)
         return self._register(fn, options, implemented=True)
 
     def declare(self, fn=None, /, **options):
@@ -77,6 +81,7 @@ class App:
                 threadsafe=options.get("threadsafe", True),
                 rate_limit=options.get("rate_limit"),
                 resources=options.get("resources"),
+                env=options.get("env"),
                 implemented=implemented,
             )
             with self._registry_lock:
@@ -88,17 +93,31 @@ class App:
         unknown = set(options) - _TASK_OPTIONS
         if unknown:
             raise TypeError(f"unknown task option(s) {sorted(unknown)}; valid options: {sorted(_TASK_OPTIONS)}")
+        options["env"] = env_name(self, options.get("env"))  # checked here, not when the decorator is applied
         return register(fn) if fn is not None else register
 
+    def env(self, name: str, /, *, python: str, imports: list[str] = ()) -> Env:
+        """Declares an interpreter that runs the tasks and pools made with ``env=`` in a child process.
+
+        ``python`` is this host's default path (``--envs`` overrides it per worker); the child imports the app, then
+        each module in ``imports`` (for implementations whose libraries only exist in that interpreter)."""
+        env = Env(name, python, imports)
+        with self._registry_lock:
+            if name in self.envs:
+                raise ValueError(f"env {name!r} is already registered")
+            self.envs[name] = env
+        return env
+
     def pool(self, name: str, /, *, discard_on=(), linger: float | None = None, parked: dict | None = None,
-             **resources):
+             env=None, **resources):
         """Decorator registering ``fn(ctx)`` as the factory of a pool; resources are per instance.
 
         ``linger`` (lazy mode only) keeps an idle instance for that many seconds while a running workflow still
         has a node waiting for it. ``parked`` (lazy mode only) is what one parked instance holds, like
         ``{"ram_gb": 6.6}``: instead of closing an idle instance to make room, the worker moves it there with the
         pool's ``@park`` hook and moves it back with ``@unpark``; ``@stage`` can build one straight into that state.
-        Eager mode ignores ``linger`` and ``parked``."""
+        Eager mode ignores ``linger`` and ``parked``. With ``env=`` the factory runs in that env's child process
+        (eager mode only), never in the worker."""
         check_pool_name(name)
         linger = check_linger(linger)
         if parked is not None:
@@ -108,9 +127,13 @@ class App:
                                  f"like parked={{'ram_gb': 6.6}}, or leave it out")
         resources = check_resources(f"resources of pool {name!r}", resources)
         discard_on = check_discard_on(discard_on)
+        env = env_name(self, env)
+        if env is not None and (linger is not None or parked is not None):
+            raise ValueError(f"pool {name!r} is in env {env!r}, whose pools are eager only; "
+                             f"linger and parked are for lazy pools")
 
         def register(factory):
-            pool = Pool(self, name, factory, resources, discard_on, linger, parked)
+            pool = Pool(self, name, factory, resources, discard_on, linger, parked, env)
             with self._registry_lock:
                 if name in self.pools:
                     raise ValueError(f"pool {name!r} is already registered")

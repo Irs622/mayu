@@ -7,7 +7,7 @@ import sys
 import pytest
 
 from mayu import App
-from mayu.cli import load_app, parse_gpus, parse_pools, parse_preload, parse_resources
+from mayu.cli import load_app, parse_envs, parse_gpus, parse_pools, parse_preload, parse_resources
 
 HERE = pathlib.Path(__file__).parent
 
@@ -203,6 +203,27 @@ def test_parse_pools(text, expected):
 def test_parse_pools_rejects_malformed_input(text):
     with pytest.raises(ValueError, match="--pools"):
         parse_pools(text)
+
+
+@pytest.mark.parametrize("text,expected", [
+    (None, None), ("", None), ("  ", None), ("legacy=/opt/py313/bin/python", {"legacy": "/opt/py313/bin/python"}),
+    ("a=/x, b = /y z/python", {"a": "/x", "b": "/y z/python"}), ("a=/x=y", {"a": "/x=y"}),
+])
+def test_parse_envs(text, expected):
+    assert parse_envs(text) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "legacy", "=/x", "legacy=", "legacy= ", "a=/x,,b=/y", "a=/x,a=/y", "le gacy=/x", "a=/x,",
+])
+def test_parse_envs_rejects_malformed_input(text):
+    with pytest.raises(ValueError, match="--envs"):
+        parse_envs(text)
+
+
+def test_worker_cli_help_lists_envs():
+    r = subprocess.run([sys.executable, "-m", "mayu", "worker", "--help"], capture_output=True, text=True, timeout=60)
+    assert "--envs" in r.stdout
 
 
 @pytest.mark.parametrize("extra", [[], ["--mode", "process", "--processes", "2"]])

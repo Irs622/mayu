@@ -602,6 +602,48 @@ voice_lines  01JB  laptop-1  7/25 (28 %)  ~4m10s  01JA
 The only addition to the Redis layout is a `tasks` field in the worker's heartbeat hash, removed when the worker
 is idle; it is stored as hex text and older workers ignore it.
 
+## Per-task environments
+
+```python
+legacy = app.env("legacy", python="/opt/venvs/py313/bin/python", imports=["myproj.legacy_tasks"])
+
+@app.task(env=legacy, resources={"gpu": 0.5})
+def encode(path): ...
+
+@app.pool("whisper", env=legacy, vram_gb=3)     # built in the legacy child, never in the parent
+def whisper(ctx): ...
+```
+
+```bash
+mayu worker tasks:app --envs legacy=/opt/venvs/py313/bin/python     # or MAYU_ENVS
+```
+
+A task with `env=` runs in a child process started with that interpreter, for code that needs another
+Python version or libraries the main environment can't have. The worker starts one long-lived child
+per env, running many tasks at once, before it fetches anything, and fails to start on a bad path, a
+mayu version mismatch or an import error. `python=` is the default path; `--envs` overrides it per host
+(naming an env the app doesn't declare is an error). `imports` are modules the child imports after the
+app, for tasks implemented only there (declare them in the shared module and `implement` them in one of
+these, so producers and the parent never import their libraries). `env=` also takes the env's name.
+Tasks without `env=` are unaffected, and a worker that serves none starts no child.
+
+- **Same semantics:** retries, `retry_on`, links, results, resources and `mayu.progress()` work as in
+  process. The parent records every outcome and acks only after it, so the child crashing means the
+  task runs again, counting as an attempt, so a task that always kills it ends in the dead letters.
+  Arguments are decoded in the child only, so they may use types that exist only there.
+- **Time limits:** the soft limit is raised inside the child as usual. The hard limit is enforced by the
+  parent: it kills the child, fails that task with `TimeLimitExceeded`, and retries the task's
+  neighbours in that child. The next call starts a fresh child (backing off from 1 s to 30 s if it
+  can't), so there are no zombies.
+- **Pools:** `@app.pool(..., env=...)` instances are built in the child at startup (sized by `--pools`,
+  reserved like any pool) and rebuilt there after `DiscardInstance`. A task and its pools must have the
+  same env, and env pools need `--pool-mode eager`.
+- **Version:** the interpreter needs mayu with the same major.minor installed (`pip install mayu` in
+  that venv); the Python version may differ.
+- **Limits:** `--max-memory-per-process` and `--max-tasks-per-process` look at the parent only, tracing
+  spans are recorded in the parent, and a `threadsafe=False` task is serialized in the child, not in the
+  parent. A parent slot is held while its call runs, so `--threads` bounds concurrency per env too.
+
 ## Declaring tasks without their code
 
 A producer often can't import a task's dependencies (a GPU model, a heavy library). Declare the task

@@ -221,6 +221,18 @@ process. Recommended deployment: **a few processes × many threads** (e.g.
 `@app.task(threadsafe=False)` routes the task to a single dedicated thread,
 executing serially. Escape hatch for legacy code.
 
+### 5.5 Per-task environments
+`@app.task(env=...)` runs a task in a long-lived child process (`python -m mayu.runner`) under the
+interpreter the env names, for code that needs another Python version or libraries the main
+interpreter can't have. One child per env, spawned with `subprocess` (never fork) and spoken to over
+two pipes (length-prefixed msgpack), after a hello handshake that requires the same protocol and
+mayu major.minor. The parent never deserializes env args and keeps ownership of the delivery: the
+slot thread blocks on the call and the parent records the outcome (ack, retry, dead-letter, links),
+so ack-after-completion and the Lua transitions are untouched. The hard limit SIGKILLs the child and
+fails that task by the usual rules; every other call pending on a killed or crashed child is retried
+(a crash means "runs again"). The soft limit runs inside the child. Tasks without
+`env=` take no new code path, and no wire or key-layout change is involved.
+
 ---
 
 ## 6. Public API

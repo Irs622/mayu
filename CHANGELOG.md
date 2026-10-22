@@ -6,6 +6,10 @@ All notable changes to mayu are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Per-task environments: `env = app.env("legacy", python="/opt/venvs/py313/bin/python", imports=[...])` with `@app.task(env=legacy)` and `@app.pool(..., env=legacy)` runs those tasks and pools in a long-lived child process under another Python (a different version or a venv with libraries the main one can't have), started by the worker and spoken to over pipes. `--envs legacy=/path/python` (`MAYU_ENVS`) sets the interpreter per host. The child must have the same mayu major.minor. Ack-after-completion is unchanged: the soft limit is raised in the child, the hard limit kills the child and fails that task with `TimeLimitExceeded`, and the other tasks in a killed or crashed child run again. `env` is now a keyword of `app.pool`, so it can't name a pool resource. Nothing changes for tasks without `env=`: no child is started. No wire or key-layout change.
+
 ## [0.2.5] - 2026-10-22
 
 ### Added

@@ -13,6 +13,7 @@ _RUST_LEVEL = {"DEBUG": "debug", "INFO": "info", "WARNING": "warn", "ERROR": "er
 _STANDARD = frozenset(vars(logging.LogRecord("", 0, "", 0, "", (), None))) | {"message", "asctime"}
 
 logger = logging.getLogger("mayu")
+_configured: tuple[str, str] | None = None  # (format, level) of the last configure_logging, for env children
 
 
 class JsonFormatter(logging.Formatter):
@@ -58,3 +59,5 @@ def configure_logging(format: str = "text", level: str = "INFO") -> None:
     logger.setLevel(level)
     logger.propagate = False
     _native.init_logging(format, _RUST_LEVEL[level])
+    global _configured
+    _configured = (format, level)

@@ -71,7 +71,8 @@ class Pool:
     (lazy mode only)."""
 
     def __init__(self, app, name: str, factory, resources: dict[str, float], discard_on: tuple,
-                 linger: float | None = None, parked: dict[str, float] | None = None):
+                 linger: float | None = None, parked: dict[str, float] | None = None,
+                 env: str | None = None):
         if not callable(factory):
             raise TypeError(f"the factory of pool {name!r} must be callable, got {factory!r}")
         self.app = app
@@ -81,6 +82,7 @@ class Pool:
         self.discard_on = discard_on
         self.linger = linger  # lazy mode only
         self.parked = parked  # lazy mode only: what one parked instance holds, or None if the pool cannot park
+        self.env = env  # the name of the env whose child process builds the instances, or None
         self.closer = None
         self.parker = None
         self.unparker = None

@@ -183,7 +183,8 @@ def _enqueue(app, name: str, queue: str, max_retries: int, args, kwargs, countdo
 class Task:
     def __init__(self, app, fn, *, name: str, queue: str, max_retries: int, retry_on: tuple,
                  soft_time_limit: float | None = None, hard_time_limit: float | None = None, threadsafe: bool = True,
-                 rate_limit=None, implemented: bool = True, resources=None):
+                 rate_limit=None, implemented: bool = True, resources=None,
+                 env: str | None = None):
         self.app = app
         self.fn = fn
         self.name = name
@@ -209,6 +210,7 @@ class Task:
         self.rate_limit = rate_limit
         self.rate_per_sec = None if rate_limit is None else parse_rate(rate_limit)
         self.resources = check_resources(f"resources of task {name!r}", resources)
+        self.env = env  # the name of the env whose interpreter runs this task, or None
         self.implemented = implemented
         self.declared = not implemented
         functools.update_wrapper(self, fn)

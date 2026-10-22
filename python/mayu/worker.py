@@ -11,6 +11,7 @@ import traceback
 from . import _native, otel
 from . import gpu as gpu_mod
 from . import thp as thp_mod
+from .envproc import EnvChild, EnvUnavailable
 from .exceptions import DiscardInstance, Retry, SoftTimeLimitExceeded, TimeLimitExceeded
 from .limits import TimeLimits
 from .pool import PoolContext, check_pool_name
@@ -30,6 +31,10 @@ PARKED_WAIT = 30.0
 
 def _hostport(host: str, port: int) -> str:
     return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+def _where(env: str | None) -> str:
+    return "in the worker" if env is None else f"in env {env!r}"
 
 
 def _ms(seconds: float) -> int:
@@ -184,7 +189,8 @@ class WorkerRunner:
                  resources: dict[str, float] | None = None, pools: dict[str, int] | None = None,
                  thp: str = "python", pool_mode: str = "eager", schedule: str | None = None,
                  preload: list[str] | None = None, gpu_monitor: str = "auto", gpu_interval: float = 2.0,
-                 autotune: str | None = None, lookahead: bool = False):
+                 autotune: str | None = None, lookahead: bool = False,
+                 envs: dict[str, str] | None = None, app_path: str | None = None):
         if threads < 1:
             raise ValueError("threads must be >= 1")
         if visibility_timeout <= 0 or heartbeat_interval <= 0:
@@ -224,7 +230,8 @@ class WorkerRunner:
         self.threads = threads
         if queues:
             for q in queues:
-                stubs = sorted(t.name for t in app.registry.values() if t.queue == q and not t.implemented)
+                stubs = sorted(t.name for t in app.registry.values()
+                               if t.queue == q and not (t.implemented or t.env is not None))
                 if stubs:
                     raise ValueError(f"queue {q!r} has tasks declared but not implemented in this process: "
                                      f"{', '.join(stubs)}; import their implementations or don't serve that queue")
@@ -244,7 +251,9 @@ class WorkerRunner:
                      ", ".join(f"{n}={v:g}" for n, v in resources.items() if n in gpu_mod.AUTO_RESOURCES))
         self.resources = check_resources("resources", resources, allow_zero=True)
         self.lazy = pool_mode == "lazy"
+        self._plan_envs(envs, app_path)
         left = self._plan_pools(pools)
+        self._make_env_children()
         self.lazy_pools = self._plan_preload(preload)
         self.lazy = self.lazy and bool(self._loaded)  # a lazy worker with no pools is an ordinary one
         self.schedule = (schedule or "oldest") if self.lazy else None
@@ -334,6 +343,50 @@ class WorkerRunner:
                              "@app.task(resources={'gpu': ...}) or drop --autotune")
         return gpu_mod.Tuner(self.capacity["gpu"], max(asks), min(asks))
 
+    def _plan_envs(self, envs, app_path) -> None:
+        """Checks `envs` (per-host interpreter overrides) and that every served env task has an env to run in."""
+        shape = "envs must be a dict like {'legacy': '/opt/venvs/py313/bin/python'} (env name -> interpreter)"
+        if envs is None:
+            envs = {}
+        if not isinstance(envs, dict):
+            raise TypeError(f"{shape}, got {type(envs).__name__}")
+        for name, python in envs.items():
+            if not isinstance(name, str) or not isinstance(python, str):
+                raise TypeError(f"{shape}; got {name!r}: {python!r}")
+            if not python.strip():
+                raise ValueError(f"{shape}; the interpreter of {name!r} is empty")
+            if name not in self.app.envs:
+                raise ValueError(f"--envs names env {name!r}, which this process does not define; "
+                                 f"declare it with app.env({name!r}, python=...)")
+        used: dict[str, list[str]] = {}
+        for t in sorted(self.app.registry.values(), key=lambda t: t.name):
+            if t.env is None or t.queue not in self.queues:
+                continue
+            if t.env not in self.app.envs:
+                raise ValueError(f"task {t.name!r} runs in env {t.env!r}, which this process does not define; "
+                                 f"declare it with app.env({t.env!r}, python=...)")
+            used.setdefault(t.env, []).append(t.name)
+        if used and not app_path:
+            raise ValueError(f"tasks run in env(s) {sorted(used)}, which the worker starts by importing the app in a "
+                             f"child process; pass app_path='module:app', or start the worker with `mayu worker`")
+        self._env_used = sorted(used)
+        self._env_pythons = dict(envs)
+        self.app_path = app_path
+
+    def _make_env_children(self) -> None:
+        """One (not yet started) child per env in use. Its pools are the loaded ones that belong to it."""
+        self._env_lock = threading.Lock()  # guards the two dicts below
+        self._env_live: dict[str, int] = {}  # env pool -> instances the ledger counts as alive
+        self._env_epoch: dict[str, int] = {}  # env -> the child generation the ledger describes
+        self._env_children: dict[str, EnvChild] = {}
+        for name in self._env_used:
+            env = self.app.envs[name]
+            pools = {p: n for p, n in self._loaded.items() if self.app.pools[p].env == name}
+            python = self._env_pythons.get(name) or env.python
+            self._env_children[name] = EnvChild(self, env, python, self.app_path, pools,
+                                                self.app.result_ttl is not None, self.app.allow_pickle)
+            self._env_live.update(pools)
+
     def _plan_pools(self, pools) -> dict[str, float]:
         """Checks `pools` against the served tasks; returns what each declared resource has left after reserving
         room for the loaded pools. Sets `self._loaded` ({pool: instances}, in `pools` order) and `self._reserved`."""
@@ -357,6 +410,9 @@ class WorkerRunner:
                 if p not in registered:
                     raise ValueError(f"task {t.name!r} uses pool {p!r}, which this process does not define; "
                                      f"import the module with @app.pool({p!r})")
+                if registered[p].env != t.env:
+                    raise ValueError(f"task {t.name!r} runs {_where(t.env)} but pool {p!r} is "
+                                     f"{_where(registered[p].env)}; a task and its pools must be in the same env")
                 if not pools.get(p):
                     raise ValueError(f"task {t.name!r} uses pool {p!r} but this worker has no instances of it; "
                                      f"pass --pools {p}=N")
@@ -369,6 +425,10 @@ class WorkerRunner:
                 log.warning("pool %r is sized but no task on the served queues uses it; not loading it", name)
         self._sized = {p: n for p, n in pools.items() if n}
         self._loaded = {p: n for p, n in pools.items() if n and p in used}
+        in_env = sorted(p for p in self._loaded if registered[p].env)
+        if self.lazy and in_env:
+            raise ValueError(f"pools in an env need --pool-mode eager (the env's child builds them once); "
+                             f"pool(s) {in_env} are in an env")
         reserved: dict[str, int] = {}  # milli-units, like the dispatcher
         parts: dict[str, list[str]] = {}
         for p, n in self._loaded.items():
@@ -495,9 +555,11 @@ class WorkerRunner:
         thp_mod.apply(self.thp)  # before any thread exists, so every heap starts in the advised arena
         rate_limits = {t.name: t.rate_per_sec for t in self.app.registry.values() if t.rate_per_sec is not None}
         self._load_pools()  # before the native worker: it starts fetching as soon as it exists
+        self._start_envs()
         try:
             self.native = self._start_native(rate_limits)
         except BaseException:
+            self._stop_envs(time.monotonic() + 5.0)
             self._close_pools()
             raise
         for name in self._preload if self.lazy else ():  # the dispatcher already counts them (lazy_pools)
@@ -574,6 +636,7 @@ class WorkerRunner:
         if self._lookahead_thread is not None:  # what it is building or staging still gets closed by _close_pools
             self._lookahead_stop.set()
             self._lookahead_thread.join(max(0.0, deadline - time.monotonic()))
+        self._stop_envs(deadline)
         remaining_ms = int(max(0.0, deadline - time.monotonic()) * 1000)
         self.native.shutdown(max(remaining_ms, 1000))
         self._close_pools()  # what threads past the grace period still hold is not closed
@@ -593,6 +656,105 @@ class WorkerRunner:
             pass
         self.join()
         return self.restart_reason
+
+    # -- envs ----------------------------------------------------------------
+
+    def _start_envs(self) -> None:
+        """Spawns every env's child and waits until its app is imported and its pools are built, so a bad
+        interpreter, a version mismatch or a failing factory stops the worker before it fetches anything."""
+        try:
+            for child in self._env_children.values():
+                child.start()
+        except BaseException:
+            self._stop_envs(time.monotonic() + 5.0)
+            self._close_pools()
+            raise
+
+    def _stop_envs(self, deadline: float) -> None:
+        """Asks each child to finish and close its pools; kills what is still running at the deadline."""
+        for child in self._env_children.values():
+            try:
+                child.stop(max(1.0, deadline - time.monotonic()))
+            except Exception:
+                log.exception("stopping the runner of env %r failed", child.name)
+        for s in self._live_slots():  # a call that was cut short reports "run again" right away
+            s.thread.join(1.0)
+
+    def _env_ready(self, child: EnvChild, gen) -> None:
+        """A child finished its handshake. A respawned one built all its pools afresh, so the ledger is brought to
+        what it holds."""
+        with self._env_lock:
+            self._env_epoch[child.name] = gen.epoch
+            for pool, n in child.pools.items():
+                delta = n - self._env_live[pool]
+                self._env_live[pool] = n
+                if delta:
+                    self._adjust(f"pool:{pool}", float(delta))
+
+    def _env_rebuilt(self, child: EnvChild, gen, pool: str, ok: bool) -> None:
+        with self._env_lock:
+            if self._env_epoch.get(child.name) != gen.epoch:
+                return  # a child that was replaced since
+            if ok:
+                self._env_live[pool] += 1
+                self._adjust(f"pool:{pool}", 1.0)
+            left = self._env_live[pool]
+        if ok:
+            self.native.pool_rebuilt(pool)
+            log.info("pool instance rebuilt", extra={"pool": pool, "env": child.name})
+        elif left == 0:
+            self._request_restart(f"pool {pool!r} has no instances left")
+
+    def _run_env(self, ready, task, plan) -> None:
+        """Runs a task in its env's child. The arguments are never deserialized here: their types may only exist
+        in the child's interpreter."""
+        token = ready.token
+        if plan:  # lazy mode: the task may have to make room for in-process models
+            try:
+                self._checkout(token, task, plan)
+            except Exception as e:
+                self._report_error(token, task, e)
+                return
+        try:
+            gen, outcome = self._env_children[task.env].call(token, task.name, ready.content_type, ready.payload,
+                                                             task.hard_time_limit)
+        except EnvUnavailable as e:  # no child to run it: try again later, not at once
+            self._end_span(token, e)
+            self.native.complete_retry(token, e.backoff_ms, str(e))
+            self._settled()
+            return
+        except Exception as e:
+            self._report_error(token, task, e)
+            return
+        broken = outcome.get("broken")
+        if broken:  # before the report, like `_release`: it frees the task's `pool:` slots
+            with self._env_lock:
+                if self._env_epoch.get(task.env) == gen.epoch:
+                    for pool in broken:
+                        self._env_live[pool] -= 1
+                        self._adjust(f"pool:{pool}", -1.0)
+        kind = outcome["o"]
+        if kind == "ok":
+            self._end_span(token)
+            try:
+                self.native.complete_success(token, outcome["result"], [tuple(f) for f in outcome["links"]])
+            except (TypeError, ValueError, OverflowError) as e:
+                self.native.complete_failure(token, f"bad link callback: {e!r}", traceback.format_exc())
+            self._settled()
+        elif kind == "retry":
+            self._end_span(token, RuntimeError(outcome["error"]))
+            self.native.complete_retry(token, outcome["ms"], outcome["error"])
+            self._settled()
+        elif kind == "hard":
+            self._report_error(token, task, TimeLimitExceeded(f"hard time limit ({task.hard_time_limit}s) exceeded"))
+        elif kind == "crash":  # whatever it was running runs again
+            self._end_span(token, RuntimeError(outcome["error"]))
+            self.native.complete_retry(token, None, outcome["error"])
+            self._settled()
+        else:
+            self._end_span(token, RuntimeError(outcome["error"]))
+            self.native.complete_failure(token, outcome["error"], outcome.get("traceback") or "")
+            self._settled()
 
     # -- pools ---------------------------------------------------------------
 
@@ -618,6 +780,8 @@ class WorkerRunner:
             return
         for name, n in self._loaded.items():
             pool = self.app.pools[name]
+            if pool.env is not None:  # the env's child builds it
+                continue
             state = self._states[name] = _PoolState(pool, n)
             for index in range(n):
                 started = time.monotonic()
@@ -1185,7 +1349,7 @@ class WorkerRunner:
             self.native.complete_failure(ready.token, f"unknown task {ready.task!r}", "")
             self._settled()
             return
-        if not task.implemented:  # declared elsewhere; running the stub would record a bogus success
+        if not task.implemented and task.env is None:  # declared elsewhere; the stub would record a bogus success
             self._abandon(plan)
             self.native.complete_failure(
                 ready.token, f"task {ready.task!r} is declared but not implemented in this worker", "")
@@ -1195,6 +1359,9 @@ class WorkerRunner:
         if span is not None:
             with self._spans_lock:
                 self._spans[ready.token] = span
+        if task.env is not None:
+            self._run_env(ready, task, plan)
+            return
         planned = bool(plan)  # true until something carries the plan out
         try:
             serializer = for_content_type(ready.content_type, allow_pickle=self.app.allow_pickle)
