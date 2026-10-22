@@ -6,6 +6,8 @@ All notable changes to mayu are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-10-22
+
 ### Added
 
 - Parked models: `@app.pool("tts", vram_gb=6.9, parked={"ram_gb": 6.6})` with `@tts.park` and `@tts.unpark` hooks lets a lazy pool move an idle instance to host RAM instead of closing it, and move it back in about a second instead of rebuilding it. The worker parks a victim when its `parked=` amount fits in `--resources` (every resource named must be declared there), unparks a parked model before loading one, closes parked instances to make room, and scores a swap from RAM at a quarter of the loaded-model bonus. With `--lookahead`, victims go in order of when their pool is next needed, `--lookahead` unparks a parked model ahead of its task, and an optional `@tts.stage` hook builds the model straight into host RAM, even while the worker is busy, shortly before a workflow needs it (estimated from this worker's own run times and the workflow DAG). `close` runs on parked instances too. The README has a torch recipe.
@@ -45,6 +47,7 @@ First public release.
 - Prometheus metrics, JSON logging, OpenTelemetry tracing and the `mayu inspect` / `mayu dead` CLI.
 - Benchmarks against Celery, RQ, Dramatiq and streaQ.
 
-[Unreleased]: https://github.com/Siddid-Soni/mayu/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Siddid-Soni/mayu/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/Siddid-Soni/mayu/compare/v0.2.0...v0.2.5
 [0.2.0]: https://github.com/Siddid-Soni/mayu/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Siddid-Soni/mayu/releases/tag/v0.1.0

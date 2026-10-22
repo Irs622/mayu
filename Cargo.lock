@@ -443,7 +443,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "mayu-core"
-version = "0.2.0"
+version = "0.2.5"
 dependencies = [
  "proptest",
  "rand",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "mayu-py"
-version = "0.2.0"
+version = "0.2.5"
 dependencies = [
  "mayu-core",
  "mayu-redis",
@@ -471,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "mayu-redis"
-version = "0.2.0"
+version = "0.2.5"
 dependencies = [
  "mayu-core",
  "redis",
