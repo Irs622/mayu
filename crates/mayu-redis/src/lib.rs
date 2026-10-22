@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use mayu_core::{
-    Broker, Delivery, Error, Header, NodeInfo, NodeState, QueueStats, Reclaimed, Result, StoredResult, WorkerInfo,
-    WorkflowSpec, WorkflowState, decode_header, encode_delayed_member, encode_header, now_ms,
+    Broker, Delivery, Error, Header, NodeInfo, NodeState, QueueStats, Reclaimed, Result, RunningTask, StoredResult,
+    WorkerInfo, WorkflowSpec, WorkflowState, decode_header, decode_running, encode_delayed_member, encode_header,
+    encode_running, now_ms,
 };
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::streams::StreamReadReply;
@@ -29,6 +30,46 @@ fn queue_from_stream_key(k: &str) -> &str {
 }
 
 fn be(e: impl std::fmt::Display) -> Error { Error::Broker(e.to_string()) }
+
+/// The heartbeat's `tasks` field: set while tasks run, removed when idle so a reader never sees stale ones.
+/// Stored as lowercase hex of the msgpack so the hash stays valid UTF-8 for readers of older versions
+/// (they `HGETALL` it into strings).
+fn tasks_cmd(key: &str, tasks: &[RunningTask]) -> redis::Cmd {
+    if tasks.is_empty() {
+        let mut c = redis::cmd("HDEL");
+        c.arg(key).arg("tasks");
+        c
+    } else {
+        let mut c = redis::cmd("HSET");
+        c.arg(key).arg("tasks").arg(to_hex(&encode_running(tasks)));
+        c
+    }
+}
+
+fn to_hex(b: &[u8]) -> String {
+    use std::fmt::Write;
+    b.iter().fold(String::with_capacity(b.len() * 2), |mut s, x| {
+        let _ = write!(s, "{x:02x}");
+        s
+    })
+}
+
+fn from_hex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 || !s.is_ascii() {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+}
+
+/// A worker's `tasks` field; a malformed one reads as empty so a bad writer can't break `workers()` or inspect.
+fn parse_tasks(worker_id: &str, raw: &str) -> Vec<RunningTask> {
+    let decoded = from_hex(raw).ok_or_else(|| "not hex".to_string())
+        .and_then(|b| decode_running(&b).map_err(|e| e.to_string()));
+    decoded.unwrap_or_else(|e| {
+        tracing::warn!(worker = %worker_id, error = %e, "ignoring a malformed tasks field in a worker heartbeat");
+        Vec::new()
+    })
+}
 
 /// Splits the metadata `HMGET` of a workflow hash into (node count, name, created_at, status).
 fn parse_workflow_meta(id: &str, meta: Vec<Option<String>>) -> Result<(usize, String, u64, String)> {
@@ -292,6 +333,7 @@ impl RedisBroker {
             inflight: num("inflight") as usize,
             started_at: num("started_at"),
             last_seen: num("last_seen"),
+            tasks: map.get("tasks").map(|t| parse_tasks(worker_id, t)).unwrap_or_default(),
         }))
     }
 
@@ -703,8 +745,15 @@ impl Broker for RedisBroker {
                 .arg("started_at").arg(info.started_at)
                 .arg("last_seen").arg(info.last_seen)
                 .ignore()
+            .add_command(tasks_cmd(&key, &info.tasks)).ignore()
             .cmd("PEXPIRE").arg(&key).arg(ttl_ms).ignore()
             .query_async::<()>(&mut self.conn.clone()).await.map_err(be)
+    }
+
+    async fn running(&self, worker_id: &str) -> Result<Vec<RunningTask>> {
+        let raw: Option<String> = redis::cmd("HGET").arg(worker_key(worker_id)).arg("tasks")
+            .query_async(&mut self.conn.clone()).await.map_err(be)?;
+        Ok(raw.map(|t| parse_tasks(worker_id, &t)).unwrap_or_default())
     }
 
     async fn unregister(&self, worker_id: &str) -> Result<()> {

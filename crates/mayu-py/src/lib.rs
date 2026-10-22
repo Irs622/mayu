@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use mayu_core::{
-    Broker, GpuStat, Header, LazyPool, Link, MoveKind, Outcome, ReadyTask, Resources, Runtime, RuntimeConfig, Schedule,
+    Broker, GpuStat, Header, LazyPool, Link, MoveKind, Outcome, ReadyTask, Resources, RunningTask, Runtime,
+    RuntimeConfig, Schedule,
     WorkflowNode, WorkflowSpec, WorkflowState,
 };
 use mayu_redis::RedisBroker;
@@ -70,6 +71,21 @@ struct Client {
     broker: RedisBroker,
 }
 
+fn running_task_dict<'py>(py: Python<'py>, t: RunningTask) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("id", t.id)?;
+    d.set_item("task", t.task)?;
+    d.set_item("queue", t.queue)?;
+    d.set_item("workflow_id", t.workflow_id)?;
+    d.set_item("node", t.node)?;
+    d.set_item("started_ms", t.started_ms)?;
+    d.set_item("done", t.done)?;
+    d.set_item("total", t.total)?;
+    d.set_item("fraction", t.fraction)?;
+    d.set_item("remaining_s", t.remaining_s)?;
+    Ok(d)
+}
+
 fn worker_dict<'py>(py: Python<'py>, w: mayu_core::WorkerInfo) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("worker_id", w.worker_id)?;
@@ -80,6 +96,8 @@ fn worker_dict<'py>(py: Python<'py>, w: mayu_core::WorkerInfo) -> PyResult<Bound
     d.set_item("inflight", w.inflight)?;
     d.set_item("started_at", w.started_at)?;
     d.set_item("last_seen", w.last_seen)?;
+    let tasks = w.tasks.into_iter().map(|t| running_task_dict(py, t)).collect::<PyResult<Vec<_>>>()?;
+    d.set_item("tasks", tasks)?;
     Ok(d)
 }
 
@@ -159,6 +177,20 @@ impl Client {
     fn workers<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
         let ws = py.detach(|| self.rt.block_on(self.broker.workers())).map_err(rt_err)?;
         ws.into_iter().map(|w| worker_dict(py, w)).collect()
+    }
+
+    /// Tasks running on every live worker, each with its `worker` id; as fresh as the last heartbeat.
+    fn running_tasks<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let ws = py.detach(|| self.rt.block_on(self.broker.workers())).map_err(rt_err)?;
+        let mut out = Vec::new();
+        for w in ws {
+            for t in w.tasks {
+                let d = running_task_dict(py, t)?;
+                d.set_item("worker", &w.worker_id)?;
+                out.push(d);
+            }
+        }
+        Ok(out)
     }
 
     fn known_queues(&self, py: Python<'_>) -> PyResult<Vec<String>> {
@@ -466,6 +498,12 @@ impl Worker {
 
     fn stop_fetching(&self) {
         self.inner.stop_fetching();
+    }
+
+    /// Records a running task's progress; False if the task is gone or the numbers are unusable. No I/O.
+    #[pyo3(signature = (token, done, total=None))]
+    fn progress(&self, token: u64, done: f64, total: Option<f64>) -> bool {
+        self.inner.progress(token, done, total)
     }
 
     fn inflight(&self) -> usize {

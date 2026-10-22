@@ -9,6 +9,7 @@ use tokio::sync::Notify;
 use crate::broker::{Broker, Delivery, QueueStats, Reclaimed, StoredResult, WorkerInfo};
 use crate::envelope::{Header, decode_header, encode_header, now_ms};
 use crate::error::{Error, Result};
+use crate::progress::RunningTask;
 use crate::workflow::{NodeInfo, NodeState, WorkflowSpec, WorkflowState};
 
 #[derive(Debug, Clone)]
@@ -442,6 +443,11 @@ impl Broker for MemoryBroker {
         Ok(())
     }
 
+    async fn running(&self, worker_id: &str) -> Result<Vec<RunningTask>> {
+        self.check()?;
+        Ok(self.worker(worker_id).map(|w| w.tasks).unwrap_or_default())
+    }
+
     async fn unregister(&self, worker_id: &str) -> Result<()> {
         self.check()?;
         self.state.lock().unwrap().workers.remove(worker_id);
@@ -672,7 +678,7 @@ mod tests {
             let b = MemoryBroker::default();
             let info = WorkerInfo {
                 worker_id: "w1".into(), hostname: "h".into(), pid: 1, queues: vec!["q".into()],
-                concurrency: 2, inflight: 0, started_at: 0, last_seen: 0,
+                concurrency: 2, inflight: 0, started_at: 0, last_seen: 0, tasks: vec![],
             };
             b.heartbeat(&info, 50).await.unwrap();
             assert_eq!(b.worker("w1"), Some(info.clone()));

@@ -25,7 +25,7 @@ pub use eta::{Durations, MoveKind};
 pub use memory::{DeadEntry, MemoryBroker};
 pub use metrics::{DURATION_BUCKETS, Gauges, GpuStat, Metrics, Settled};
 pub use policy::{Action, Link, Outcome, RetryPolicy, backoff_ms, decide, full_jitter};
-pub use progress::{MAX_PUBLISHED, Progress, RunningTask};
+pub use progress::{MAX_PUBLISHED, Progress, RunningTask, decode_running, encode_running};
 pub use result::{ResultRecord, wait_result};
 pub use runtime::{ReadyTask, Runtime, RuntimeConfig};
 pub use workflow::{NodeInfo, NodeState, WorkflowNode, WorkflowSpec, WorkflowState, WorkflowSummary};

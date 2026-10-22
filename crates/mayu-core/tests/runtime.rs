@@ -589,3 +589,55 @@ fn progress_is_recorded_for_a_running_task_and_ignored_after() {
     assert!(!rt.progress(t.token, 50.0, Some(100.0)), "settled task");
     rt.shutdown(Duration::from_secs(1));
 }
+
+#[test]
+fn heartbeat_publishes_running_tasks_with_progress() {
+    let mem = MemoryBroker::default();
+    mem.push(&Header::new("a", "q", 0, "ct"), b"");
+    mem.push(&Header::new("b", "q", 0, "ct"), b"");
+    let rt = start(&mem, cfg(2, 2));
+    let id = rt.worker_id().to_string();
+    let reader = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let (t1, t2) = (rt.recv_timeout(RECV).unwrap(), rt.recv_timeout(RECV).unwrap());
+    assert!(rt.progress(t1.token, 5.0, Some(10.0)));
+    let t = Instant::now();
+    let tasks = loop {
+        let tasks = reader.block_on(mayu_core::Broker::running(&mem, &id)).unwrap();
+        if tasks.iter().any(|x| x.fraction.is_some()) {
+            break tasks;
+        }
+        assert!(t.elapsed() < Duration::from_secs(3), "progress never reached a heartbeat");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(tasks.len(), 2);
+    let p = tasks.iter().find(|x| x.id == t1.id).unwrap();
+    assert_eq!((p.done, p.total, p.fraction), (Some(5.0), Some(10.0), Some(0.5)));
+    assert_eq!((p.task.as_str(), p.queue.as_str()), (t1.task.as_str(), "q"));
+    let other = tasks.iter().find(|x| x.id != t1.id).unwrap();
+    assert_eq!((other.done, other.fraction, other.remaining_s), (None, None, None));
+    // Once both finish, the next heartbeat publishes none.
+    rt.complete(t1.token, Outcome::Success { result: None, links: vec![] });
+    rt.complete(t2.token, Outcome::Success { result: None, links: vec![] });
+    wait_until(|| mem.worker(&id).is_some_and(|w| w.tasks.is_empty()));
+    assert!(reader.block_on(mayu_core::Broker::running(&mem, &id)).unwrap().is_empty());
+    rt.shutdown(Duration::from_secs(1));
+    assert!(reader.block_on(mayu_core::Broker::running(&mem, &id)).unwrap().is_empty(), "unregistered");
+}
+
+#[test]
+fn heartbeat_publishes_at_most_the_cap() {
+    let mem = MemoryBroker::default();
+    let n = mayu_core::MAX_PUBLISHED + 6;
+    for _ in 0..n {
+        mem.push(&Header::new("t", "q", 0, "ct"), b"");
+    }
+    let rt = start(&mem, cfg(n, 1));
+    let id = rt.worker_id().to_string();
+    let tokens: Vec<_> = (0..n).map(|_| rt.recv_timeout(RECV).unwrap().token).collect();
+    wait_until(|| mem.worker(&id).is_some_and(|w| w.inflight == n));
+    assert_eq!(mem.worker(&id).unwrap().tasks.len(), mayu_core::MAX_PUBLISHED);
+    for t in tokens {
+        rt.complete(t, Outcome::Success { result: None, links: vec![] });
+    }
+    rt.shutdown(Duration::from_secs(1));
+}

@@ -2,6 +2,7 @@ use std::future::Future;
 
 use crate::envelope::Header;
 use crate::error::Result;
+use crate::progress::RunningTask;
 use crate::workflow::{WorkflowSpec, WorkflowState};
 
 #[derive(Debug, Clone)]
@@ -37,7 +38,7 @@ impl QueueStats {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WorkerInfo {
     pub worker_id: String,
     pub hostname: String,
@@ -47,6 +48,8 @@ pub struct WorkerInfo {
     pub inflight: usize,
     pub started_at: u64,
     pub last_seen: u64,
+    /// Tasks running now, as of this heartbeat (at most `MAX_PUBLISHED`).
+    pub tasks: Vec<RunningTask>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,6 +91,8 @@ pub trait Broker: Send + Sync + 'static {
     fn reclaim(&self, queue: &str, min_idle_ms: u64, cursor: &str, count: usize)
         -> impl Future<Output = Result<Reclaimed>> + Send;
     fn heartbeat(&self, info: &WorkerInfo, ttl_ms: u64) -> impl Future<Output = Result<()>> + Send;
+    /// The tasks `worker_id` published in its last live heartbeat; empty if it is unknown, expired or published none.
+    fn running(&self, worker_id: &str) -> impl Future<Output = Result<Vec<RunningTask>>> + Send;
     fn unregister(&self, worker_id: &str) -> impl Future<Output = Result<()>> + Send;
     /// Removes consumers with no pending entries, idle at least `min_idle_ms`, and no heartbeat.
     fn prune_consumers(&self, queue: &str, min_idle_ms: u64) -> impl Future<Output = Result<usize>> + Send;

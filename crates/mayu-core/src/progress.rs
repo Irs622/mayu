@@ -1,5 +1,9 @@
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, Result};
+
 /// Most running tasks one heartbeat publishes, oldest-started first.
 pub const MAX_PUBLISHED: usize = 64;
 
@@ -76,20 +80,36 @@ impl Progress {
 }
 
 /// A task running on this worker, as published in the heartbeat.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunningTask {
     pub id: String,
     pub task: String,
     pub queue: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_id: Option<String>,
     /// The node's index in its workflow, as a decimal string (as in `Header`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
     /// Unix ms the task started running.
     pub started_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub done: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fraction: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remaining_s: Option<f64>,
+}
+
+/// The heartbeat's `tasks` field: a msgpack list of maps with named keys and no None fields, so later versions
+/// can add keys (readers ignore unknown ones) and older writers can omit optional ones.
+pub fn encode_running(tasks: &[RunningTask]) -> Vec<u8> {
+    rmp_serde::to_vec_named(tasks).expect("running task serialization cannot fail")
+}
+
+pub fn decode_running(b: &[u8]) -> Result<Vec<RunningTask>> {
+    rmp_serde::from_slice(b).map_err(|e| Error::Envelope(e.to_string()))
 }
 
 #[cfg(test)]
@@ -198,5 +218,54 @@ mod tests {
         assert_eq!(Progress::new(t0, 12.0, Some(10.0)).unwrap().fraction, 1.0);
         assert_eq!(Progress::new(t0, -3.0, None).unwrap().fraction, 0.0);
         assert_eq!(Progress::new(t0, 3.0, None).unwrap().fraction, 1.0);
+    }
+
+    fn task(id: &str) -> RunningTask {
+        RunningTask {
+            id: id.into(), task: "t".into(), queue: "q".into(), workflow_id: None, node: None,
+            started_ms: 1_700_000_000_000, done: None, total: None, fraction: None, remaining_s: None,
+        }
+    }
+
+    #[test]
+    fn running_tasks_round_trip_with_and_without_optional_fields() {
+        let full = RunningTask {
+            workflow_id: Some("wf".into()), node: Some("2".into()), done: Some(7.0), total: Some(25.0),
+            fraction: Some(0.28), remaining_s: Some(250.5), ..task("a")
+        };
+        let list = vec![full, task("b")];
+        assert_eq!(decode_running(&encode_running(&list)).unwrap(), list);
+        assert_eq!(decode_running(&encode_running(&[])).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn none_fields_are_left_out_of_the_wire_form() {
+        use serde::de::IgnoredAny;
+        let raw: Vec<std::collections::BTreeMap<String, IgnoredAny>> =
+            rmp_serde::from_slice(&encode_running(&[task("a")])).unwrap();
+        let keys: Vec<_> = raw[0].keys().cloned().collect();
+        assert_eq!(keys, ["id", "queue", "started_ms", "task"]);
+    }
+
+    #[test]
+    fn decode_ignores_unknown_keys_and_accepts_missing_optional_ones() {
+        #[derive(Serialize)]
+        struct Newer {
+            id: &'static str, task: &'static str, queue: &'static str, started_ms: u64, gpu: &'static str, extra: Vec<u8>,
+        }
+        let bytes = rmp_serde::to_vec_named(&[Newer {
+            id: "a", task: "t", queue: "q", started_ms: 5, gpu: "0", extra: vec![1, 2],
+        }]).unwrap();
+        let got = decode_running(&bytes).unwrap();
+        assert_eq!(got, vec![RunningTask { started_ms: 5, ..task("a") }]);
+    }
+
+    #[test]
+    fn malformed_bytes_are_an_error() {
+        assert!(decode_running(b"").is_err());
+        assert!(decode_running(b"\xff\xfe not msgpack").is_err());
+        // A map where a list is expected, and a list of the wrong things.
+        assert!(decode_running(&rmp_serde::to_vec_named(&task("a")).unwrap()).is_err());
+        assert!(decode_running(&rmp_serde::to_vec(&[1, 2, 3]).unwrap()).is_err());
     }
 }

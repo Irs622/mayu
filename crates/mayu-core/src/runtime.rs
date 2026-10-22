@@ -323,6 +323,7 @@ impl<B: Broker> Runtime<B> {
             inflight: 0,
             started_at: now_ms(),
             last_seen: 0,
+            tasks: Vec::new(),
         };
         let prune_idle_ms = cfg.visibility_timeout_ms.max(cfg.heartbeat_interval_ms.saturating_mul(3)).saturating_mul(2);
         let heartbeat = rt.spawn(critical("heartbeat",
@@ -1190,6 +1191,7 @@ async fn heartbeat_loop<B: Broker>(
         let mut info = base.clone();
         info.inflight = inflight.lock().unwrap().len();
         info.last_seen = now_ms();
+        info.tasks = running_snapshot(&inflight, Instant::now(), info.last_seen);
         if let Err(e) = broker.heartbeat(&info, ttl_ms).await {
             metrics.broker_error("heartbeat");
             tracing::warn!(error = %e, "heartbeat failed");
