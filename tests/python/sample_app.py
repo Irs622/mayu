@@ -53,3 +53,17 @@ def flaky_file(path):
     if not os.path.exists(path):
         raise RuntimeError("flag file missing")
     return "ok"
+
+
+import mayu
+
+
+@app.task(name="sample.progressing")
+def progressing(path):
+    """Reports 1/2, waits for `path` to exist, then reports 2/2."""
+    mayu.progress(1, 2)
+    deadline = time.monotonic() + 30
+    while not os.path.exists(path) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    mayu.progress(2, 2)
+    return "done"

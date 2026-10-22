@@ -1,5 +1,6 @@
 """Parked models: a lazy pool's idle instance moves to host RAM instead of being closed, and is staged ahead of need."""
 import collections
+import re
 import threading
 import time
 import urllib.request
@@ -331,16 +332,21 @@ def _workflow(app, release, started=None, gemma=False):
 STAGING = dict(RES, gpu=1)
 
 
-def test_a_model_is_staged_while_the_node_before_it_runs_and_unparked_for_its_task(app, running):
+def test_a_model_is_staged_while_the_node_before_it_runs_and_unparked_for_its_task(app, running, caplog):
     rig = Rig(7.5, 16)
     rig.pool(app, "tts", 7.2, 6.6, stage=True)
     release, started = threading.Event(), threading.Event()
     _, wf, nb = _workflow(app, release, started)
+    caplog.set_level("INFO", logger="mayu.worker")
     with running(app, threads=2, resources=STAGING, pools={"tts": 1}, lookahead=True, **LAZY) as w:
         try:
             handle = wf.send()
             assert started.wait(10)
             assert rig.seen[("stage", "tts")].wait(10), "staged while a still holds the GPU"
+            logged = [r.getMessage() for r in caplog.records if r.getMessage().startswith("staging pool tts")]
+            assert len(logged) == 1 and re.fullmatch(
+                r"staging pool tts into host RAM: needed in ~\d+ s \(0/1 of its tasks done\)", logged[0]
+            ), logged
             assert not release.is_set()
             assert rig.seen[("unpark", "tts")].wait(10), "and moved to the GPU ahead of b, which still waits"
             assert _series(w.metrics_port, 'mayu_pool_stages_total{pool="tts"}') == 1.0

@@ -329,10 +329,12 @@ mayu worker tasks:app --queues gpu --pools gemma=1,tts=1 --pool-mode lazy --sche
   logged and the task builds the model itself; that pool isn't staged again for 60 seconds.
 - **Estimates:** when a pool is next needed comes from the workflow DAG and this worker's own average run time
   of each task (successful runs, weighted towards recent ones). A node that is running counts what is left of
-  its average, a waiting one starts when its slowest unfinished parent ends, and a task this worker has never
-  run counts as instant, which only makes a stage earlier. Like `linger`, it knows only the workflows this
-  worker has fetched a task of, and another worker's speed is not known. `mayu_pool_next_need_seconds` shows
-  the estimate.
+  its average, or what its own [progress reports](#reporting-progress) say is left when it has made enough of
+  them (on another worker too); a waiting node starts when its slowest unfinished parent ends, and a task this
+  worker has never run counts as instant, which only makes a stage earlier. Like `linger`, it knows only the
+  workflows this worker has fetched a task of, and another worker's speed is not known unless its tasks report
+  progress. `mayu_pool_next_need_seconds` shows the estimate. When staging starts the worker logs it, like
+  `staging pool tts into host RAM: needed in ~38 s (9/12 of its tasks done)`.
 - **Metrics:** `mayu_pool_parked`, `mayu_pool_parks_total`, `mayu_pool_unparks_total`,
   `mayu_pool_drops_total`, `mayu_pool_stages_total`, `mayu_pool_move_seconds` and
   `mayu_pool_next_need_seconds` (see [Metrics](#metrics)). They exist only for pools with `parked=`, so a
@@ -538,6 +540,68 @@ done, so each child is released exactly once. Nodes still run at least once, lik
   Redis-Cluster-safe.
 - Upgrade workers before submitting workflows: an older worker acks a node but never releases its children.
 
+## Reporting progress
+
+A long task can say how far it is, and mayu turns that into a fraction and a time left.
+
+```python
+@app.task(queue="gpu")
+def voice_lines(lines, tts=app.use("tts")):
+    for i, line in enumerate(lines):
+        tts.voice(line)
+        mayu.progress(i + 1, len(lines))      # or mayu.progress(0.4) for a fraction
+
+h = voice_lines.send(lines)
+h.progress()    # Progress(done=7.0, total=25.0, fraction=0.28, remaining=250.0, worker="laptop-1", updated=...)
+```
+
+```console
+$ mayu inspect tasks:app
+RUNNING (1)
+TASK         ID    WORKER    PROGRESS     LEFT    WORKFLOW
+voice_lines  01JB  laptop-1  7/25 (28 %)  ~4m10s  01JA
+```
+
+- **Reporting:** `mayu.progress(done, total)` needs `0 <= done <= total` and `total > 0`; `mayu.progress(fraction)`
+  takes a number from 0 to 1. It returns `True` when recorded, and does nothing and returns `False` outside a
+  running task, so library code can call it unconditionally. A wrong call raises `ValueError` (the message names
+  the rule) or `TypeError` for a non-number, running or not. Progress may go backwards (a retry inside the task, a
+  new phase); the estimate restarts from there. It is for the task body: a task that finishes, however it ends,
+  has no progress afterwards.
+- **Threads and async:** `mayu.progress` finds its task from the thread it runs on, so a thread the task starts
+  can't use it. Call `mayu.progress_reporter()` in the task and give the result to the thread: it has the same
+  signature as `progress`, is bound to that task, and does nothing after the task ends. It returns `None` outside
+  a task. `async def` tasks call `mayu.progress` directly, each in its own context. Process mode needs nothing
+  extra.
+- **Reading it:** `TaskHandle.progress()` returns a `Progress` (`done`, `total`, `fraction`, `remaining` in seconds,
+  `worker`, `updated` as `time.time()`) or `None` when the task isn't running (not started, finished, or its
+  worker is gone). A running task that hasn't reported gives a `Progress` whose numbers are `None`; `total` is
+  `None` after a bare fraction. `mayu inspect` lists running tasks in a `RUNNING` section, only while something
+  runs, and `--json` has a `running` key with the same fields (`task`, `id`, `worker`, `done`, `total`,
+  `fraction`, `remaining_s`, `workflow_id`, `node`, `started_ms`). Each worker entry in `workers` also has its
+  `tasks`.
+- **Time left:** from the pace between the first report and the latest, once two reports differ by at least 1 %
+  and are at least 1 s apart, so model loading before the loop doesn't count as slow work. Before that, from
+  the time since the task started, once it is 5 % done. Otherwise it is unknown (`None`, `-` in `inspect`).
+  100 % is 0 s.
+- **Cost:** `mayu.progress` does no I/O and never blocks; it only updates a small record in the worker. The worker
+  publishes the latest values with its heartbeat (every `--heartbeat-interval`, 5 s by default), so a reader is
+  up to one interval behind. A worker publishes at most 64 running tasks, oldest started first. Nothing is
+  added to tasks that never report. `TaskHandle.progress()` scans the live workers, so use it for an admin
+  page or a UI, not in a tight loop; poll no faster than the heartbeat.
+- **Metrics:** `mayu_task_progress_reports_total{queue,task}` counts the reports, and shows up after the first
+  one. There is no per-task gauge, since task ids would make the label set grow without end. A worker whose
+  `tasks` field can't be read is skipped and counted in `mayu_broker_errors_total{op="progress"}`.
+- **Lookahead:** with `--lookahead` and a pool with `parked=`, a running workflow node's reported progress
+  replaces its average run time in the estimate of when a pool is next needed (see
+  [Estimates](#parking-models-in-host-ram)), so staging follows the real position in a loop instead of a guess.
+  That includes nodes running on other workers, read from their heartbeats at most once per heartbeat interval,
+  and only while a workflow has a queued node this worker isn't running. Without progress reports the estimate
+  is the average, as before.
+
+The only addition to the Redis layout is a `tasks` field in the worker's heartbeat hash, removed when the worker
+is idle; it is stored as hex text and older workers ignore it.
+
 ## Declaring tasks without their code
 
 A producer often can't import a task's dependencies (a GPU model, a heavy library). Declare the task
@@ -638,6 +702,7 @@ processes listen on 9100–9103, so scrape all four. `MAYU_METRICS_PORT` sets th
 | `mayu_pool_drops_total`, `mayu_pool_stages_total` | counter | `pool` (parked instances closed to make room, and instances built straight into host RAM) |
 | `mayu_pool_move_seconds` | summary | `pool`, `kind` (`build`, `stage`, `park`, `unpark`; only for pools with `parked=`; `_sum` and `_count`) |
 | `mayu_pool_next_need_seconds` | gauge | `pool` (only with `parked=` and `--lookahead`; estimated seconds until the pool is next needed, omitted when no workflow has a task to come for it) |
+| `mayu_task_progress_reports_total` | counter | `queue`, `task` (only after a task first calls `mayu.progress`) |
 | `mayu_gpu_utilization_ratio` | gauge | `gpu`, `uuid` (0 to 1) |
 | `mayu_gpu_memory_used_bytes`, `mayu_gpu_memory_total_bytes` | gauge | `gpu`, `uuid` (used by all processes, and installed) |
 | `mayu_gpu_process_memory_bytes` | gauge | `gpu`, `uuid` (used by this worker and its children; omitted if NVML can't say) |
@@ -664,15 +729,17 @@ from your own code, call `mayu.configure_logging("json")` first.
 ## Inspecting and dead letters
 
 ```bash
-mayu inspect tasks:app                      # queue depths (ready, claimed, delayed, dead), live workers, unfinished workflows
+mayu inspect tasks:app                      # queue depths (ready, claimed, delayed, dead), live workers, running tasks, unfinished workflows
 mayu inspect tasks:app --json
 mayu dead list tasks:app --queue emails     # oldest first: when, task id, task, attempt, error
 mayu dead replay tasks:app --queue emails   # run them again
 mayu dead replay tasks:app --queue emails --id 01J... --limit 10
 ```
 
-The workflows table lists those not yet done (id, name, state, node counts, age); finished ones are left
-out and expire on their `ttl`.
+The running table appears only while a task runs: its progress and time left if it reports any (see
+[Reporting progress](#reporting-progress)), as fresh as each worker's last heartbeat. The workflows table
+lists those not yet done (id, name, state, node counts, age); finished ones are left out and expire on
+their `ttl`.
 
 A replayed task keeps its id, starts again at attempt 0, and its stored failure is cleared, so
 `handle.result()` waits for the new outcome. Each dead letter is moved back atomically, so

@@ -532,3 +532,196 @@ fn a_lookahead_worker_without_parkable_pools_exposes_no_new_families() {
     assert!(families.contains(&"mayu_pool_demand") && families.contains(&"mayu_pool_loads_total"), "{families:?}");
     rt.shutdown(Duration::from_secs(1));
 }
+
+// ---- lookahead ETA from task progress ----
+
+/// A task running on another worker, as that worker's heartbeat publishes it.
+fn remote_task(id: &str, remaining_s: Option<f64>) -> mayu_core::RunningTask {
+    mayu_core::RunningTask {
+        id: id.into(), task: "r".into(), queue: "rq".into(), workflow_id: None, node: None, started_ms: 1,
+        done: remaining_s.map(|_| 3.0), total: remaining_s.map(|_| 10.0), fraction: remaining_s.map(|_| 0.3),
+        remaining_s,
+    }
+}
+
+/// Registers `worker` as alive with these tasks running.
+fn publish(mem: &MemoryBroker, worker: &str, tasks: Vec<mayu_core::RunningTask>) {
+    let info = mayu_core::WorkerInfo {
+        worker_id: worker.into(), hostname: "h".into(), pid: 1, queues: vec!["rq".into()], concurrency: 1,
+        inflight: tasks.len(), started_at: 1, last_seen: 1, tasks,
+    };
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(mem.heartbeat(&info, 60_000)).unwrap();
+}
+
+/// `a` (queue q, this worker) and `r` (queue rq, which this worker doesn't serve; claimed by another consumer)
+/// -> `voice`. Returns the workflow, with `r` in flight on "other".
+fn remote_encode(mem: &MemoryBroker, pool_task: &str) -> WorkflowSpec {
+    let mut r = wf_node("r", &[]);
+    r.header.queue = "rq".into();
+    let wf = WorkflowSpec::new("w", 3600, vec![wf_node("a", &[]), r, wf_node(pool_task, &[0, 1])]);
+    submit(mem, &wf);
+    let other = mem.with_consumer("other");
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let got = rt.block_on(other.fetch(&["rq".to_string()], 1, 0)).unwrap();
+    assert_eq!(got.len(), 1, "the other worker claims r");
+    wf
+}
+
+#[test]
+fn next_need_tracks_the_reported_progress_instead_of_the_mean_and_a_stage_follows() {
+    let mem = MemoryBroker::default();
+    let wf = WorkflowSpec::new("w", 3600, vec![wf_node("enc", &[]), wf_node("voice", &[0])]);
+    submit(&mem, &wf);
+    let rt = start(&mem, parked_cfg());
+    rt.seed_task_secs("enc", 3600.0); // nothing like the real run
+    let enc = rt.recv_timeout(RECV).expect("the encode");
+    // No report yet: the mean rule, an hour away.
+    wait_until(|| next_need(&rt).is_some_and(|s| s > 3000.0));
+    assert_eq!(rt.stage_begin(), None);
+    // 3/10 after ~0.3 s: the encode is about 2 s in by the next look, so ~5 s are left.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(rt.progress(enc.token, 3.0, Some(10.0)));
+    wait_until(|| next_need(&rt).is_some_and(|s| s < 100.0));
+    let first = next_need(&rt).unwrap();
+    assert!(first > 0.5 && first < 14.0, "{first}");
+    // Inside the 15 s lead: the stage is granted although the mean says an hour.
+    assert_eq!(rt.stage_begin().as_deref(), Some("tts"));
+    rt.stage_done("tts", true).unwrap();
+    // 9/10: nearly there, and the estimate follows.
+    assert!(rt.progress(enc.token, 9.0, Some(10.0)));
+    wait_until(|| next_need(&rt).is_some_and(|s| s < first / 2.0));
+    let (secs, done, total) = rt.pool_need("tts").expect("tts is needed");
+    assert!(secs < first / 2.0 && (done, total) == (0, 1), "{secs} {done} {total}");
+    succeed(&rt, &enc);
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn a_task_that_reports_too_little_keeps_the_mean_rule() {
+    let mem = MemoryBroker::default();
+    let wf = WorkflowSpec::new("w", 3600, vec![wf_node("enc", &[]), wf_node("voice", &[0])]);
+    submit(&mem, &wf);
+    let rt = start(&mem, parked_cfg());
+    rt.seed_task_secs("enc", 3600.0);
+    let enc = rt.recv_timeout(RECV).expect("the encode");
+    // 1 % is below the fraction an estimate needs, so it isn't one.
+    assert!(rt.progress(enc.token, 1.0, Some(100.0)));
+    wait_until(|| next_need(&rt).is_some_and(|s| s > 3000.0));
+    assert_eq!(rt.stage_begin(), None);
+    succeed(&rt, &enc);
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn a_node_running_on_another_worker_is_estimated_from_its_heartbeat() {
+    let mem = MemoryBroker::default();
+    let wf = remote_encode(&mem, "voice");
+    publish(&mem, "other", vec![remote_task(&wf.nodes[1].header.id, Some(5.0))]);
+    let rt = start(&mem, parked_cfg());
+    rt.seed_task_secs("r", 3600.0);
+    rt.seed_task_secs("a", 0.0);
+    let a = rt.recv_timeout(RECV).expect("node a");
+    succeed(&rt, &a);
+    // voice waits on r alone, which has ~5 s left over there (and an hour by its mean).
+    wait_until(|| next_need(&rt).is_some_and(|s| s > 0.0 && s <= 5.0));
+    assert_eq!(rt.stage_begin().as_deref(), Some("tts"), "5 s is inside the lead");
+    assert!(mem.running_all_calls() >= 1);
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn a_remote_node_without_an_estimate_keeps_the_mean_rule_and_a_failed_read_is_counted() {
+    let mem = MemoryBroker::default();
+    let wf = remote_encode(&mem, "voice");
+    publish(&mem, "other", vec![remote_task(&wf.nodes[1].header.id, None)]);
+    let rt = start(&mem, parked_cfg());
+    rt.seed_task_secs("r", 40.0);
+    let a = rt.recv_timeout(RECV).expect("node a");
+    succeed(&rt, &a);
+    wait_until(|| next_need(&rt).is_some_and(|s| s > 30.0 && s <= 40.0));
+    assert_eq!(rt.stage_begin(), None);
+    assert_eq!(value(&scrape(&rt), r#"mayu_broker_errors_total{op="progress"}"#), None, "nothing failed");
+    rt.shutdown(Duration::from_secs(1));
+
+    // The broker can't list the other workers: the estimate falls back to the mean and the error is counted.
+    let mem = MemoryBroker::default();
+    let wf = remote_encode(&mem, "voice");
+    publish(&mem, "other", vec![remote_task(&wf.nodes[1].header.id, Some(1.0))]);
+    mem.fail_running_all(true);
+    let rt = start(&mem, parked_cfg());
+    rt.seed_task_secs("r", 40.0);
+    let a = rt.recv_timeout(RECV).expect("node a");
+    succeed(&rt, &a);
+    wait_until(|| value(&scrape(&rt), r#"mayu_broker_errors_total{op="progress"}"#).is_some_and(|n| n >= 1.0));
+    wait_until(|| next_need(&rt).is_some_and(|s| s > 30.0 && s <= 40.0));
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn a_task_this_worker_runs_is_not_overridden_by_a_heartbeat_listing_it() {
+    let mem = MemoryBroker::default();
+    let wf = remote_encode(&mem, "voice"); // r is on another worker, so the loop does read the heartbeats
+    // That worker's heartbeat (stale, or confused) also lists the task this worker is running.
+    publish(&mem, "other", vec![
+        remote_task(&wf.nodes[0].header.id, Some(3000.0)), remote_task(&wf.nodes[1].header.id, Some(1.0)),
+    ]);
+    let rt = start(&mem, parked_cfg());
+    rt.seed_task_secs("a", 10.0);
+    let a = rt.recv_timeout(RECV).expect("node a");
+    // Its own mean rule (10 s, a little of it spent), not 3000 s.
+    wait_until(|| next_need(&rt).is_some_and(|s| s > 5.0 && s <= 10.0));
+    assert!(mem.running_all_calls() >= 1, "the heartbeats were read");
+    succeed(&rt, &a);
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn other_workers_are_read_at_most_once_per_heartbeat() {
+    let mem = MemoryBroker::default();
+    let wf = remote_encode(&mem, "voice");
+    publish(&mem, "other", vec![remote_task(&wf.nodes[1].header.id, Some(500.0))]);
+    let rt = start(&mem, RuntimeConfig { heartbeat_interval_ms: 60_000, ..parked_cfg() });
+    rt.seed_task_secs("a", 0.0);
+    let a = rt.recv_timeout(RECV).expect("node a");
+    succeed(&rt, &a);
+    wait_until(|| next_need(&rt).is_some_and(|s| s > 400.0 && s <= 500.0));
+    assert_eq!(mem.running_all_calls(), 1);
+    // A second workflow wakes the loop; the estimate is recomputed (voice 2 is ~0.5 s away) without another read.
+    let two = WorkflowSpec::new("w2", 3600, vec![wf_node("b", &[]), wf_node("voice", &[0])]);
+    submit(&mem, &two);
+    rt.seed_task_secs("b", 0.5);
+    let b = rt.recv_timeout(RECV).expect("node b");
+    wait_until(|| next_need(&rt).is_some_and(|s| s <= 0.5));
+    assert_eq!(mem.running_all_calls(), 1);
+    succeed(&rt, &b);
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn workers_that_do_not_use_the_estimate_never_read_other_workers() {
+    // Lookahead on, no pool that parks.
+    let mem = MemoryBroker::default();
+    let wf = remote_encode(&mem, "t");
+    publish(&mem, "other", vec![remote_task(&wf.nodes[1].header.id, Some(5.0))]);
+    let rt = start(&mem, RuntimeConfig { lookahead: true, ..lazy_cfg() });
+    let a = rt.recv_timeout(RECV).expect("node a");
+    // `voice` is waiting, so the loop has run over this workflow.
+    wait_until(|| value(&scrape(&rt), r#"mayu_pool_demand{pool="tts"}"#) == Some(1.0));
+    succeed(&rt, &a);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(mem.running_all_calls(), 0, "no parkable pool");
+    rt.shutdown(Duration::from_secs(1));
+
+    // A parkable pool without --lookahead.
+    let mem = MemoryBroker::default();
+    let wf = remote_encode(&mem, "voice");
+    publish(&mem, "other", vec![remote_task(&wf.nodes[1].header.id, Some(5.0))]);
+    let rt = start(&mem, RuntimeConfig { lookahead: false, ..parked_cfg() });
+    let a = rt.recv_timeout(RECV).expect("node a");
+    succeed(&rt, &a);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(mem.running_all_calls(), 0, "no --lookahead");
+    assert_eq!(rt.pool_need("tts"), None);
+    rt.shutdown(Duration::from_secs(1));
+}

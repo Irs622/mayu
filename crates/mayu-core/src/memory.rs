@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
-use crate::broker::{Broker, Delivery, QueueStats, Reclaimed, StoredResult, WorkerInfo};
+use crate::broker::{Broker, Delivery, PublishedTasks, QueueStats, Reclaimed, StoredResult, WorkerInfo};
 use crate::envelope::{Header, decode_header, encode_header, now_ms};
 use crate::error::{Error, Result};
+use crate::progress::RunningTask;
 use crate::workflow::{NodeInfo, NodeState, WorkflowSpec, WorkflowState};
 
 #[derive(Debug, Clone)]
@@ -159,6 +160,8 @@ pub struct MemoryBroker {
     failing: Arc<AtomicBool>,
     fail_retries: Arc<AtomicBool>,
     fail_cancelled: Arc<AtomicBool>,
+    fail_running_all: Arc<AtomicBool>,
+    running_all_calls: Arc<AtomicUsize>,
     fetch_extra: Arc<AtomicUsize>,
     record_delay_ns: Arc<AtomicU64>,
     consumer: String,
@@ -179,6 +182,16 @@ impl MemoryBroker {
     /// broker that rejects deferring a task.
     pub fn fail_retries(&self, on: bool) {
         self.fail_retries.store(on, Ordering::SeqCst);
+    }
+
+    /// Test aid: while set, only `running_all` fails.
+    pub fn fail_running_all(&self, on: bool) {
+        self.fail_running_all.store(on, Ordering::SeqCst);
+    }
+
+    /// Test aid: how many times `running_all` was called, on this broker and every handle sharing its state.
+    pub fn running_all_calls(&self) -> usize {
+        self.running_all_calls.load(Ordering::SeqCst)
     }
 
     /// Test aid: while set, only `cancelled_workflows` fails.
@@ -442,6 +455,28 @@ impl Broker for MemoryBroker {
         Ok(())
     }
 
+    async fn running(&self, worker_id: &str) -> Result<Vec<RunningTask>> {
+        self.check()?;
+        Ok(self.worker(worker_id).map(|w| w.tasks).unwrap_or_default())
+    }
+
+    async fn running_all(&self) -> Result<PublishedTasks> {
+        self.running_all_calls.fetch_add(1, Ordering::SeqCst);
+        self.check()?;
+        if self.fail_running_all.load(Ordering::SeqCst) {
+            return Err(Error::Broker("injected running_all failure".into()));
+        }
+        let now = Instant::now();
+        let s = self.state.lock().unwrap();
+        let mut workers: Vec<&(WorkerInfo, Instant)> = s.workers.values().filter(|(_, expires)| *expires > now).collect();
+        workers.sort_by(|a, b| a.0.worker_id.cmp(&b.0.worker_id));
+        // Typed in memory, so nothing here can be malformed.
+        let tasks = workers.into_iter()
+            .flat_map(|(w, _)| w.tasks.iter().map(|t| (w.worker_id.clone(), t.clone())))
+            .collect();
+        Ok(PublishedTasks { tasks, malformed: 0 })
+    }
+
     async fn unregister(&self, worker_id: &str) -> Result<()> {
         self.check()?;
         self.state.lock().unwrap().workers.remove(worker_id);
@@ -672,7 +707,7 @@ mod tests {
             let b = MemoryBroker::default();
             let info = WorkerInfo {
                 worker_id: "w1".into(), hostname: "h".into(), pid: 1, queues: vec!["q".into()],
-                concurrency: 2, inflight: 0, started_at: 0, last_seen: 0,
+                concurrency: 2, inflight: 0, started_at: 0, last_seen: 0, tasks: vec![],
             };
             b.heartbeat(&info, 50).await.unwrap();
             assert_eq!(b.worker("w1"), Some(info.clone()));

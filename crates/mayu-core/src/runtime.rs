@@ -9,12 +9,13 @@ use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::MissedTickBehavior;
 
 use crate::dispatch::{Admit, Dispatcher, ReadyQueue, Resources, Schedule};
-use crate::broker::{Broker, Delivery, StoredResult, WorkerInfo};
+use crate::broker::{Broker, Delivery, PublishedTasks, StoredResult, WorkerInfo};
 use crate::envelope::{Header, now_ms};
 use crate::error::{Error, Result};
-use crate::eta::{self, Durations, MoveKind, PoolEta};
+use crate::eta::{self, Durations, MoveKind, PoolEta, Running};
 use crate::metrics::{Gauges, GpuStat, Metrics, Settled};
 use crate::policy::{Action, Outcome, RetryPolicy, decide, full_jitter};
+use crate::progress::{MAX_PUBLISHED, Progress, RunningTask};
 use crate::result::ResultRecord;
 use crate::workflow::NodeState;
 
@@ -140,6 +141,8 @@ struct InFlight {
     lost: bool,
     /// When a Python thread took it; None while it waits in the dispatcher.
     started: Option<Instant>,
+    /// What the running code last reported through `Runtime::progress`.
+    progress: Option<Progress>,
 }
 
 type Inflight = Arc<Mutex<HashMap<u64, InFlight>>>;
@@ -188,6 +191,8 @@ struct EtaState {
     durations: Mutex<Durations>,
     /// (pool, seconds until next needed) as last computed by the lookahead loop; pools with no need left out.
     needs: Mutex<Vec<(String, f64)>>,
+    /// (pool, (workflow nodes using it that are done, all of them)), for the pools in `needs`.
+    counts: Mutex<HashMap<String, (u32, u32)>>,
 }
 
 pub struct Runtime<B: Broker> {
@@ -261,6 +266,7 @@ impl<B: Broker> Runtime<B> {
         let eta = (!parkable.is_empty()).then(|| Arc::new(EtaState {
             durations: Mutex::new(Durations::default()),
             needs: Mutex::new(Vec::new()),
+            counts: Mutex::new(HashMap::new()),
         }));
         // Run times are only gathered, and needs only computed, for a worker that can use them to park or stage.
         let eta_in_use = if cfg.lookahead && lookahead { eta.clone() } else { None };
@@ -307,6 +313,8 @@ impl<B: Broker> Runtime<B> {
                 metrics: metrics.clone(),
                 inflight: inflight.clone(),
                 eta: eta_in_use,
+                worker_id: cfg.worker_id.clone(),
+                heartbeat: Duration::from_millis(cfg.heartbeat_interval_ms.max(10)),
             })))
         });
         let keepalive = rt.spawn(critical("keepalive",
@@ -320,6 +328,7 @@ impl<B: Broker> Runtime<B> {
             inflight: 0,
             started_at: now_ms(),
             last_seen: 0,
+            tasks: Vec::new(),
         };
         let prune_idle_ms = cfg.visibility_timeout_ms.max(cfg.heartbeat_interval_ms.saturating_mul(3)).saturating_mul(2);
         let heartbeat = rt.spawn(critical("heartbeat",
@@ -393,6 +402,32 @@ impl<B: Broker> Runtime<B> {
             f.started = Some(Instant::now());
         }
         Some(task)
+    }
+
+    /// Records a running task's progress. False if the token is no longer in flight or the numbers are unusable.
+    pub fn progress(&self, token: u64, done: f64, total: Option<f64>) -> bool {
+        let now = Instant::now();
+        let mut m = self.inflight.lock().unwrap();
+        let Some(f) = m.get_mut(&token) else { return false };
+        let ok = match &mut f.progress {
+            Some(p) => p.report(now, done, total),
+            none => match Progress::new(now, done, total) {
+                Some(p) => {
+                    *none = Some(p);
+                    true
+                }
+                None => false,
+            },
+        };
+        if ok {
+            self.metrics.progress_reported(&f.delivery.queue, &f.delivery.header.task);
+        }
+        ok
+    }
+
+    /// Tasks running now, oldest first, at most `MAX_PUBLISHED`.
+    pub fn running(&self) -> Vec<RunningTask> {
+        running_snapshot(&self.inflight, Instant::now(), now_ms())
     }
 
     pub fn complete(&self, token: u64, outcome: Outcome) {
@@ -520,6 +555,15 @@ impl<B: Broker> Runtime<B> {
         if let Some(eta) = &self.eta {
             eta.durations.lock().unwrap().record_task(task, secs);
         }
+    }
+
+    /// When `pool` is next needed, as the lookahead loop last estimated: (seconds from now, workflow nodes using
+    /// it that are done, all of them). None when `--lookahead` isn't estimating, or nothing needs the pool.
+    pub fn pool_need(&self, pool: &str) -> Option<(f64, u32, u32)> {
+        let eta = self.eta.as_ref()?;
+        let secs = eta.needs.lock().unwrap().iter().find(|(p, _)| p == pool)?.1;
+        let (done, total) = eta.counts.lock().unwrap().get(pool).copied().unwrap_or((0, 0));
+        Some((secs, done, total))
     }
 
     /// See `Dispatcher::blocked`.
@@ -705,7 +749,7 @@ async fn fetch_batches<B: Broker>(c: &mut FetchCtx<B>, skips: &mut JoinSet<()>) 
             let token = next_token;
             next_token += 1;
             let task = ReadyTask::from_delivery(token, &d);
-            c.inflight.lock().unwrap().insert(token, InFlight { delivery: d, last_claim: Instant::now(), lost: false, started: None });
+            c.inflight.lock().unwrap().insert(token, InFlight { delivery: d, last_claim: Instant::now(), lost: false, started: None, progress: None });
             if let Admit::Defer { task, delay } = c.ready.push(task, Instant::now()) {
                 defer(c, *task, delay).await;
             }
@@ -1017,6 +1061,55 @@ struct LookaheadCtx<B> {
     inflight: Inflight,
     /// Some when pools park and `--lookahead` is on: the loop also estimates when each pool is next needed.
     eta: Option<Arc<EtaState>>,
+    worker_id: String,
+    /// How long a read of the other workers' running tasks stays good: they publish once per heartbeat.
+    heartbeat: Duration,
+}
+
+/// What other workers' last heartbeats said about the tasks running there, with when it was read.
+#[derive(Default)]
+struct RemoteRunning {
+    read_at: Option<Instant>,
+    /// Task id -> seconds left as of `read_at`, for tasks that report a usable estimate.
+    remaining: HashMap<String, f64>,
+}
+
+impl RemoteRunning {
+    fn stale(&self, max_age: Duration) -> bool {
+        self.read_at.is_none_or(|at| at.elapsed() >= max_age)
+    }
+
+    /// Reads the other workers' published tasks. A failed read leaves them unknown (the estimate falls back to
+    /// run-time averages) and is not retried before the next heartbeat. Every worker whose field can't be parsed
+    /// counts as a `progress` broker error per read, so a bad writer shows up on `/metrics` until it goes away.
+    async fn refresh<B: Broker>(&mut self, broker: &B, own: &str, metrics: &Metrics) {
+        self.read_at = Some(Instant::now());
+        self.remaining.clear();
+        match broker.running_all().await {
+            Ok(PublishedTasks { tasks, malformed }) => {
+                for _ in 0..malformed {
+                    metrics.broker_error("progress");
+                }
+                for (worker, t) in tasks {
+                    if let Some(r) = t.remaining_s.filter(|r| r.is_finite() && worker != own) {
+                        self.remaining.insert(t.id, r);
+                    }
+                }
+            }
+            Err(e) => {
+                metrics.broker_error("progress");
+                tracing::warn!(error = %e, "reading other workers' running tasks failed");
+            }
+        }
+    }
+
+    /// The estimates as of now: each has aged by the time since the read.
+    fn running(&self) -> impl Iterator<Item = (String, Running)> + '_ {
+        let age = self.read_at.map_or(0.0, |at| at.elapsed().as_secs_f64());
+        self.remaining.iter().map(move |(id, r)| {
+            (id.clone(), Running { elapsed: 0.0, remaining: Some((r - age).max(0.0)) })
+        })
+    }
 }
 
 /// Served task -> the lazy pools its request names as `pool:<name>`; tasks using none are left out.
@@ -1038,6 +1131,7 @@ fn task_pools(res: &Resources) -> HashMap<String, Vec<String>> {
 async fn lookahead_loop<B: Broker>(mut c: LookaheadCtx<B>) {
     let mut tick = tokio::time::interval(LOOKAHEAD_INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut remote = RemoteRunning::default();
     loop {
         tokio::select! {
             _ = tick.tick() => {}
@@ -1047,23 +1141,10 @@ async fn lookahead_loop<B: Broker>(mut c: LookaheadCtx<B>) {
         let ids: Vec<String> = c.active.seen.lock().unwrap().keys().cloned().collect();
         let mut demand: HashMap<&str, u32> = c.pools.iter().map(|p| (p.as_str(), 0)).collect();
         let mut finished = Vec::new();
-        // Run times so far, and how long each task this worker runs has been going (by task id).
-        let (durations, elapsed) = match &c.eta {
-            Some(eta) => {
-                let elapsed: HashMap<String, f64> = c.inflight.lock().unwrap().values()
-                    .filter_map(|f| Some((f.delivery.header.id.clone(), f.started?.elapsed().as_secs_f64())))
-                    .collect();
-                (eta.durations.lock().unwrap().clone(), elapsed)
-            }
-            None => (Durations::default(), HashMap::new()),
-        };
-        let mut etas: HashMap<String, PoolEta> = HashMap::new();
+        let mut running_wfs = Vec::new();
         for id in ids {
             match c.broker.workflow(&id).await {
                 Ok(Some(wf)) if wf.summary().state == "running" => {
-                    if c.eta.is_some() {
-                        eta::add_workflow(&mut etas, &wf, &durations, &elapsed, &c.task_pools);
-                    }
                     for n in wf.nodes.iter().filter(|n| matches!(n.state, NodeState::Waiting | NodeState::Queued)) {
                         for p in c.task_pools.get(&n.task).into_iter().flatten() {
                             if let Some(d) = demand.get_mut(p.as_str()) {
@@ -1071,12 +1152,48 @@ async fn lookahead_loop<B: Broker>(mut c: LookaheadCtx<B>) {
                             }
                         }
                     }
+                    if c.eta.is_some() {
+                        running_wfs.push(wf);
+                    }
                 }
                 Ok(_) => finished.push(id),
                 Err(e) => {
                     c.metrics.broker_error("workflow");
                     tracing::warn!(error = %e, workflow = %id, "reading a workflow for pool demand failed");
                 }
+            }
+        }
+        // Run times so far, and the tasks running now (by task id): the ones on this worker from the in-flight
+        // map, the ones on other workers from their heartbeats.
+        let mut etas: HashMap<String, PoolEta> = HashMap::new();
+        if let Some(eta) = &c.eta {
+            let durations = eta.durations.lock().unwrap().clone();
+            let now = Instant::now();
+            let local: HashMap<String, Running> = c.inflight.lock().unwrap().values()
+                .filter_map(|f| {
+                    let started = f.started?;
+                    Some((f.delivery.header.id.clone(), Running {
+                        elapsed: now.saturating_duration_since(started).as_secs_f64(),
+                        remaining: f.progress.as_ref().and_then(|p| p.remaining_s(started, now)),
+                    }))
+                })
+                .collect();
+            // Only worth a read while a pool's workflow has a queued node that isn't running here: that one may be
+            // running elsewhere.
+            let elsewhere = running_wfs.iter().any(|wf| {
+                wf.nodes.iter().any(|n| c.task_pools.contains_key(&n.task))
+                    && wf.nodes.iter().any(|n| n.state == NodeState::Queued && !local.contains_key(&n.task_id))
+            });
+            let mut running = HashMap::new();
+            if elsewhere {
+                if remote.stale(c.heartbeat) {
+                    remote.refresh(&*c.broker, &c.worker_id, &c.metrics).await;
+                }
+                running.extend(remote.running());
+            }
+            running.extend(local); // this worker knows its own tasks best
+            for wf in &running_wfs {
+                eta::add_workflow(&mut etas, wf, &durations, &running, &c.task_pools);
             }
         }
         if !finished.is_empty() {
@@ -1090,17 +1207,22 @@ async fn lookahead_loop<B: Broker>(mut c: LookaheadCtx<B>) {
             c.ready.set_demand(&demand);
             continue;
         };
+        let mut counts = HashMap::new();
         let needs: Vec<(String, u32, Option<f64>)> = demand.into_iter().map(|(p, n)| {
             let e = etas.get(&p);
             if let Some(e) = e.filter(|_| n > 0) {
                 tracing::debug!(pool = %p, next_need = ?e.next_need, done = e.done, total = e.total, "pool progress");
             }
             let next = e.and_then(|e| e.next_need).filter(|_| n > 0);
+            if let (Some(e), Some(_)) = (e, next) {
+                counts.insert(p.clone(), (e.done, e.total));
+            }
             (p, n, next)
         }).collect();
         let mut known: Vec<(String, f64)> = needs.iter().filter_map(|(p, _, s)| Some((p.clone(), (*s)?))).collect();
         known.sort_by(|a, b| a.0.cmp(&b.0));
         *eta.needs.lock().unwrap() = known;
+        *eta.counts.lock().unwrap() = counts;
         c.ready.set_needs(&needs);
     }
 }
@@ -1165,6 +1287,7 @@ async fn heartbeat_loop<B: Broker>(
         let mut info = base.clone();
         info.inflight = inflight.lock().unwrap().len();
         info.last_seen = now_ms();
+        info.tasks = running_snapshot(&inflight, Instant::now(), info.last_seen);
         if let Err(e) = broker.heartbeat(&info, ttl_ms).await {
             metrics.broker_error("heartbeat");
             tracing::warn!(error = %e, "heartbeat failed");
@@ -1186,6 +1309,34 @@ struct PoolView {
     /// Sorted.
     parkable: Vec<String>,
     eta: Option<Arc<EtaState>>,
+}
+
+/// Started tasks, oldest first (ties by claim order), capped; clones only the ones it returns.
+fn running_snapshot(inflight: &Inflight, now: Instant, wall_ms: u64) -> Vec<RunningTask> {
+    let m = inflight.lock().unwrap();
+    let mut started: Vec<(Instant, u64, &InFlight)> =
+        m.iter().filter_map(|(token, f)| f.started.map(|s| (s, *token, f))).collect();
+    started.sort_unstable_by_key(|(s, token, _)| (*s, *token));
+    started.truncate(MAX_PUBLISHED);
+    started
+        .into_iter()
+        .map(|(s, _, f)| {
+            let h = &f.delivery.header;
+            let p = f.progress.as_ref();
+            RunningTask {
+                id: h.id.clone(),
+                task: h.task.clone(),
+                queue: f.delivery.queue.clone(),
+                workflow_id: h.workflow_id.clone(),
+                node: h.node.clone(),
+                started_ms: wall_ms.saturating_sub(now.saturating_duration_since(s).as_millis() as u64),
+                done: p.map(|p| p.done),
+                total: p.and_then(|p| p.total),
+                fraction: p.map(|p| p.fraction),
+                remaining_s: p.and_then(|p| p.remaining_s(s, now)),
+            }
+        })
+        .collect()
 }
 
 /// One `/metrics` body: counters, process gauges, and queue depths if the broker answers in time.
@@ -1248,6 +1399,44 @@ mod tests {
         let ms = 1_700_000_000_123;
         let id = ulid::Ulid::from_parts(ms, 42).to_string();
         assert_eq!(ReadyTask::from_delivery(1, &delivery(Some(&id))).workflow_started_ms, Some(ms));
+    }
+
+    fn inflight_with(entries: Vec<(u64, Option<Instant>, Option<Progress>)>) -> Inflight {
+        let m = entries
+            .into_iter()
+            .map(|(token, started, progress)| {
+                let mut d = delivery(None);
+                d.header.id = format!("id{token}");
+                (token, InFlight { delivery: d, last_claim: Instant::now(), lost: false, started, progress })
+            })
+            .collect();
+        Arc::new(Mutex::new(m))
+    }
+
+    #[test]
+    fn snapshot_lists_started_tasks_oldest_first() {
+        let now = Instant::now();
+        let ago = |s| Some(now - Duration::from_secs(s));
+        let p = Progress::new(now, 5.0, Some(10.0));
+        let inflight = inflight_with(vec![(1, ago(10), None), (2, ago(30), p), (3, None, None), (4, ago(20), None)]);
+        let snap = running_snapshot(&inflight, now, 1_000_000);
+        let ids: Vec<_> = snap.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["id2", "id4", "id1"]);
+        assert_eq!(snap[0].started_ms, 970_000);
+        assert_eq!((snap[0].done, snap[0].total, snap[0].fraction), (Some(5.0), Some(10.0), Some(0.5)));
+        assert_eq!(snap[0].remaining_s, Some(30.0 * 0.5 / 0.5));
+        assert_eq!((snap[1].done, snap[1].fraction, snap[1].remaining_s), (None, None, None));
+        assert_eq!((snap[1].task.as_str(), snap[1].queue.as_str()), ("t", "q"));
+    }
+
+    #[test]
+    fn snapshot_is_capped() {
+        let now = Instant::now();
+        let entries = (0..MAX_PUBLISHED as u64 + 10).map(|i| (i, Some(now - Duration::from_millis(1000 - i)), None));
+        let snap = running_snapshot(&inflight_with(entries.collect()), now, 10_000);
+        assert_eq!(snap.len(), MAX_PUBLISHED);
+        assert_eq!(snap[0].id, "id0");
+        assert_eq!(snap[MAX_PUBLISHED - 1].id, format!("id{}", MAX_PUBLISHED - 1));
     }
 
     #[test]

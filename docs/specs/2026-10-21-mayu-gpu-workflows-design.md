@@ -141,6 +141,55 @@ handle = wf.send()          # WorkflowHandle: status, per-node handles, cancel()
 - Supersedes "canvas" in the architecture spec's out-of-scope list; `link=` stays as the single-callback
   shortcut.
 
+## 6.1 Task progress (Plan 16)
+
+A step is a loop over items (prompts to encode, lines to voice, scenes to render), so the task knows its
+position; mayu otherwise sees it only as running or finished, and a 400 s step reads the same from start to end.
+The task reports it, mayu turns it into an estimate of the time left.
+
+```python
+@app.task(queue="gpu")
+def voice_lines(lines, tts=app.use("tts")):
+    for i, line in enumerate(lines):
+        tts.voice(line)
+        mayu.progress(i + 1, len(lines))      # or mayu.progress(0.4) for a fraction
+```
+
+- **API:** `mayu.progress(done, total=None)` records a count, or a fraction in `[0, 1]` without `total`, and returns
+  whether it was recorded. Outside a running task it does nothing and returns `False`, so library code that
+  also runs standalone can call it unconditionally; bad values raise `ValueError` / `TypeError` either way.
+  `mayu.progress_reporter()` returns a callable bound to the current task for threads the task starts, since
+  the current task is found through the thread. Progress may go backwards; the estimate restarts from there.
+- **Finding the task:** the worker already runs each task on a slot thread, so it sets the slot's token around
+  the call (one attribute write each way, no allocation) and `progress` reads it; async tasks carry it in a
+  `ContextVar` set on submit. Process mode needs nothing, each child being a full worker. A task that never
+  reports pays nothing.
+- **Storage:** the in-flight entry of the Rust runtime holds the last report and the first one the current
+  estimate is measured from, behind the lock the entry map already has. Reporting does no I/O and never
+  blocks, and a report for a task that has finished is ignored.
+- **Time left:** `(1 - f) / rate`, with the rate measured from the first report to the latest once they differ
+  by 1 % and are 1 s apart, so setup before the loop (a model load) doesn't read as slow work. Before that,
+  `elapsed * (1 - f) / f` from 5 % done; below that, unknown. A pure function in `mayu-core`.
+- **Publishing:** no extra round trip. Each heartbeat writes the running tasks (id, task, queue, workflow and
+  node, start time, and the progress fields when reported; at most 64, oldest first) into a `tasks` field of
+  the worker's hash as msgpack in hex text, and deletes the field when none runs. It is additive: readers
+  ignore unknown fields, and an unreadable `tasks` reads as empty and counts as a `progress` broker error. So
+  progress is up to one heartbeat interval old.
+- **Reading:** `TaskHandle.progress()` scans the live workers' hashes for the task id (an admin and UI call, not
+  for tight loops), and `mayu inspect` lists running tasks with progress and time left, in text and `--json`. The
+  only metric is a counter of reports per queue and task; a gauge per task would multiply label values with
+  every task id.
+- **Lookahead (§7.2):** with `--lookahead`, a running node's remaining time in the next-need estimate is its
+  progress estimate when it has one, else what is left of the average run time. Local tasks come from the
+  in-flight entries, tasks on other workers from their heartbeats, read at most once per heartbeat interval and
+  only while a workflow has a queued node that isn't running here. The staging decision and
+  `mayu_pool_next_need_seconds` follow, so the voice model is staged by the encode loop's real position, not
+  by a guess.
+- **Opt-in:** a task that doesn't call `progress` and a worker without `--lookahead` and `parked=` behave and
+  export as before, apart from the heartbeat field and a `RUNNING` section in `mayu inspect` while a task runs.
+- **Not in scope:** free-text messages, pushing progress to the producer (it polls), keeping progress after the
+  task ends, limits based on progress.
+
 ## 7. Model pools (Plan 12)
 
 For servers: a fixed number of instances of an expensive object (a model, a loaded tensor set), loaded at
@@ -258,7 +307,8 @@ mayu worker app:app --queues gpu --pools encoder=1,voice=1 --pool-mode lazy --sc
   per task name, when each pool is next needed: a running node has what is left of its average, a queued one
   its average, a waiting one starts when its slowest unfinished parent ends. A task never run here counts as
   zero, which errs towards staging early, never late. Only workflows this worker has fetched a task of are
-  known, as for `linger=` and lookahead.
+  known, as for `linger=` and lookahead. A running node that reports progress (§6.1) has its own estimate
+  instead of its average.
 - **Victim order:** with `--lookahead` and some pool declaring `parked=`, idle (or parked) instances are
   chosen as victims in order of when their pool is next needed, the furthest first and a pool nobody needs
   before any, ties by least recently used. Otherwise it is least recently used, so an existing worker evicts as
@@ -293,6 +343,7 @@ for the first park, 0.3 s for later ones, 0.5 s to unpark, against 1 to 5 s to r
 | 13 | Resident models with eviction, residency-aware scoring, `cost=` | 11, 12 | yes: load times, VRAM |
 | 14 | Self-tuning concurrency (NVML, optional `gpu` extra), GPU metrics, linger | 13 | yes |
 | 15 | Parked models (host-RAM tier for lazy pools), progress-aware staging | 13, 14 | yes: park, unpark and stage times, host RAM |
+| 16 | Task progress (`mayu.progress`), time-left estimates, progress-aware lookahead | 11, 15 (lookahead part) | yes: estimates against actual finish times |
 | later | Capacity requeue on GPU OOM without spending a retry | 10 | no |
 
 Before Plan 13: one instrumented run of the driving example on the target GPU, recording model load

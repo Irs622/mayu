@@ -220,7 +220,7 @@ async fn heartbeat_roundtrip_ttl_and_unregister() {
     let (b, _q) = setup().await;
     let info = WorkerInfo {
         worker_id: uniq("w"), hostname: "host-1".into(), pid: 42, queues: vec!["a".into(), "b".into()],
-        concurrency: 8, inflight: 3, started_at: 1_000, last_seen: 2_000,
+        concurrency: 8, inflight: 3, started_at: 1_000, last_seen: 2_000, tasks: vec![],
     };
     b.heartbeat(&info, 300).await.unwrap();
     assert_eq!(b.worker_info(&info.worker_id).await.unwrap(), Some(info.clone()));
@@ -250,7 +250,7 @@ async fn prune_removes_only_idle_consumers_without_heartbeat_or_pending() {
     busy.fetch(&[q.clone()], 1, 100).await.unwrap(); // 1 pending, no heartbeat
     live.heartbeat(&WorkerInfo {
         worker_id: live_name.clone(), hostname: "h".into(), pid: 1, queues: vec![q.clone()],
-        concurrency: 1, inflight: 0, started_at: 0, last_seen: 0,
+        concurrency: 1, inflight: 0, started_at: 0, last_seen: 0, tasks: vec![],
     }, 60_000).await.unwrap();
     assert_eq!(consumer_count(&q).await, 3);
     assert_eq!(ghost.prune_consumers(&q, 0).await.unwrap(), 1);
@@ -435,7 +435,7 @@ async fn workers_lists_live_heartbeats() {
     let (a, z) = (uniq("w"), uniq("w"));
     for id in [&a, &z] {
         let info = WorkerInfo { worker_id: id.clone(), hostname: "h".into(), pid: 1, queues: vec![q.clone()],
-                                concurrency: 2, inflight: 0, started_at: 1, last_seen: 2 };
+                                concurrency: 2, inflight: 0, started_at: 1, last_seen: 2, tasks: vec![] };
         b.heartbeat(&info, 10_000).await.unwrap();
     }
     let ws = b.workers().await.unwrap();
@@ -457,4 +457,143 @@ async fn known_queues_finds_queues_in_redis() {
     let qs = b.known_queues().await.unwrap();
     assert!(qs.contains(&q) && qs.contains(&delayed_only));
     assert!(qs.windows(2).all(|p| p[0] < p[1]), "sorted and unique");
+}
+
+fn running_task(id: &str, progress: bool) -> mayu_core::RunningTask {
+    mayu_core::RunningTask {
+        id: id.into(), task: "t".into(), queue: "q".into(), workflow_id: Some("wf".into()), node: Some("1".into()),
+        started_ms: 1_000, done: progress.then_some(3.0), total: progress.then_some(12.0),
+        fraction: progress.then_some(0.25), remaining_s: progress.then_some(90.5),
+    }
+}
+
+fn worker(id: &str, tasks: Vec<mayu_core::RunningTask>) -> WorkerInfo {
+    WorkerInfo {
+        worker_id: id.into(), hostname: "h".into(), pid: 7, queues: vec!["q".into()], concurrency: 2,
+        inflight: tasks.len(), started_at: 1, last_seen: 2, tasks,
+    }
+}
+
+async fn has_tasks_field(id: &str) -> bool {
+    redis::cmd("HEXISTS").arg(worker_key(id)).arg("tasks").query_async(&mut raw().await).await.unwrap()
+}
+
+#[tokio::test]
+async fn heartbeat_publishes_running_tasks_and_removes_them_when_idle() {
+    let (b, _q) = setup().await;
+    let id = uniq("w");
+    let tasks = vec![running_task("a", true), running_task("b", false)];
+    let info = worker(&id, tasks.clone());
+    b.heartbeat(&info, 60_000).await.unwrap();
+    assert_eq!(b.running(&id).await.unwrap(), tasks);
+    assert_eq!(b.worker_info(&id).await.unwrap(), Some(info));
+    let listed = b.workers().await.unwrap().into_iter().find(|w| w.worker_id == id).unwrap();
+    assert_eq!(listed.tasks, tasks);
+    assert!(has_tasks_field(&id).await);
+    // Idle: the field is deleted, not left stale, and the other fields are still refreshed.
+    b.heartbeat(&worker(&id, vec![]), 60_000).await.unwrap();
+    assert!(!has_tasks_field(&id).await);
+    assert!(b.running(&id).await.unwrap().is_empty());
+    assert_eq!(b.worker_info(&id).await.unwrap().unwrap().pid, 7);
+    // Unknown and expired workers have none.
+    assert!(b.running(&uniq("nope")).await.unwrap().is_empty());
+    b.heartbeat(&worker(&id, vec![running_task("c", false)]), 100).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(b.running(&id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn heartbeat_with_tasks_is_readable_the_way_older_versions_read_it() {
+    // 0.2.0 reads the worker hash with HGETALL into strings; a binary field would fail that conversion.
+    let (b, _q) = setup().await;
+    let id = uniq("w");
+    b.heartbeat(&worker(&id, vec![running_task("a", true), running_task("b", false)]), 60_000).await.unwrap();
+    let old: std::collections::HashMap<String, String> =
+        redis::cmd("HGETALL").arg(worker_key(&id)).query_async(&mut raw().await).await.unwrap();
+    assert_eq!(old["hostname"], "h");
+    assert_eq!(old["pid"], "7");
+    assert_eq!(old["queues"], "q");
+    assert_eq!(old["concurrency"], "2");
+    assert_eq!(old["inflight"], "2");
+    assert_eq!(old["started_at"], "1");
+    assert_eq!(old["last_seen"], "2");
+    assert!(old.contains_key("tasks"));
+}
+
+#[tokio::test]
+async fn publishes_a_full_batch_of_tasks() {
+    let (b, _q) = setup().await;
+    let id = uniq("w");
+    let tasks: Vec<_> = (0..mayu_core::MAX_PUBLISHED).map(|i| running_task(&format!("id{i}"), i % 2 == 0)).collect();
+    b.heartbeat(&worker(&id, tasks.clone()), 60_000).await.unwrap();
+    assert_eq!(b.running(&id).await.unwrap(), tasks);
+}
+
+#[tokio::test]
+async fn worker_hash_from_an_older_version_has_no_tasks() {
+    let (b, _q) = setup().await;
+    let id = uniq("w");
+    let _: i64 = redis::cmd("HSET").arg(worker_key(&id))
+        .arg("hostname").arg("old").arg("pid").arg(9).arg("queues").arg("a,b").arg("concurrency").arg(4)
+        .arg("inflight").arg(1).arg("started_at").arg(10).arg("last_seen").arg(20)
+        .query_async(&mut raw().await).await.unwrap();
+    let w = b.workers().await.unwrap().into_iter().find(|w| w.worker_id == id).unwrap();
+    assert_eq!((w.hostname.as_str(), w.pid, w.concurrency, w.inflight, w.started_at, w.last_seen),
+               ("old", 9, 4, 1, 10, 20));
+    assert_eq!(w.queues, vec!["a".to_string(), "b".to_string()]);
+    assert!(w.tasks.is_empty());
+    assert!(b.running(&id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn malformed_tasks_field_reads_as_empty_without_an_error() {
+    let (b, _q) = setup().await;
+    let id = uniq("w");
+    b.heartbeat(&worker(&id, vec![]), 60_000).await.unwrap();
+    // Not hex, odd length, empty, hex of garbage, hex of msgpack that is not a task list, non-ASCII text.
+    for bad in ["not hex at all", "abc", "", "fffe00", "93010203", "caf\u{e9}"] {
+        let _: i64 = redis::cmd("HSET").arg(worker_key(&id)).arg("tasks").arg(bad)
+            .query_async(&mut raw().await).await.unwrap();
+        assert!(b.running(&id).await.unwrap().is_empty());
+        let w = b.worker_info(&id).await.unwrap().unwrap();
+        assert!(w.tasks.is_empty());
+        assert_eq!(w.pid, 7, "the other fields still parse");
+        assert!(b.workers().await.unwrap().iter().any(|w| w.worker_id == id));
+    }
+    // The next heartbeat replaces it.
+    b.heartbeat(&worker(&id, vec![running_task("a", false)]), 60_000).await.unwrap();
+    assert_eq!(b.running(&id).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn running_all_lists_every_live_workers_tasks_and_survives_a_malformed_field() {
+    let (b, _q) = setup().await;
+    let (w1, w2, bad, idle) = (uniq("w1"), uniq("w2"), uniq("bad"), uniq("idle"));
+    let (t1, t2) = (vec![running_task("a", true), running_task("b", false)], vec![running_task("c", true)]);
+    b.heartbeat(&worker(&w1, t1.clone()), 60_000).await.unwrap();
+    b.heartbeat(&worker(&w2, t2.clone()), 60_000).await.unwrap();
+    b.heartbeat(&worker(&idle, vec![]), 60_000).await.unwrap();
+    b.heartbeat(&worker(&bad, vec![]), 60_000).await.unwrap();
+    let ours = |all: &mayu_core::PublishedTasks, w: &str| -> Vec<mayu_core::RunningTask> {
+        all.tasks.iter().filter(|(id, _)| id == w).map(|(_, t)| t.clone()).collect()
+    };
+
+    let all = b.running_all().await.unwrap();
+    assert_eq!(ours(&all, &w1), t1);
+    assert_eq!(ours(&all, &w2), t2);
+    assert!(ours(&all, &idle).is_empty() && ours(&all, &bad).is_empty());
+
+    // One worker writes garbage: it is counted, and the others still read. (Workers other tests left behind
+    // may add to the count.)
+    let _: i64 = redis::cmd("HSET").arg(worker_key(&bad)).arg("tasks").arg("not hex at all")
+        .query_async(&mut raw().await).await.unwrap();
+    let again = b.running_all().await.unwrap();
+    assert!(again.malformed > all.malformed, "{} vs {}", again.malformed, all.malformed);
+    assert_eq!(ours(&again, &w1), t1);
+    assert_eq!(ours(&again, &w2), t2);
+    assert!(ours(&again, &bad).is_empty());
+
+    // A worker that leaves, or whose beat lapses, is not listed.
+    b.unregister(&w1).await.unwrap();
+    assert!(ours(&b.running_all().await.unwrap(), &w1).is_empty());
 }
