@@ -43,16 +43,17 @@ fn parse_workflow_meta(id: &str, meta: Vec<Option<String>>) -> Result<(usize, St
     Ok((count, name, created_at, status))
 }
 
-/// Builds a `WorkflowState` from the per-node `HMGET` (id, task, queue, state for each of `count` nodes).
+/// Builds a `WorkflowState` from the per-node `HMGET` (id, task, queue, state, up for each of `count` nodes).
+/// `up` is absent in hashes written by older versions, which reads as no parents.
 fn parse_workflow_nodes(
     id: &str, name: String, created_at: u64, cancelled: bool, count: usize, vals: &[Option<String>],
 ) -> Result<WorkflowState> {
-    if vals.len() != count * 4 {
+    if vals.len() != count * 5 {
         return Err(be(format!("workflow {id} has a malformed node list")));
     }
     let mut nodes = Vec::with_capacity(count);
-    for (i, f) in vals.chunks(4).enumerate() {
-        let [Some(task_id), Some(task), Some(queue), Some(state)] = f else {
+    for (i, f) in vals.chunks(5).enumerate() {
+        let [Some(task_id), Some(task), Some(queue), Some(state), up] = f else {
             return Err(be(format!("workflow {id} node {i} is missing fields")));
         };
         nodes.push(NodeInfo {
@@ -61,9 +62,21 @@ fn parse_workflow_nodes(
             task: task.clone(),
             queue: queue.clone(),
             state: NodeState::parse(state)?,
+            parents: parse_parents(id, i, up.as_deref()),
         });
     }
     Ok(WorkflowState { id: id.to_string(), name, created_at, cancelled, nodes })
+}
+
+/// `n:<i>:up`: comma-separated parent indexes (empty for a root); `None` when the field is missing. Parents only
+/// feed the lookahead estimate, so a malformed list reads as none (with a warning) instead of failing the read.
+fn parse_parents(id: &str, node: usize, up: Option<&str>) -> Vec<usize> {
+    let parsed: std::result::Result<Vec<usize>, _> =
+        up.unwrap_or("").split(',').filter(|p| !p.is_empty()).map(str::parse).collect();
+    parsed.unwrap_or_else(|_| {
+        tracing::warn!(workflow = %id, node, "ignoring a malformed parent list in a workflow hash");
+        Vec::new()
+    })
 }
 
 struct Scripts {
@@ -400,10 +413,11 @@ impl RedisBroker {
         let mut cmd = redis::cmd("HMGET");
         cmd.arg(&key);
         for i in 0..count {
-            cmd.arg(format!("n:{i}:id")).arg(format!("n:{i}:t")).arg(format!("n:{i}:q")).arg(format!("n:{i}:s"));
+            cmd.arg(format!("n:{i}:id")).arg(format!("n:{i}:t")).arg(format!("n:{i}:q")).arg(format!("n:{i}:s"))
+                .arg(format!("n:{i}:up"));
         }
         let vals: Vec<Option<String>> = cmd.query_async(&mut c).await.map_err(be)?;
-        if vals.len() == count * 4 && vals.iter().all(Option::is_none) {
+        if vals.len() == count * 5 && vals.iter().all(Option::is_none) {
             return Ok(None); // expired between the two reads
         }
         Ok(Some(parse_workflow_nodes(id, name, created_at, status == "cancelled", count, &vals)))

@@ -346,6 +346,27 @@ async fn malformed_hash_data_is_a_broker_error() {
 }
 
 #[tokio::test]
+async fn parents_read_back_and_a_missing_up_field_reads_empty() {
+    let _scan = SCAN.lock().await;
+    let (b, q) = setup().await;
+    let wf = diamond(&q);
+    b.submit_workflow(&wf).await.unwrap();
+    let parents = |s: &WorkflowState| s.nodes.iter().map(|n| n.parents.clone()).collect::<Vec<_>>();
+    assert_eq!(parents(&state_of(&b, &wf).await), vec![vec![], vec![0], vec![0], vec![1, 2]]);
+    // A hash written before `up` existed: every node reads as a root.
+    let mut c = raw().await;
+    let key = workflow_key(&wf.id);
+    for i in 0..4 {
+        let _: i64 = redis::cmd("HDEL").arg(&key).arg(format!("n:{i}:up")).query_async(&mut c).await.unwrap();
+    }
+    assert_eq!(parents(&state_of(&b, &wf).await), vec![Vec::<usize>::new(); 4]);
+    let _: i64 = redis::cmd("HSET").arg(&key).arg("n:3:up").arg("1,x").query_async(&mut c).await.unwrap();
+    // Parents only feed the lookahead estimate: a malformed list reads as none rather than failing the read.
+    assert_eq!(state_of(&b, &wf).await.nodes[3].parents, Vec::<usize>::new());
+    assert_eq!(state_of(&b, &wf).await.nodes[1].task, wf.nodes[1].header.task);
+}
+
+#[tokio::test]
 async fn listing_skips_a_malformed_workflow() {
     let _scan = SCAN.lock().await;
     let (b, q) = setup().await;

@@ -60,6 +60,12 @@ struct Counters {
     pool_loads: BTreeMap<String, u64>,
     pool_evictions: BTreeMap<String, u64>,
     pool_lookahead_loads: BTreeMap<String, u64>,
+    pool_parks: BTreeMap<String, u64>,
+    pool_unparks: BTreeMap<String, u64>,
+    pool_drops: BTreeMap<String, u64>,
+    pool_stages: BTreeMap<String, u64>,
+    /// (pool, kind) -> (moves, seconds); only pools that can park report these.
+    pool_moves: BTreeMap<(String, &'static str), (u64, f64)>,
 }
 
 /// Sampled when `/metrics` is scraped.
@@ -78,6 +84,10 @@ pub struct Gauges {
     pub loaded: Vec<(String, u32)>,
     /// (pool, queued or waiting workflow nodes that use it) for each lazy pool; empty unless lookahead runs.
     pub demand: Vec<(String, u32)>,
+    /// (pool, instances parked in host RAM, staging ones included) for each lazy pool that can park.
+    pub parked: Vec<(String, u32)>,
+    /// (pool, seconds until its next need) for pools the progress estimate has a need for; empty without one.
+    pub next_need: Vec<(String, f64)>,
 }
 
 /// One GPU as last sampled by the Python side (NVML), pushed with `Runtime::set_gpu_stats`.
@@ -158,6 +168,34 @@ impl Metrics {
         *self.c.lock().unwrap().pool_lookahead_loads.entry(pool.to_string()).or_default() += 1;
     }
 
+    /// A lazy pool instance was moved to host RAM.
+    pub fn pool_parked(&self, pool: &str) {
+        *self.c.lock().unwrap().pool_parks.entry(pool.to_string()).or_default() += 1;
+    }
+
+    /// A lazy pool instance was moved back from host RAM (by a task or ahead of need).
+    pub fn pool_unparked(&self, pool: &str) {
+        *self.c.lock().unwrap().pool_unparks.entry(pool.to_string()).or_default() += 1;
+    }
+
+    /// A parked lazy pool instance was closed to make room.
+    pub fn pool_dropped(&self, pool: &str) {
+        *self.c.lock().unwrap().pool_drops.entry(pool.to_string()).or_default() += 1;
+    }
+
+    /// A lazy pool instance was built straight into host RAM ahead of need.
+    pub fn pool_staged(&self, pool: &str) {
+        *self.c.lock().unwrap().pool_stages.entry(pool.to_string()).or_default() += 1;
+    }
+
+    /// One timed move (`build`, `stage`, `park` or `unpark`) of a pool instance.
+    pub fn pool_move(&self, pool: &str, kind: &'static str, secs: f64) {
+        let mut c = self.c.lock().unwrap();
+        let m = c.pool_moves.entry((pool.to_string(), kind)).or_default();
+        m.0 += 1;
+        m.1 += secs;
+    }
+
     /// Replaces the GPU samples rendered by `render`.
     pub fn set_gpus(&self, gpus: Vec<GpuStat>) {
         *self.gpus.lock().unwrap() = gpus;
@@ -221,6 +259,27 @@ impl Metrics {
                 sample(&mut out, "mayu_pool_lookahead_loads_total", &[("pool", p)], n);
             }
         }
+        let counters: [(&str, &str, &BTreeMap<String, u64>); 4] = [
+            ("mayu_pool_parks_total", "Lazy pool instances moved to host RAM.", &c.pool_parks),
+            ("mayu_pool_unparks_total", "Lazy pool instances moved back from host RAM.", &c.pool_unparks),
+            ("mayu_pool_drops_total", "Parked lazy pool instances closed to make room.", &c.pool_drops),
+            ("mayu_pool_stages_total", "Lazy pool instances built straight into host RAM ahead of need.", &c.pool_stages),
+        ];
+        for (name, help, by_pool) in counters {
+            if !by_pool.is_empty() {
+                family(&mut out, name, "counter", help);
+                for (p, n) in by_pool {
+                    sample(&mut out, name, &[("pool", p)], n);
+                }
+            }
+        }
+        if !c.pool_moves.is_empty() {
+            family(&mut out, "mayu_pool_move_seconds", "summary", "Time to build, stage, park or unpark a lazy pool instance.");
+            for ((p, kind), (n, secs)) in &c.pool_moves {
+                sample(&mut out, "mayu_pool_move_seconds_sum", &[("pool", p), ("kind", kind)], secs);
+                sample(&mut out, "mayu_pool_move_seconds_count", &[("pool", p), ("kind", kind)], n);
+            }
+        }
         drop(c);
 
         family(&mut out, "mayu_worker_concurrency", "gauge", "Task threads in this worker process.");
@@ -273,6 +332,18 @@ impl Metrics {
             family(&mut out, "mayu_pool_demand", "gauge", "Waiting or queued workflow nodes that use each lazy pool.");
             for (p, n) in &g.demand {
                 sample(&mut out, "mayu_pool_demand", &[("pool", p)], n);
+            }
+        }
+        if !g.parked.is_empty() {
+            family(&mut out, "mayu_pool_parked", "gauge", "Instances of each parkable lazy pool held in host RAM.");
+            for (p, n) in &g.parked {
+                sample(&mut out, "mayu_pool_parked", &[("pool", p)], n);
+            }
+        }
+        if !g.next_need.is_empty() {
+            family(&mut out, "mayu_pool_next_need_seconds", "gauge", "Estimated seconds until a lazy pool is next needed.");
+            for (p, secs) in &g.next_need {
+                sample(&mut out, "mayu_pool_next_need_seconds", &[("pool", p)], secs);
             }
         }
         self.render_gpus(&mut out);

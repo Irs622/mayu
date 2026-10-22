@@ -51,6 +51,18 @@ fn new_stamps_ids_and_children_are_the_reverse_of_parents() {
 }
 
 #[test]
+fn parents_are_read_back() {
+    rt().block_on(async {
+        let b = MemoryBroker::default();
+        let wf = diamond();
+        b.submit_workflow(&wf).await.unwrap();
+        let s = b.workflow(&wf.id).await.unwrap().unwrap();
+        let parents: Vec<_> = s.nodes.iter().map(|n| n.parents.clone()).collect();
+        assert_eq!(parents, vec![vec![], vec![0], vec![0], vec![1, 2]]);
+    });
+}
+
+#[test]
 fn diamond_runs_in_dependency_order() {
     rt().block_on(async {
         let b = MemoryBroker::default();
@@ -361,6 +373,7 @@ fn summary_precedence() {
                     task: "t".into(),
                     queue: "q".into(),
                     state: *s,
+                    parents: Vec::new(),
                 })
                 .collect(),
         }

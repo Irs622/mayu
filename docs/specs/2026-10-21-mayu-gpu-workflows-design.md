@@ -215,6 +215,72 @@ Reordering only covers tasks the worker has prefetched; GPU queues should run wi
 that proves too narrow, priority lanes (several streams per queue) are the follow-up; that changes the
 key layout.
 
+## 7.2 Parked models and staging (Plan 15)
+
+Eviction (§7.1) closes a model, so the next task that needs it loads it again from disk: seconds to tens of
+seconds for a multi-GB model. If the machine has spare host RAM, a lazy pool can keep the evicted model there
+and bring it back over PCIe in about a second. mayu holds the accounting; moving the model is the pool's code.
+
+```python
+@app.pool("voice", vram_gb=6.9, parked={"ram_gb": 6.6})   # what one parked instance holds
+def voice(ctx): return load_voice(device="cuda")
+
+@voice.park                         # GPU -> host RAM, the object is kept
+def _(model): ...
+@voice.unpark                       # host RAM -> GPU, in place
+def _(model): ...
+@voice.stage                        # optional: build straight into the parked state, no GPU
+def _(ctx): ...
+```
+```bash
+mayu worker app:app --queues gpu --pools encoder=1,voice=1 --pool-mode lazy --schedule throughput \
+    --lookahead --resources gpu=1,vram_gb=7.5,ram_gb=16
+```
+
+- **Ledger:** a parked instance holds `parked=` instead of its normal claim, and is not counted as loaded, so
+  `pool:<name>` still bounds GPU-resident instances while `loaded + parked` stays within the pool's size. Every
+  resource in `parked=` must be declared on the worker, so host RAM has an explicit budget. Parks, unparks,
+  drops and stages are committed in the ledger, under its one lock, before Python touches an instance, like
+  loads and evictions.
+- **Plan:** the dispatcher's plan for a task gains `parks`, `unparks` and `drops` beside `loads` and `evicts`,
+  carried out in the order drops, evicts, parks, unparks, loads, so room exists before it is used. A missing model with a parked
+  instance is unparked instead of loaded. A victim of a parkable pool is parked instead of evicted when its
+  `parked=` claim fits, after closing other parked instances if need be (never one the task unparks); if it
+  doesn't fit, the victim is evicted as in §7.1. A parked instance is also closed when a task, a park or an
+  unpark needs a resource it holds.
+- **Scoring:** a task whose missing models are all parked gets a quarter of the resident bonus
+  (`PARKED_BONUS_RATIO`): a swap from RAM is worth grouping, less than keeping a model on the GPU.
+- **Failures:** a park hook that raises closes the instance instead (an eviction); an unpark hook that raises
+  closes it and the task builds a fresh one; a failed stage gives its room back and that pool is not staged
+  again for 60 s. None of them delays or drops an outcome.
+- **Progress estimate:** with `--lookahead`, the worker reads each workflow it has seen (the DAG's parent links
+  are already in Redis since §6, so no wire change) and estimates, from the moving average of its own run time
+  per task name, when each pool is next needed: a running node has what is left of its average, a queued one
+  its average, a waiting one starts when its slowest unfinished parent ends. A task never run here counts as
+  zero, which errs towards staging early, never late. Only workflows this worker has fetched a task of are
+  known, as for `linger=` and lookahead.
+- **Victim order:** with `--lookahead` and some pool declaring `parked=`, idle (or parked) instances are
+  chosen as victims in order of when their pool is next needed, the furthest first and a pool nobody needs
+  before any, ties by least recently used. Otherwise it is least recently used, so an existing worker evicts as
+  it did.
+- **Staging:** a pool with a `stage` hook is built into host RAM once its next need is within its lead time:
+  the moving averages of its stage and unpark times plus a 5 s margin, or 15 s until a stage has been
+  measured. It also needs a workflow task to come, no idle, loading or parked instance, room below its size,
+  and the `parked=` amount free without closing anything. Unlike a lookahead load, a stage uses no GPU
+  resource, so a busy worker stages: the voice model is built in RAM while the encodes run, and is unparked
+  when the GPU frees. Lookahead's usual rule then moves a parked model to the GPU when nothing is due.
+- **Opt-in:** a worker whose pools don't declare `parked=` plans, evicts, logs and exports metrics exactly as
+  before; the estimate is not computed without `--lookahead`.
+- **Metrics:** `mayu_pool_parked`, `mayu_pool_parks_total`, `mayu_pool_unparks_total`, `mayu_pool_drops_total`,
+  `mayu_pool_stages_total`, `mayu_pool_move_seconds{kind}` (build, stage, park, unpark) and
+  `mayu_pool_next_need_seconds`, all per pool and only for pools with `parked=`.
+- **Not in scope:** parking to disk, sharing a parked copy between worker processes, routing tasks across
+  workers by parked state, `cost=`-based durations.
+
+mayu doesn't know about any framework: with torch, the hooks keep a host mirror of the model's CUDA tensors in
+one registered slab (the README has the recipe). Measured on an 8 GB laptop card with 6 GB models: about 1 s
+for the first park, 0.3 s for later ones, 0.5 s to unpark, against 1 to 5 s to reload from a warm page cache.
+
 ## 8. Plans
 
 | # | Plan | Depends on | Needs measurement |
@@ -226,6 +292,7 @@ key layout.
 | 12 | Model pools (`@app.pool`, `--pools`, `app.use`), server form of residency | 10 | no |
 | 13 | Resident models with eviction, residency-aware scoring, `cost=` | 11, 12 | yes: load times, VRAM |
 | 14 | Self-tuning concurrency (NVML, optional `gpu` extra), GPU metrics, linger | 13 | yes |
+| 15 | Parked models (host-RAM tier for lazy pools), progress-aware staging | 13, 14 | yes: park, unpark and stage times, host RAM |
 | later | Capacity requeue on GPU OOM without spending a retry | 10 | no |
 
 Before Plan 13: one instrumented run of the driving example on the target GPU, recording model load

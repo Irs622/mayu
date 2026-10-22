@@ -27,6 +27,16 @@ pub const OLDEST_BONUS: Duration = Duration::from_secs(10);
 /// After a failed lookahead load of a pool, no new one is granted for it for this long.
 pub const LOOKAHEAD_BACKOFF: Duration = Duration::from_secs(60);
 
+/// How much of the resident bonus a task gets whose missing models are all parked in host RAM: a swap from RAM
+/// (about a second) is worth grouping, just less than keeping a model on the GPU (about ten).
+pub const PARKED_BONUS_RATIO: f64 = 0.25;
+
+/// A staged model is wanted in host RAM this long before the stage and unpark times say it is needed.
+pub const STAGE_MARGIN: Duration = Duration::from_secs(5);
+
+/// How long before a pool is needed it is staged until this worker has measured a stage of it.
+pub const DEFAULT_STAGE_LEAD: Duration = Duration::from_secs(15);
+
 /// A workflow is never counted as older than this, so a bogus id cannot rank a task ahead of everything.
 const MAX_ORIGIN_AGE: Duration = Duration::from_secs(24 * 3600);
 
@@ -45,6 +55,24 @@ pub enum Schedule {
     Throughput,
     /// Oldest workflow first (other tasks by arrival); a loaded model is worth `OLDEST_BONUS`.
     Oldest,
+}
+
+/// What a granted lookahead does to the instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookaheadKind {
+    /// Build a new instance with the factory.
+    Build,
+    /// Move the parked instance back to the GPU.
+    Unpark,
+}
+
+impl LookaheadKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LookaheadKind::Build => "build",
+            LookaheadKind::Unpark => "unpark",
+        }
+    }
 }
 
 /// What a worker has and what its tasks use, in the units the user picked (GPUs, GB, cores).
@@ -69,6 +97,11 @@ pub struct LazyPool {
     /// Keep an idle instance loaded up to this long after its last use while its workflows still have work
     /// for it. None: it may be evicted as soon as it is idle.
     pub linger: Option<Duration>,
+    /// Resource -> amount one parked instance (moved to host RAM, not closed) holds instead of `claim`.
+    /// Empty: the pool cannot park and a victim is closed.
+    pub parked_claim: HashMap<String, f64>,
+    /// An instance may be built straight into the parked state ahead of need (needs `parked_claim`).
+    pub stageable: bool,
 }
 
 fn milli(amount: f64) -> Option<u64> {
@@ -96,6 +129,7 @@ pub enum Admit {
 }
 
 /// One lazy pool's residency, as far as the ledger knows.
+#[derive(Default)]
 struct LazyState {
     name: String,
     /// Ledger index of `pool:<name>`; its `in_use` is the number of busy instances.
@@ -120,6 +154,55 @@ struct LazyState {
     demand: u32,
     /// When a lookahead load of this pool last failed.
     lookahead_failed: Option<Instant>,
+    /// What one parked instance holds in the ledger; empty when the pool cannot park.
+    parked_claim: Claim,
+    /// Instances parked in host RAM, staging ones included. They hold `parked_claim`, not `claim`, and are not
+    /// in `loaded`; `loaded + parked` is bounded by `pool:<name>`.
+    parked: u32,
+    /// Parked instances a stage is still building: counted in `parked` and the ledger, but not usable yet.
+    staging: u32,
+    /// When an instance of this pool was last parked or staged; the oldest parked instance is dropped first.
+    parked_last_used: Option<Instant>,
+    /// When a stage of this pool last failed.
+    stage_failed: Option<Instant>,
+    /// Instances may be staged ahead of need.
+    stageable: bool,
+    /// The instance `loading` counts was unparked, not built.
+    loading_unpark: bool,
+    /// Seconds until a workflow needs this pool next, as last reported; None: not needed (or unknown).
+    next_need: Option<f64>,
+    /// Seconds a stage and an unpark of this pool took, as last reported.
+    stage_secs: Option<f64>,
+    unpark_secs: Option<f64>,
+}
+
+impl LazyState {
+    fn parkable(&self) -> bool {
+        !self.parked_claim.is_empty()
+    }
+
+    /// Milli-units of resource `r` one loaded instance holds.
+    fn claim_m(&self, r: usize) -> u64 {
+        self.claim.iter().find(|&&(c, _)| c == r).map_or(0, |&(_, m)| m)
+    }
+
+    /// Milli-units of resource `r` one parked instance holds.
+    fn parked_m(&self, r: usize) -> u64 {
+        self.parked_claim.iter().find(|&&(c, _)| c == r).map_or(0, |&(_, m)| m)
+    }
+
+    /// Parked instances that are done being staged: the ones an unpark or a drop may take.
+    fn parked_ready(&self) -> u32 {
+        self.parked.saturating_sub(self.staging)
+    }
+
+    /// Seconds before the next need at which a stage of this pool is due.
+    fn stage_lead(&self) -> f64 {
+        match self.stage_secs {
+            Some(stage) => stage + self.unpark_secs.unwrap_or(0.0) + STAGE_MARGIN.as_secs_f64(),
+            None => DEFAULT_STAGE_LEAD.as_secs_f64(),
+        }
+    }
 }
 
 /// The lazy pools, sorted by name. Empty for eager and non-pool workers, which never look at it.
@@ -128,6 +211,8 @@ struct Lazy {
     pools: Vec<LazyState>,
     /// Ledger resource index -> the lazy pool whose `pool:<name>` it is.
     of_res: Vec<Option<usize>>,
+    /// Some pool can park.
+    any_parkable: bool,
 }
 
 /// What popping a task changes in a lazy worker: pools (indexes into `Lazy::pools`), one entry per instance.
@@ -135,6 +220,38 @@ struct Lazy {
 struct Plan {
     loads: Vec<usize>,
     evicts: Vec<usize>,
+    /// Parked instances brought back to the GPU instead of loading a new one.
+    unparks: Vec<usize>,
+    /// Victims moved to host RAM instead of being closed.
+    parks: Vec<usize>,
+    /// Parked instances closed for the room a park or an unpark's claim needs.
+    drops: Vec<usize>,
+}
+
+impl Plan {
+    /// Nothing to change: every model is on the GPU.
+    fn resident(&self) -> bool {
+        self.loads.is_empty() && self.evicts.is_empty() && self.unparks.is_empty() && self.parks.is_empty()
+            && self.drops.is_empty()
+    }
+
+    /// The only models missing are parked.
+    fn parked_swap(&self) -> bool {
+        self.loads.is_empty() && !self.unparks.is_empty()
+    }
+}
+
+/// A plan being worked out: the ledger as it would be, and the idle and parked instances still free to take.
+#[derive(Clone)]
+struct Sim {
+    used: Vec<i64>,
+    /// Per pool: idle instances still available as victims.
+    avail: Vec<u32>,
+    /// Per pool: parked instances still available to drop (not staging, not being unparked).
+    droppable: Vec<u32>,
+    evicts: Vec<usize>,
+    parks: Vec<usize>,
+    drops: Vec<usize>,
 }
 
 impl Lazy {
@@ -157,81 +274,170 @@ impl Lazy {
         (m / MILLI as u64).max(1) as u32
     }
 
-    /// Pools to load for `claim`: one entry per instance the task needs beyond the idle ones. A pool already
-    /// at its instance limit gets no load: the task waits for `pool:<name>`, not for room to build one.
-    fn loads_for(&self, claim: &Claim, in_use: &[u64], capacity: &[u64]) -> Vec<usize> {
-        let mut loads = Vec::new();
+    /// Pools to load and to unpark for `claim`: one entry per instance the task needs beyond the idle ones. A
+    /// parked instance is unparked before a new one is built. A pool already at its instance limit gets neither:
+    /// the task waits for `pool:<name>`, not for room to build one.
+    fn loads_for(&self, claim: &Claim, in_use: &[u64], capacity: &[u64]) -> (Vec<usize>, Vec<usize>) {
+        let (mut loads, mut unparks) = (Vec::new(), Vec::new());
         for &(r, m) in claim {
             let Some(p) = self.of_res[r] else { continue };
-            let room = ((capacity[r] / MILLI as u64) as u32).saturating_sub(self.pools[p].loaded);
+            let pool = &self.pools[p];
+            let room = ((capacity[r] / MILLI as u64) as u32).saturating_sub(pool.loaded.saturating_add(pool.parked));
             let missing = Self::instances(m).saturating_sub(self.idle(p, in_use));
-            loads.extend(std::iter::repeat_n(p, missing.min(room) as usize));
+            let unpark = missing.min(pool.parked_ready());
+            unparks.extend(std::iter::repeat_n(p, unpark as usize));
+            loads.extend(std::iter::repeat_n(p, (missing - unpark).min(room) as usize));
         }
-        loads
+        (loads, unparks)
     }
 
-    /// Whether `claim` can start now, loading what is missing and evicting idle instances (least recently
-    /// used pool first, and never one that is lingering) for the room; the plan says how. None if it cannot, even
-    /// with every idle instance gone.
+    /// Whether `claim` can start now, loading or unparking what is missing and evicting (or parking) idle
+    /// instances, least recently used pool first (or, if some pool can park, the one needed furthest in the future
+    /// first, the least recently used among equals; a pool with no known need counts as never needed) and never
+    /// one that is lingering, for the room; the plan says how. A victim of a pool that can park is parked when
+    /// its parked claim fits, after dropping other parked instances if need be. None if the task cannot start,
+    /// even with every idle instance gone.
     fn plan(&self, claim: &Claim, in_use: &[u64], capacity: &[u64], now: Instant) -> Option<Plan> {
-        let loads = self.loads_for(claim, in_use, capacity);
+        let (loads, unparks) = self.loads_for(claim, in_use, capacity);
         // An instance that is still loading fits the ledger but cannot run the task, and the pool may allow
         // no other: wait for it.
         for &(r, m) in claim {
             if let Some(p) = self.of_res[r] {
-                let coming = loads.iter().filter(|&&l| l == p).count() as u32;
+                let coming = loads.iter().chain(&unparks).filter(|&&l| l == p).count() as u32;
                 if self.idle(p, in_use) + coming < Self::instances(m) {
                     return None;
                 }
             }
         }
-        if loads.is_empty() && claim.iter().all(|&(r, m)| in_use[r] + m <= capacity[r]) {
+        if loads.is_empty() && unparks.is_empty() && claim.iter().all(|&(r, m)| in_use[r] + m <= capacity[r]) {
             return Some(Plan::default());
         }
-        let mut add = vec![0u64; capacity.len()];
+        let mut used: Vec<i64> = in_use.iter().map(|&u| u as i64).collect();
+        // Only what this task adds counts: a resource over capacity after a shrink must not block it.
+        let mut touched = vec![false; capacity.len()];
         for &(r, m) in claim {
-            add[r] += m;
+            used[r] += m as i64;
+            touched[r] |= m > 0;
         }
         for &p in &loads {
             for &(r, m) in &self.pools[p].claim {
-                add[r] += m;
+                used[r] += m as i64;
+                touched[r] |= m > 0;
             }
         }
-        // Only what this task touches counts: a resource over capacity after a shrink must not block it.
-        let mut short: Vec<u64> = (0..capacity.len())
-            .map(|r| if add[r] > 0 { (in_use[r] + add[r]).saturating_sub(capacity[r]) } else { 0 })
-            .collect();
+        // An unpark's parked claim is not credited here: parks run before unparks (they free the GPU room the
+        // unpark needs), so for a moment both are in host RAM, and a park must fit alongside it.
+        for &p in &unparks {
+            let pool = &self.pools[p];
+            for &(r, m) in &pool.claim {
+                used[r] += m as i64 - pool.parked_m(r) as i64;
+                touched[r] |= m > pool.parked_m(r);
+            }
+        }
+        let over = |sim: &Sim, r: usize| touched[r] && sim.used[r] > capacity[r] as i64;
         // The instances this task takes are not victims.
         let mut avail: Vec<u32> = (0..self.pools.len()).map(|p| self.idle(p, in_use)).collect();
+        let mut droppable: Vec<u32> = (0..self.pools.len()).map(|p| self.pools[p].parked_ready()).collect();
         for &(r, m) in claim {
             if let Some(p) = self.of_res[r] {
                 avail[p] = avail[p].saturating_sub(Self::instances(m));
             }
         }
-        let mut order: Vec<usize> = (0..self.pools.len())
-            .filter(|&p| avail[p] > 0 && !self.lingering(p, now))
-            .collect();
-        order.sort_by_key(|&p| (self.pools[p].last_used, p));
-        let mut evicts = Vec::new();
-        while short.iter().any(|&s| s > 0) {
-            // A pool that holds none of what is short would be closed for nothing.
-            let p = order.iter().copied()
-                .find(|&p| avail[p] > 0 && self.pools[p].claim.iter().any(|&(r, _)| short[r] > 0))?;
-            avail[p] -= 1;
-            evicts.push(p);
-            for &(r, m) in &self.pools[p].claim {
-                short[r] = short[r].saturating_sub(m);
-            }
+        for &p in &unparks {
+            droppable[p] -= 1;
         }
-        Some(Plan { loads, evicts })
+        let mut sim = Sim { used, avail, droppable, evicts: Vec::new(), parks: Vec::new(), drops: Vec::new() };
+        let by_need = self.any_parkable;
+        // Victims, first to go first. By recency unless the pools' next needs are known and some pool can park.
+        let mut order: Vec<usize> = (0..self.pools.len())
+            .filter(|&p| sim.avail[p] > 0 && !self.lingering(p, now))
+            .collect();
+        order.sort_by(|&a, &b| self.victim_order(a, b, by_need, |p| self.pools[p].last_used));
+        let mut drop_order: Vec<usize> = (0..self.pools.len()).filter(|&p| sim.droppable[p] > 0).collect();
+        drop_order.sort_by(|&a, &b| self.victim_order(a, b, by_need, |p| self.pools[p].parked_last_used));
+        while (0..capacity.len()).any(|r| over(&sim, r)) {
+            // A pool that holds none of what is over would be closed for nothing.
+            let victim = order.iter().copied()
+                .find(|&p| sim.avail[p] > 0 && self.pools[p].claim.iter().any(|&(r, _)| over(&sim, r)));
+            if let Some(p) = victim {
+                if let Some(parked) = self.try_park(&sim, p, capacity, &drop_order, &over) {
+                    sim = parked;
+                    continue;
+                }
+                sim.avail[p] -= 1;
+                sim.evicts.push(p);
+                for &(r, m) in &self.pools[p].claim {
+                    sim.used[r] -= m as i64;
+                }
+                continue;
+            }
+            // No idle instance holds it: a parked one may.
+            let q = drop_order.iter().copied()
+                .find(|&q| sim.droppable[q] > 0 && self.pools[q].parked_claim.iter().any(|&(r, _)| over(&sim, r)))?;
+            self.drop_parked(&mut sim, q);
+        }
+        Some(Plan { loads, evicts: sim.evicts, unparks, parks: sim.parks, drops: sim.drops })
     }
 
-    /// Resources a waiting head claim wants beyond its own: those of its loads, and `pool:<name>` of every
-    /// pool holding any of what it needs, so tasks that would keep such a pool busy stop backfilling.
+    /// Orders two pools as victims: with `by_need`, the one needed further in the future first (never or not known
+    /// to be needed first); then the one `used` says was used longer ago; then by name.
+    fn victim_order(
+        &self, a: usize, b: usize, by_need: bool, used: impl Fn(usize) -> Option<Instant>,
+    ) -> std::cmp::Ordering {
+        let need = |p: usize| self.pools[p].next_need.unwrap_or(f64::INFINITY);
+        let by_need = if by_need { need(b).total_cmp(&need(a)) } else { std::cmp::Ordering::Equal };
+        by_need.then_with(|| used(a).cmp(&used(b))).then_with(|| a.cmp(&b))
+    }
+
+    /// `sim` with an idle instance of `p` parked instead of closed, if `p` can park, that frees something that is
+    /// over, and its parked claim fits (after dropping parked instances from `drop_order` if need be).
+    fn try_park(
+        &self, sim: &Sim, p: usize, capacity: &[u64], drop_order: &[usize], over: &dyn Fn(&Sim, usize) -> bool,
+    ) -> Option<Sim> {
+        let pool = &self.pools[p];
+        if !pool.parkable() || !pool.claim.iter().any(|&(r, m)| over(sim, r) && m > pool.parked_m(r)) {
+            return None;
+        }
+        let mut s = sim.clone();
+        loop {
+            // The parked claim adds to a resource when it holds more of it than the claim did.
+            let full = pool.parked_claim.iter()
+                .find(|&&(r, pm)| pm > pool.claim_m(r) && s.used[r] + (pm - pool.claim_m(r)) as i64 > capacity[r] as i64);
+            let Some(&(r, _)) = full else { break };
+            let q = drop_order.iter().copied().find(|&q| s.droppable[q] > 0 && self.pools[q].parked_m(r) > 0)?;
+            self.drop_parked(&mut s, q);
+        }
+        s.avail[p] -= 1;
+        s.parks.push(p);
+        for &(r, m) in &pool.claim {
+            s.used[r] -= m as i64;
+        }
+        for &(r, pm) in &pool.parked_claim {
+            s.used[r] += pm as i64;
+        }
+        Some(s)
+    }
+
+    fn drop_parked(&self, sim: &mut Sim, q: usize) {
+        sim.droppable[q] -= 1;
+        sim.drops.push(q);
+        for &(r, pm) in &self.pools[q].parked_claim {
+            sim.used[r] -= pm as i64;
+        }
+    }
+
+    /// Resources a waiting head claim wants beyond its own: those of its loads (and what its unparks add), and
+    /// `pool:<name>` of every pool holding any of what it needs, so tasks that would keep such a pool busy stop
+    /// backfilling.
     fn wanted_beyond(&self, claim: &Claim, in_use: &[u64], capacity: &[u64]) -> Vec<usize> {
-        let mut wanted: Vec<usize> = self.loads_for(claim, in_use, capacity).into_iter()
+        let (loads, unparks) = self.loads_for(claim, in_use, capacity);
+        let mut wanted: Vec<usize> = loads.into_iter()
             .flat_map(|p| self.pools[p].claim.iter().map(|&(r, _)| r))
             .collect();
+        wanted.extend(unparks.into_iter().flat_map(|p| {
+            let pool = &self.pools[p];
+            pool.claim.iter().filter(|&&(r, m)| m > pool.parked_m(r)).map(|&(r, _)| r)
+        }));
         let needs = |r: usize| wanted.contains(&r) || claim.iter().any(|&(c, _)| c == r);
         let holders: Vec<usize> = self.pools.iter()
             .filter(|p| p.claim.iter().any(|&(r, _)| needs(r)))
@@ -241,8 +447,17 @@ impl Lazy {
         wanted
     }
 
-    /// Applies `plan` for the task being popped; `claim` is already in `in_use`.
+    /// Applies `plan` for the task being popped; `claim` is already in `in_use`. The task carries it out in the
+    /// order of the lists: drops, evicts, parks, unparks, loads, so the room exists before it is used.
     fn commit(&mut self, claim: &Claim, plan: Plan, in_use: &mut [u64], task: &mut ReadyTask, now: Instant) {
+        for p in plan.drops {
+            let pool = &mut self.pools[p];
+            pool.parked -= 1;
+            for &(r, m) in &pool.parked_claim {
+                in_use[r] = in_use[r].saturating_sub(m);
+            }
+            task.drops.push(pool.name.clone());
+        }
         // The victims' room goes straight to the loads: the task closes them before it builds.
         for p in plan.evicts {
             let pool = &mut self.pools[p];
@@ -251,6 +466,31 @@ impl Lazy {
                 in_use[r] = in_use[r].saturating_sub(m);
             }
             task.evicts.push(pool.name.clone());
+        }
+        for p in plan.parks {
+            let pool = &mut self.pools[p];
+            pool.loaded -= 1;
+            pool.parked += 1;
+            pool.parked_last_used = Some(now);
+            for &(r, m) in &pool.parked_claim {
+                in_use[r] += m;
+            }
+            for &(r, m) in &pool.claim {
+                in_use[r] = in_use[r].saturating_sub(m);
+            }
+            task.parks.push(pool.name.clone());
+        }
+        for p in plan.unparks {
+            let pool = &mut self.pools[p];
+            pool.parked -= 1;
+            pool.loaded += 1;
+            for &(r, m) in &pool.claim {
+                in_use[r] += m;
+            }
+            for &(r, m) in &pool.parked_claim {
+                in_use[r] = in_use[r].saturating_sub(m);
+            }
+            task.unparks.push(pool.name.clone());
         }
         for p in plan.loads {
             let pool = &mut self.pools[p];
@@ -383,7 +623,7 @@ impl Dispatcher {
             }
         }
         let mut in_use = vec![0u64; capacity.len()];
-        let mut lazy = Lazy { pools: Vec::new(), of_res: vec![None; capacity.len()] };
+        let mut lazy = Lazy { of_res: vec![None; capacity.len()], ..Default::default() };
         let mut lazy_names: Vec<&String> = resources.lazy.keys().collect();
         lazy_names.sort();
         for name in lazy_names {
@@ -419,10 +659,31 @@ impl Dispatcher {
                 claim.push((i, m));
             }
             claim.sort_unstable();
+            let mut parked_claim: Claim = Vec::with_capacity(pool.parked_claim.len());
+            for (rname, &amount) in &pool.parked_claim {
+                let i = resource_names.binary_search(rname).map_err(|_| {
+                    Error::Config(format!("lazy pool {name:?} parks into resource {rname:?}, which this worker does not declare"))
+                })?;
+                let m = milli(amount).filter(|&m| m > 0).ok_or_else(|| {
+                    Error::Config(format!("lazy pool {name:?} parks {amount} of {rname:?}; it must be a finite amount of at least 0.001"))
+                })?;
+                if m > capacity[i] {
+                    return Err(Error::Config(format!(
+                        "lazy pool {name:?} parks {amount} of {rname:?}, but this worker has only {}",
+                        capacity[i] as f64 / MILLI
+                    )));
+                }
+                parked_claim.push((i, m));
+            }
+            parked_claim.sort_unstable();
+            if pool.stageable && parked_claim.is_empty() {
+                return Err(Error::Config(format!("lazy pool {name:?} is stageable but cannot park; give it a parked claim")));
+            }
+            lazy.any_parkable |= !parked_claim.is_empty();
             lazy.of_res[res] = Some(lazy.pools.len());
             lazy.pools.push(LazyState {
-                name: name.clone(), res, claim, loaded: pool.loaded, loading: 0, unloading: 0, last_used: None,
-                idle_since: None, linger: pool.linger, demand: 0, lookahead_failed: None,
+                name: name.clone(), res, claim, loaded: pool.loaded, linger: pool.linger, parked_claim,
+                stageable: pool.stageable, ..Default::default()
             });
         }
         Ok(Dispatcher {
@@ -520,10 +781,13 @@ impl Dispatcher {
                     None => Some(Plan::default()),
                     Some(c) => self.lazy.plan(c, &self.in_use, &self.capacity, now),
                 };
-                let resident = plan.as_ref().is_some_and(|p| p.loads.is_empty() && p.evicts.is_empty());
                 let mut age = now.saturating_duration_since(basis(h));
-                if resident {
-                    age = age.saturating_add(bonus);
+                if let Some(plan) = &plan {
+                    if plan.resident() {
+                        age = age.saturating_add(bonus);
+                    } else if plan.parked_swap() {
+                        age = age.saturating_add(bonus.mul_f64(PARKED_BONUS_RATIO));
+                    }
                 }
                 Ranked { key: (h.level, Reverse(age), h.seq), i, claim, plan }
             })
@@ -644,15 +908,32 @@ impl Dispatcher {
 
     /// Sets the demand of the lazy pools named (tasks their workflows still have pending); other pools keep
     /// theirs and unknown names are ignored. Returns whether a pool's demand dropped to zero, when a lingering
-    /// idle instance may become a victim.
+    /// idle instance may become a victim. Says nothing about when a pool is needed (see `set_needs`).
     pub fn set_demand(&mut self, demand: &[(String, u32)]) -> bool {
         let mut dropped = false;
         for (name, n) in demand {
-            if let Some(p) = self.lazy.pools.iter_mut().find(|p| &p.name == name) {
-                dropped |= p.demand > 0 && *n == 0;
-                p.demand = *n;
-            }
+            dropped |= self.set_need(name, *n, None);
         }
+        dropped
+    }
+
+    /// `set_demand`, and when each pool is needed next, in seconds from now (None: not known, or not needed).
+    /// With a pool that can park, victims go in order of need (see `Lazy::plan`); a worker that never calls this
+    /// (no lookahead) knows no need, and a worker without `parked=` ignores it, so both evict by recency as ever.
+    /// Returns whether a pool's demand dropped to zero.
+    pub fn set_needs(&mut self, needs: &[(String, u32, Option<f64>)]) -> bool {
+        let mut dropped = false;
+        for (name, n, next) in needs {
+            dropped |= self.set_need(name, *n, *next);
+        }
+        dropped
+    }
+
+    fn set_need(&mut self, name: &str, demand: u32, next_need: Option<f64>) -> bool {
+        let Some(p) = self.lazy.pools.iter_mut().find(|p| p.name == name) else { return false };
+        let dropped = p.demand > 0 && demand == 0;
+        p.demand = demand;
+        p.next_need = next_need.filter(|s| s.is_finite() && demand > 0).map(|s| s.max(0.0));
         dropped
     }
 
@@ -661,41 +942,81 @@ impl Dispatcher {
         self.lazy.pools.iter().map(|p| (p.name.clone(), p.demand)).collect()
     }
 
+    /// How long a stage and an unpark of lazy pool `pool` took, in seconds (None leaves the last value). A stage
+    /// is due `stage + unpark + STAGE_MARGIN` before the pool is needed; until a stage is measured,
+    /// `DEFAULT_STAGE_LEAD` before.
+    pub fn set_move_times(&mut self, pool: &str, stage: Option<f64>, unpark: Option<f64>) -> Result<()> {
+        let p = self.lazy.pool_mut(pool)?;
+        let ok = |s: f64| s.is_finite() && s >= 0.0;
+        p.stage_secs = stage.filter(|&s| ok(s)).or(p.stage_secs);
+        p.unpark_secs = unpark.filter(|&s| ok(s)).or(p.unpark_secs);
+        Ok(())
+    }
+
     /// Grants a speculative load: the first lazy pool (by name) whose workflows want it, that has no idle or
-    /// loading instance, may have another and has room for one without evicting anything. Only a worker with
-    /// nothing due does this, and not again for a pool soon after a failed load. The caller builds the instance
-    /// and calls `lookahead_done`; until then the ledger counts it as loaded but not idle.
-    pub fn lookahead_begin(&mut self, now: Instant) -> Option<String> {
+    /// loading instance, may have another and has room for one without evicting anything. A pool with a
+    /// parked instance gets it unparked (`Unpark`) instead of a new one built (`Build`). Only a worker with
+    /// nothing due does this, and not again for a pool soon after a failed load. The caller builds or unparks
+    /// the instance and calls `lookahead_done`; until then the ledger counts it as loaded but not idle.
+    pub fn lookahead_begin(&mut self, now: Instant) -> Option<(LookaheadKind, String)> {
         if self.held.iter().any(|h| h.at <= now) {
             return None;
         }
-        let p = (0..self.lazy.pools.len()).find(|&p| {
+        let (p, kind) = (0..self.lazy.pools.len()).find_map(|p| {
             let pool = &self.lazy.pools[p];
-            pool.demand > 0
+            let wanted = pool.demand > 0
                 && pool.loading == 0
+                && pool.staging == 0
                 && self.lazy.idle(p, &self.in_use) == 0
-                && pool.loaded < (self.capacity[pool.res] / MILLI as u64) as u32
-                && self.fits(&pool.claim)
-                && pool.lookahead_failed.is_none_or(|f| now.saturating_duration_since(f) >= LOOKAHEAD_BACKOFF)
+                && pool.lookahead_failed.is_none_or(|f| now.saturating_duration_since(f) >= LOOKAHEAD_BACKOFF);
+            if !wanted {
+                return None;
+            }
+            if pool.parked > 0 {
+                // Moving it back adds what the claim holds beyond the parked claim.
+                let fits = pool.claim.iter().all(|&(r, m)| {
+                    m <= pool.parked_m(r) || self.in_use[r] + (m - pool.parked_m(r)) <= self.capacity[r]
+                });
+                return fits.then_some((p, LookaheadKind::Unpark));
+            }
+            let room = pool.loaded < (self.capacity[pool.res] / MILLI as u64) as u32;
+            (room && self.fits(&pool.claim)).then_some((p, LookaheadKind::Build))
         })?;
         let pool = &mut self.lazy.pools[p];
         pool.loaded += 1;
         pool.loading += 1;
+        pool.loading_unpark = kind == LookaheadKind::Unpark;
         // So it isn't the least recently used pool, and the next victim, as soon as it exists.
         pool.last_used = Some(now);
-        for &(r, m) in &pool.claim {
-            self.in_use[r] += m;
+        match kind {
+            LookaheadKind::Build => {
+                for &(r, m) in &pool.claim {
+                    self.in_use[r] += m;
+                }
+            }
+            LookaheadKind::Unpark => {
+                pool.parked -= 1;
+                for &(r, m) in &pool.claim {
+                    self.in_use[r] += m;
+                }
+                for &(r, m) in &pool.parked_claim {
+                    self.in_use[r] = self.in_use[r].saturating_sub(m);
+                }
+            }
         }
-        Some(pool.name.clone())
+        Some((kind, pool.name.clone()))
     }
 
-    /// The instance from `lookahead_begin` is built (`ok`) and idle, or failed and gives its room back.
+    /// The instance from `lookahead_begin` is built or unparked (`ok`) and idle, or failed and gives its room
+    /// back: the whole claim, as a failed unpark closes the instance, and the pool backs off like for a failed
+    /// build.
     pub fn lookahead_done(&mut self, pool: &str, ok: bool, now: Instant) -> Result<()> {
         let p = self.lazy.pool_mut(pool)?;
         if p.loading == 0 {
             return Err(Error::Config(format!("pool {pool:?} has no lookahead load in progress")));
         }
         p.loading -= 1;
+        p.loading_unpark = false;
         if ok {
             p.idle_since = Some(now);
         } else {
@@ -704,6 +1025,78 @@ impl Dispatcher {
             for &(r, m) in &p.claim {
                 self.in_use[r] = self.in_use[r].saturating_sub(m);
             }
+        }
+        Ok(())
+    }
+
+    /// Grants a stage: the first lazy pool (by name) that may be built straight into host RAM and is due for
+    /// it, i.e. is `stageable`, has demand, has no idle, loading, parked or staging instance, may have another
+    /// (`loaded + parked` below its limit), whose parked claim fits the free ledger without dropping anything,
+    /// has not failed a stage within `LOOKAHEAD_BACKOFF`, and is needed within its lead (see `set_move_times`).
+    /// Unlike a lookahead load a stage uses no GPU resource, so a busy worker may stage. The caller builds the
+    /// instance in the parked state and calls `stage_done`; until then the ledger counts it as parked, but not
+    /// usable.
+    pub fn stage_begin(&mut self, now: Instant) -> Option<String> {
+        let p = (0..self.lazy.pools.len()).find(|&p| {
+            let pool = &self.lazy.pools[p];
+            pool.stageable
+                && pool.demand > 0
+                && pool.next_need.is_some_and(|s| s <= pool.stage_lead())
+                && pool.loading == 0
+                && pool.parked == 0
+                && self.lazy.idle(p, &self.in_use) == 0
+                && pool.loaded.saturating_add(pool.parked) < (self.capacity[pool.res] / MILLI as u64) as u32
+                && self.fits(&pool.parked_claim)
+                && pool.stage_failed.is_none_or(|f| now.saturating_duration_since(f) >= LOOKAHEAD_BACKOFF)
+        })?;
+        let pool = &mut self.lazy.pools[p];
+        pool.parked += 1;
+        pool.staging += 1;
+        pool.parked_last_used = Some(now);
+        for &(r, m) in &pool.parked_claim {
+            self.in_use[r] += m;
+        }
+        Some(pool.name.clone())
+    }
+
+    /// The instance from `stage_begin` is built and parked (`ok`), or failed and gives its room back and the
+    /// pool backs off.
+    pub fn stage_done(&mut self, pool: &str, ok: bool, now: Instant) -> Result<()> {
+        let p = self.lazy.pool_mut(pool)?;
+        if p.staging == 0 {
+            return Err(Error::Config(format!("pool {pool:?} has no stage in progress")));
+        }
+        p.staging -= 1;
+        if !ok {
+            p.parked = p.parked.saturating_sub(1);
+            p.stage_failed = Some(now);
+            for &(r, m) in &p.parked_claim {
+                self.in_use[r] = self.in_use[r].saturating_sub(m);
+            }
+        }
+        Ok(())
+    }
+
+    /// The park hook failed for an instance a task was told to park: it is closed instead.
+    pub fn park_failed(&mut self, pool: &str) -> Result<()> {
+        let p = self.lazy.pool_mut(pool)?;
+        if !p.parkable() || p.parked_ready() == 0 {
+            return Err(Error::Config(format!("pool {pool:?} has no parked instance to close")));
+        }
+        p.parked -= 1;
+        for &(r, m) in &p.parked_claim {
+            self.in_use[r] = self.in_use[r].saturating_sub(m);
+        }
+        Ok(())
+    }
+
+    /// The unpark hook failed for an instance a task was told to unpark: it is closed and the task builds a fresh
+    /// one in its place. The ledger already counts the instance as loaded and holding the claim, which the new
+    /// one holds too, so nothing changes; this checks the call makes sense.
+    pub fn unpark_failed(&mut self, pool: &str) -> Result<()> {
+        let p = self.lazy.pool_mut(pool)?;
+        if !p.parkable() || p.loaded == 0 {
+            return Err(Error::Config(format!("pool {pool:?} has no unparked instance to replace")));
         }
         Ok(())
     }
@@ -721,6 +1114,11 @@ impl Dispatcher {
     /// (pool, instances loaded or being loaded) for each lazy pool, for metrics.
     pub fn lazy_usage(&self) -> Vec<(String, u32)> {
         self.lazy.pools.iter().map(|p| (p.name.clone(), p.loaded)).collect()
+    }
+
+    /// (pool, instances parked or being staged) for each lazy pool, for metrics.
+    pub fn parked_usage(&self) -> Vec<(String, u32)> {
+        self.lazy.pools.iter().map(|p| (p.name.clone(), p.parked)).collect()
     }
 
     /// (resource, capacity, in use), for metrics.
@@ -810,12 +1208,24 @@ impl ReadyQueue {
         }
     }
 
+    /// See `Dispatcher::set_needs`; wakes waiters like `set_demand`.
+    pub(crate) fn set_needs(&self, needs: &[(String, u32, Option<f64>)]) {
+        if self.inner.lock().unwrap().set_needs(needs) {
+            self.cv.notify_all();
+        }
+    }
+
     pub(crate) fn demand(&self) -> Vec<(String, u32)> {
         self.inner.lock().unwrap().demand()
     }
 
+    /// See `Dispatcher::set_move_times`.
+    pub(crate) fn set_move_times(&self, pool: &str, stage: Option<f64>, unpark: Option<f64>) -> Result<()> {
+        self.inner.lock().unwrap().set_move_times(pool, stage, unpark)
+    }
+
     /// See `Dispatcher::lookahead_begin`.
-    pub(crate) fn lookahead_begin(&self) -> Option<String> {
+    pub(crate) fn lookahead_begin(&self) -> Option<(LookaheadKind, String)> {
         self.inner.lock().unwrap().lookahead_begin(Instant::now())
     }
 
@@ -826,6 +1236,30 @@ impl ReadyQueue {
         Ok(())
     }
 
+    /// See `Dispatcher::stage_begin`.
+    pub(crate) fn stage_begin(&self) -> Option<String> {
+        self.inner.lock().unwrap().stage_begin(Instant::now())
+    }
+
+    /// See `Dispatcher::stage_done`. The instance may be what a waiter unparks, or its room is free again.
+    pub(crate) fn stage_done(&self, pool: &str, ok: bool) -> Result<()> {
+        self.inner.lock().unwrap().stage_done(pool, ok, Instant::now())?;
+        self.cv.notify_all();
+        Ok(())
+    }
+
+    /// See `Dispatcher::park_failed`. The closed instance's room is free again.
+    pub(crate) fn park_failed(&self, pool: &str) -> Result<()> {
+        self.inner.lock().unwrap().park_failed(pool)?;
+        self.cv.notify_all();
+        Ok(())
+    }
+
+    /// See `Dispatcher::unpark_failed`.
+    pub(crate) fn unpark_failed(&self, pool: &str) -> Result<()> {
+        self.inner.lock().unwrap().unpark_failed(pool)
+    }
+
     /// See `Dispatcher::blocked`.
     pub(crate) fn blocked(&self, resource: &str) -> usize {
         self.inner.lock().unwrap().blocked(resource, Instant::now())
@@ -833,6 +1267,10 @@ impl ReadyQueue {
 
     pub(crate) fn lazy_usage(&self) -> Vec<(String, u32)> {
         self.inner.lock().unwrap().lazy_usage()
+    }
+
+    pub(crate) fn parked_usage(&self) -> Vec<(String, u32)> {
+        self.inner.lock().unwrap().parked_usage()
     }
 
     /// (resource, capacity, in use), for metrics.
@@ -894,6 +1332,9 @@ mod tests {
             trace_ctx: None,
             loads: vec![],
             evicts: vec![],
+            parks: vec![],
+            unparks: vec![],
+            drops: vec![],
             workflow_started_ms: None,
         }
     }
@@ -1965,7 +2406,7 @@ mod tests {
         r.lazy.get_mut("tts").unwrap().linger = Some(LINGER);
         let mut d = Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r, Schedule::Oldest).unwrap();
         d.set_demand(&[("tts".to_string(), 1)]);
-        assert_eq!(d.lookahead_begin(t0).as_deref(), Some("tts"));
+        assert_eq!(d.lookahead_begin(t0).map(|(_, p)| p).as_deref(), Some("tts"));
         let built = t0 + Duration::from_secs(8);
         d.lookahead_done("tts", true, built).unwrap();
         d.push(task(1, "g", "q"), built);
@@ -2048,7 +2489,7 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(d.lookahead_begin(t0), None, "no demand");
         d.set_demand(&[("gemma".to_string(), 1)]);
-        assert_eq!(d.lookahead_begin(t0).as_deref(), Some("gemma"));
+        assert_eq!(d.lookahead_begin(t0).map(|(_, p)| p).as_deref(), Some("gemma"));
         assert_eq!(in_use(&d, "vram_gb"), 7.4);
         assert_eq!(in_use(&d, "pool:gemma"), 0.0);
         assert_eq!(loaded(&d), vec![("gemma".to_string(), 1), ("tts".to_string(), 0)]);
@@ -2088,7 +2529,7 @@ mod tests {
         assert_eq!(in_use(&d, "vram_gb"), 0.0);
         assert_eq!(loaded(&d), vec![("gemma".to_string(), 0), ("tts".to_string(), 0)]);
         assert_eq!(d.lookahead_begin(t0 + LOOKAHEAD_BACKOFF - MS), None);
-        assert_eq!(d.lookahead_begin(t0 + LOOKAHEAD_BACKOFF).as_deref(), Some("gemma"));
+        assert_eq!(d.lookahead_begin(t0 + LOOKAHEAD_BACKOFF).map(|(_, p)| p).as_deref(), Some("gemma"));
         // A task can still load the model itself during the backoff.
         d.lookahead_done("gemma", true, t0 + LOOKAHEAD_BACKOFF).unwrap();
         assert_eq!(in_use(&d, "vram_gb"), 7.4);
@@ -2112,7 +2553,7 @@ mod tests {
         let mut d = two_models(0, 0);
         demand(&mut d);
         d.hold(task(1, "g", "q"), t0 + Duration::from_secs(5));
-        assert_eq!(d.lookahead_begin(t0).as_deref(), Some("gemma"));
+        assert_eq!(d.lookahead_begin(t0).map(|(_, p)| p).as_deref(), Some("gemma"));
         let mut d = two_models(0, 0);
         demand(&mut d);
         d.push(task(1, "g", "q"), t0);
@@ -2132,7 +2573,7 @@ mod tests {
         d.push(task(1, "g", "q"), t0);
         assert!(d.pop(t0).is_some());
         d.set_demand(&[("gemma".to_string(), 1)]);
-        assert_eq!(d.lookahead_begin(t0).as_deref(), Some("gemma"), "a second instance is allowed");
+        assert_eq!(d.lookahead_begin(t0).map(|(_, p)| p).as_deref(), Some("gemma"), "a second instance is allowed");
     }
 
     #[test]
@@ -2144,8 +2585,8 @@ mod tests {
         );
         let t0 = Instant::now();
         d.set_demand(&[("tts".to_string(), 1), ("gemma".to_string(), 1)]);
-        assert_eq!(d.lookahead_begin(t0).as_deref(), Some("gemma"));
-        assert_eq!(d.lookahead_begin(t0).as_deref(), Some("tts"));
+        assert_eq!(d.lookahead_begin(t0).map(|(_, p)| p).as_deref(), Some("gemma"));
+        assert_eq!(d.lookahead_begin(t0).map(|(_, p)| p).as_deref(), Some("tts"));
         assert_eq!(d.lookahead_begin(t0), None);
         assert_eq!(in_use(&d, "vram_gb"), 14.6);
     }
@@ -2163,7 +2604,7 @@ mod tests {
         assert!(d.pop(t0 - 10 * Duration::from_secs(1)).is_some());
         d.release(1);
         d.set_demand(&[("b".to_string(), 1)]);
-        assert_eq!(d.lookahead_begin(t0).as_deref(), Some("b"));
+        assert_eq!(d.lookahead_begin(t0).map(|(_, p)| p).as_deref(), Some("b"));
         d.lookahead_done("b", true, t0).unwrap();
         d.push(task(2, "tc", "q"), t0);
         assert_eq!(d.pop(t0).unwrap().evicts, vec!["a".to_string()]);
@@ -2253,7 +2694,7 @@ mod tests {
     fn ready_queue_lookahead_done_wakes_a_waiter_and_blocked_counts_now() {
         let q = Arc::new(ReadyQueue::new(two_models(0, 0)));
         q.set_demand(&[("gemma".to_string(), 1)]);
-        assert_eq!(q.lookahead_begin().as_deref(), Some("gemma"));
+        assert_eq!(q.lookahead_begin().map(|(_, p)| p).as_deref(), Some("gemma"));
         q.push(task(1, "g", "q"), Instant::now());
         assert!(q.recv_timeout(100 * MS).is_none(), "the instance is still loading");
         assert_eq!(q.blocked("pool:gemma"), 0, "pool:gemma is free; the task waits for the load, not the pool");
@@ -2266,5 +2707,698 @@ mod tests {
         assert_eq!(h.join().unwrap(), Some(1));
         assert!(t.elapsed() < Duration::from_secs(1));
         assert!(matches!(q.lookahead_done("gemma", true), Err(Error::Config(_))));
+    }
+
+    // ---- parked models and staging ----
+
+    const SEC: Duration = Duration::from_secs(1);
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// (name, what one instance claims, what one parked instance claims; empty: cannot park)
+    type ParkSpec<'a> = (&'a str, &'a [(&'a str, f64)], &'a [(&'a str, f64)]);
+
+    fn parking_res(caps: &[(&str, f64)], reqs: &[(&str, &[(&str, f64)])], pools: &[ParkSpec]) -> Resources {
+        Resources {
+            lazy: pools.iter()
+                .map(|(n, c, pc)| (n.to_string(), LazyPool { claim: limits(c), parked_claim: limits(pc), ..Default::default() }))
+                .collect(),
+            ..res(caps, reqs)
+        }
+    }
+
+    fn parking(caps: &[(&str, f64)], reqs: &[(&str, &[(&str, f64)])], pools: &[ParkSpec]) -> Dispatcher {
+        Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &parking_res(caps, reqs, pools), Schedule::Throughput).unwrap()
+    }
+
+    /// vram for one model at a time, host RAM for two parked; gemma, tts and a pool that cannot park.
+    fn parked_models() -> Dispatcher {
+        parking(
+            &[("vram_gb", 7.5), ("ram_gb", 16.0), ("pool:gemma", 1.0), ("pool:tts", 1.0), ("pool:c", 1.0)],
+            &[("g", &[("pool:gemma", 1.0)]), ("t", &[("pool:tts", 1.0)]), ("c", &[("pool:c", 1.0)])],
+            &[
+                ("gemma", &[("vram_gb", 7.4)], &[("ram_gb", 6.6)]),
+                ("tts", &[("vram_gb", 7.2)], &[("ram_gb", 6.6)]),
+                ("c", &[("vram_gb", 7.0)], &[]),
+            ],
+        )
+    }
+
+    /// Runs a task of `name` to completion at `at` and returns what the dispatcher told it to do.
+    fn run(d: &mut Dispatcher, token: u64, name: &str, at: Instant) -> ReadyTask {
+        d.push(task(token, name, "q"), at);
+        let t = d.pop(at).unwrap_or_else(|| panic!("task {name} should start"));
+        d.release_at(token, at);
+        t
+    }
+
+    fn parked(d: &Dispatcher) -> Vec<(String, u32)> {
+        d.parked_usage()
+    }
+
+    fn plan_of(t: &ReadyTask) -> [Vec<String>; 5] {
+        [t.drops.clone(), t.evicts.clone(), t.parks.clone(), t.unparks.clone(), t.loads.clone()]
+    }
+
+    /// gemma loaded and idle, tts parked, c cold.
+    fn gemma_loaded_tts_parked(t0: Instant) -> Dispatcher {
+        let mut d = parked_models();
+        assert_eq!(run(&mut d, 1, "t", t0).loads, names(&["tts"]));
+        let t = run(&mut d, 2, "g", t0);
+        assert_eq!(plan_of(&t), [vec![], vec![], names(&["tts"]), vec![], names(&["gemma"])]);
+        d
+    }
+
+    #[test]
+    fn a_victim_is_parked_and_the_parked_model_is_unparked_instead_of_loaded() {
+        let t0 = Instant::now();
+        let mut d = gemma_loaded_tts_parked(t0);
+        assert_eq!(in_use(&d, "vram_gb"), 7.4);
+        assert_eq!(in_use(&d, "ram_gb"), 6.6, "tts holds its parked claim, not its claim");
+        assert_eq!(loaded(&d), vec![("c".into(), 0), ("gemma".into(), 1), ("tts".into(), 0)]);
+        assert_eq!(parked(&d), vec![("c".into(), 0), ("gemma".into(), 0), ("tts".into(), 1)]);
+
+        d.push(task(3, "t", "q"), t0);
+        let t = d.pop(t0).unwrap();
+        assert_eq!(plan_of(&t), [vec![], vec![], names(&["gemma"]), names(&["tts"]), vec![]]);
+        assert_eq!(in_use(&d, "vram_gb"), 7.2);
+        assert_eq!(in_use(&d, "ram_gb"), 6.6, "gemma parked, tts back on the GPU");
+        assert_eq!(in_use(&d, "pool:tts"), 1.0);
+        assert_eq!(loaded(&d), vec![("c".into(), 0), ("gemma".into(), 0), ("tts".into(), 1)]);
+        assert_eq!(parked(&d), vec![("c".into(), 0), ("gemma".into(), 1), ("tts".into(), 0)]);
+    }
+
+    #[test]
+    fn a_victim_is_evicted_when_its_parked_claim_does_not_fit() {
+        let mut d = parking(
+            &[("vram_gb", 7.5), ("ram_gb", 8.0), ("pool:gemma", 1.0), ("pool:tts", 1.0)],
+            &[("g", &[("pool:gemma", 1.0)]), ("t", &[("pool:tts", 1.0)]), ("h", &[("ram_gb", 3.0)])],
+            &[
+                ("gemma", &[("vram_gb", 7.4)], &[("ram_gb", 6.6)]),
+                ("tts", &[("vram_gb", 7.2)], &[("ram_gb", 6.6)]),
+            ],
+        );
+        let t0 = Instant::now();
+        run(&mut d, 1, "t", t0);
+        d.push(task(2, "h", "q"), t0);
+        assert!(d.pop(t0).is_some(), "a task holds 3 of the 8 GB of RAM");
+        d.push(task(3, "g", "q"), t0);
+        let t = d.pop(t0).unwrap();
+        assert_eq!(plan_of(&t), [vec![], names(&["tts"]), vec![], vec![], names(&["gemma"])]);
+        assert_eq!(in_use(&d, "ram_gb"), 3.0);
+        assert_eq!(parked(&d), vec![("gemma".into(), 0), ("tts".into(), 0)]);
+    }
+
+    #[test]
+    fn a_park_never_counts_on_the_ram_the_unpark_will_free() {
+        // Room for one parked model: parking gemma while tts is still parked would hold both for a moment.
+        let mut d = parking(
+            &[("vram_gb", 7.5), ("ram_gb", 8.0), ("pool:gemma", 1.0), ("pool:tts", 1.0)],
+            &[("g", &[("pool:gemma", 1.0)]), ("t", &[("pool:tts", 1.0)])],
+            &[
+                ("gemma", &[("vram_gb", 7.4)], &[("ram_gb", 6.6)]),
+                ("tts", &[("vram_gb", 7.2)], &[("ram_gb", 6.6)]),
+            ],
+        );
+        let t0 = Instant::now();
+        run(&mut d, 1, "t", t0);
+        assert_eq!(plan_of(&run(&mut d, 2, "g", t0)), [vec![], vec![], names(&["tts"]), vec![], names(&["gemma"])]);
+        d.push(task(3, "t", "q"), t0);
+        let t = d.pop(t0).unwrap();
+        assert_eq!(plan_of(&t), [vec![], names(&["gemma"]), vec![], names(&["tts"]), vec![]]);
+        assert_eq!(in_use(&d, "ram_gb"), 0.0);
+        assert_eq!(in_use(&d, "vram_gb"), 7.2);
+    }
+
+    /// ram_gb 9: y (parks 2.0), w and gemma (park 6.6 each), one at a time on the GPU. y is parked first, then w.
+    fn y_and_w_parked(t0: Instant) -> Dispatcher {
+        let mut d = parking(
+            &[("vram_gb", 7.5), ("ram_gb", 9.0), ("pool:y", 1.0), ("pool:w", 1.0), ("pool:gemma", 1.0)],
+            &[("ty", &[("pool:y", 1.0)]), ("tw", &[("pool:w", 1.0)]), ("tg", &[("pool:gemma", 1.0)])],
+            &[
+                ("y", &[("vram_gb", 7.0)], &[("ram_gb", 2.0)]),
+                ("w", &[("vram_gb", 7.2)], &[("ram_gb", 6.6)]),
+                ("gemma", &[("vram_gb", 7.4)], &[("ram_gb", 6.6)]),
+            ],
+        );
+        for (tok, name, at) in [(1, "ty", 0), (2, "tw", 1), (3, "tg", 2)] {
+            run(&mut d, tok, name, t0 + at * SEC);
+        }
+        assert_eq!(in_use(&d, "ram_gb"), 8.6);
+        d
+    }
+
+    #[test]
+    fn a_park_that_needs_ram_drops_another_parked_instance_but_never_the_one_being_unparked() {
+        let t0 = Instant::now();
+        let mut d = y_and_w_parked(t0);
+        d.push(task(4, "ty", "q"), t0 + 3 * SEC);
+        let t = d.pop(t0 + 3 * SEC).unwrap();
+        // y, the least recently parked, is the one unparked: w goes.
+        assert_eq!(plan_of(&t), [names(&["w"]), vec![], names(&["gemma"]), names(&["y"]), vec![]]);
+        assert_eq!(in_use(&d, "ram_gb"), 6.6);
+        assert_eq!(in_use(&d, "vram_gb"), 7.0);
+        assert_eq!(parked(&d), vec![("gemma".into(), 1), ("w".into(), 0), ("y".into(), 0)]);
+    }
+
+    #[test]
+    fn a_plain_task_drops_a_parked_instance_when_only_that_holds_what_it_needs() {
+        let mut d = parking(
+            &[("vram_gb", 7.5), ("ram_gb", 8.0), ("pool:gemma", 1.0), ("pool:tts", 1.0)],
+            &[("t", &[("pool:tts", 1.0)]), ("g", &[("pool:gemma", 1.0)]), ("render", &[("ram_gb", 3.0)])],
+            &[
+                ("gemma", &[("vram_gb", 7.4)], &[("ram_gb", 6.6)]),
+                ("tts", &[("vram_gb", 7.2)], &[("ram_gb", 6.6)]),
+            ],
+        );
+        let t0 = Instant::now();
+        run(&mut d, 1, "t", t0);
+        run(&mut d, 2, "g", t0 + SEC); // tts is parked (6.6 of 8 GB)
+        let t = run(&mut d, 3, "render", t0 + 2 * SEC);
+        assert_eq!(plan_of(&t), [names(&["tts"]), vec![], vec![], vec![], vec![]]);
+        assert_eq!(in_use(&d, "ram_gb"), 0.0);
+    }
+
+    #[test]
+    fn dropping_follows_the_needs_when_they_are_tracked_and_recency_otherwise() {
+        let drops = |needs: Option<&[(String, u32, Option<f64>)]>| {
+            let mut d = parking(
+                &[("vram_gb", 7.5), ("ram_gb", 14.0), ("pool:w", 1.0), ("pool:x", 1.0), ("pool:gemma", 1.0), ("pool:tts", 1.0)],
+                &[("tw", &[("pool:w", 1.0)]), ("tx", &[("pool:x", 1.0)]), ("tg", &[("pool:gemma", 1.0)]), ("tt", &[("pool:tts", 1.0)])],
+                &[
+                    ("w", &[("vram_gb", 7.0)], &[("ram_gb", 6.6)]),
+                    ("x", &[("vram_gb", 7.1)], &[("ram_gb", 6.6)]),
+                    ("gemma", &[("vram_gb", 7.4)], &[("ram_gb", 6.6)]),
+                    ("tts", &[("vram_gb", 7.2)], &[("ram_gb", 6.6)]),
+                ],
+            );
+            let t0 = Instant::now();
+            for (tok, name, at) in [(1, "tw", 0), (2, "tx", 1), (3, "tg", 2)] {
+                run(&mut d, tok, name, t0 + at * SEC);
+            }
+            // w and x are parked (13.2 of 14 GB), gemma is loaded: parking it needs one of them gone.
+            if let Some(needs) = needs {
+                d.set_needs(needs);
+            }
+            d.push(task(4, "tt", "q"), t0 + 3 * SEC);
+            let t = d.pop(t0 + 3 * SEC).unwrap();
+            assert_eq!((t.parks, t.loads), (names(&["gemma"]), names(&["tts"])));
+            t.drops
+        };
+        assert_eq!(drops(None), names(&["w"]), "the one parked longest ago");
+        let need = |w: f64, x: f64| vec![("w".to_string(), 1, Some(w)), ("x".to_string(), 1, Some(x))];
+        assert_eq!(drops(Some(&need(50.0, 10.0))), names(&["w"]), "w is needed later");
+        assert_eq!(drops(Some(&need(10.0, 50.0))), names(&["x"]), "x is needed later");
+        assert_eq!(drops(Some(&need(10.0, 10.0))), names(&["w"]), "a tie goes to the one parked longest ago");
+    }
+
+    /// vram for three of a, b, c, d (2.0 each); a, b and c loaded, d is `d_parks`.
+    fn four_models(d_parks: bool) -> Dispatcher {
+        let ram: &[(&str, f64)] = if d_parks { &[("ram_gb", 1.0)] } else { &[] };
+        parking(
+            &[("vram_gb", 6.0), ("ram_gb", 4.0), ("pool:a", 1.0), ("pool:b", 1.0), ("pool:c", 1.0), ("pool:d", 1.0)],
+            &[("ta", &[("pool:a", 1.0)]), ("tb", &[("pool:b", 1.0)]), ("tc", &[("pool:c", 1.0)]), ("td", &[("pool:d", 1.0)])],
+            &[
+                ("a", &[("vram_gb", 2.0)], &[]),
+                ("b", &[("vram_gb", 2.0)], &[]),
+                ("c", &[("vram_gb", 2.0)], &[]),
+                ("d", &[("vram_gb", 2.0)], ram),
+            ],
+        )
+    }
+
+    /// The pool evicted for d after b, a, c were used in that order, given `needs` (None: never set).
+    fn victim(d_parks: bool, needs: Option<&[(String, u32, Option<f64>)]>) -> Vec<String> {
+        let mut d = four_models(d_parks);
+        let t0 = Instant::now();
+        for (tok, name, at) in [(1, "tb", 0), (2, "ta", 1), (3, "tc", 2)] {
+            run(&mut d, tok, name, t0 + at * MS);
+        }
+        if let Some(needs) = needs {
+            d.set_needs(needs);
+        }
+        d.push(task(4, "td", "q"), t0 + 3 * MS);
+        let t = d.pop(t0 + 3 * MS).unwrap();
+        assert_eq!(t.loads, names(&["d"]));
+        t.evicts
+    }
+
+    #[test]
+    fn victims_go_in_order_of_need_only_with_needs_tracked_and_a_pool_that_parks() {
+        let need = |a: Option<f64>, b: Option<f64>, c: Option<f64>| {
+            vec![("a".to_string(), a.is_some() as u32, a), ("b".to_string(), b.is_some() as u32, b),
+                 ("c".to_string(), c.is_some() as u32, c)]
+        };
+        let (near, far_, mid) = (Some(1.0), Some(9.0), Some(5.0));
+        // b was used longest ago.
+        assert_eq!(victim(true, None), names(&["b"]), "no needs: least recently used");
+        assert_eq!(victim(true, Some(&need(mid, near, far_))), names(&["c"]), "c is needed furthest ahead");
+        assert_eq!(victim(true, Some(&need(near, mid, far_))), names(&["c"]));
+        assert_eq!(victim(true, Some(&need(far_, near, mid))), names(&["a"]));
+        assert_eq!(victim(true, Some(&need(None, mid, near))), names(&["a"]), "never needed goes first");
+        assert_eq!(victim(true, Some(&need(mid, mid, None))), names(&["c"]));
+        assert_eq!(victim(true, Some(&need(None, None, near))), names(&["b"]), "never needed: least recently used");
+        assert_eq!(victim(true, Some(&need(mid, mid, mid))), names(&["b"]), "a tie goes to the least recently used");
+        assert_eq!(victim(false, Some(&need(mid, near, far_))), names(&["b"]), "no pool parks: least recently used");
+        assert_eq!(victim(false, None), names(&["b"]));
+    }
+
+    #[test]
+    fn set_demand_knows_no_next_need_so_victims_stay_in_recency_order() {
+        let mut d = four_models(true);
+        let t0 = Instant::now();
+        for (tok, name, at) in [(1, "tb", 0), (2, "ta", 1), (3, "tc", 2)] {
+            run(&mut d, tok, name, t0 + at * MS);
+        }
+        d.set_demand(&[("a".to_string(), 1), ("b".to_string(), 1), ("c".to_string(), 1)]);
+        d.push(task(4, "td", "q"), t0 + 3 * MS);
+        assert_eq!(d.pop(t0 + 3 * MS).unwrap().evicts, names(&["b"]));
+    }
+
+    #[test]
+    fn set_needs_stores_demand_and_a_clean_next_need() {
+        let mut d = parked_models();
+        let need = |d: &Dispatcher, p: usize| d.lazy.pools[p].next_need;
+        let n = |name: &str, demand, next| (name.to_string(), demand, next);
+        assert!(!d.set_needs(&[n("gemma", 2, Some(3.5)), n("nope", 1, Some(1.0)), n("tts", 1, Some(-2.0))]));
+        assert_eq!(d.demand(), vec![("c".to_string(), 0), ("gemma".to_string(), 2), ("tts".to_string(), 1)]);
+        assert_eq!((need(&d, 1), need(&d, 2)), (Some(3.5), Some(0.0)), "a negative estimate is now");
+        d.set_needs(&[n("gemma", 2, Some(f64::NAN)), n("tts", 1, Some(f64::INFINITY))]);
+        assert_eq!((need(&d, 1), need(&d, 2)), (None, None), "not a time: unknown");
+        d.set_needs(&[n("gemma", 0, Some(4.0))]);
+        assert_eq!(need(&d, 1), None, "no demand, no need");
+        assert!(d.set_needs(&[n("tts", 0, None)]), "demand dropped to zero");
+        assert!(!d.set_needs(&[n("tts", 0, None)]));
+        d.set_needs(&[n("gemma", 1, Some(4.0))]);
+        d.set_demand(&[("gemma".to_string(), 3)]);
+        assert_eq!(need(&d, 1), None, "set_demand knows no next need");
+        assert_eq!(d.demand()[1], ("gemma".to_string(), 3));
+    }
+
+    #[test]
+    fn scoring_ranks_resident_above_parked_above_cold_by_a_quarter() {
+        assert_eq!(PARKED_BONUS_RATIO, 0.25);
+        let t0 = Instant::now();
+        let secs = Duration::from_secs;
+        // gemma is loaded, tts parked, c cold; throughput: resident is worth 60 s, parked 15 s.
+        let first = |parked_arrives: Duration, other: &str, other_arrives: Duration| {
+            let mut d = gemma_loaded_tts_parked(t0);
+            d.push(task(10, "t", "q"), t0 + parked_arrives);
+            d.push(task(11, other, "q"), t0 + other_arrives);
+            let now = t0 + parked_arrives.max(other_arrives);
+            d.pop(now).unwrap().token
+        };
+        // The parked task has to be more than 45 s older than the resident one to go first.
+        let parked_older = |by: Duration| first(Duration::ZERO, "g", by);
+        assert_eq!(parked_older(secs(45) - MS), 11, "resident is worth 60 s, parked 15 s: 45 s apart is a tie");
+        assert_eq!(parked_older(secs(45) + MS), 10);
+        // The cold task has waited longer than the parked one: it needs more than 15 s.
+        let cold_older = |by: Duration| first(by, "c", Duration::ZERO);
+        assert_eq!(cold_older(secs(15) - MS), 10);
+        assert_eq!(cold_older(secs(15) + MS), 11);
+    }
+
+    #[test]
+    fn scoring_under_oldest_gives_a_parked_swap_a_quarter_of_the_bonus() {
+        let t0 = far();
+        let first = |wf_age_ms: u64| {
+            let mut d = Dispatcher::new(
+                &qs(&["q"]), false, &HashMap::new(),
+                &parking_res(
+                    &[("vram_gb", 7.5), ("ram_gb", 16.0), ("pool:gemma", 1.0), ("pool:tts", 1.0), ("pool:c", 1.0)],
+                    &[("g", &[("pool:gemma", 1.0)]), ("t", &[("pool:tts", 1.0)]), ("c", &[("pool:c", 1.0)])],
+                    &[
+                        ("gemma", &[("vram_gb", 7.4)], &[("ram_gb", 6.6)]),
+                        ("tts", &[("vram_gb", 7.2)], &[("ram_gb", 6.6)]),
+                        ("c", &[("vram_gb", 7.0)], &[]),
+                    ],
+                ),
+                Schedule::Oldest,
+            ).unwrap();
+            run(&mut d, 1, "t", t0);
+            run(&mut d, 2, "g", t0);
+            let wall = now_ms();
+            // A parked swap is worth 2.5 s of age here (a quarter of OLDEST_BONUS); the cold task is older by `wf_age_ms`.
+            d.push(in_workflow(10, "t", wall - 10_000), t0);
+            d.push(in_workflow(11, "c", wall - 10_000 - wf_age_ms), t0);
+            d.pop(t0).unwrap().token
+        };
+        assert_eq!(first(2_500 - 100), 10, "older by less than the parked bonus");
+        assert_eq!(first(2_500 + 100), 11);
+    }
+
+    #[test]
+    fn park_failed_closes_the_parked_instance_and_gives_its_room_back() {
+        let t0 = Instant::now();
+        let mut d = gemma_loaded_tts_parked(t0);
+        d.park_failed("tts").unwrap();
+        assert_eq!(in_use(&d, "ram_gb"), 0.0);
+        assert_eq!(in_use(&d, "vram_gb"), 7.4, "the loaded instance is untouched");
+        assert_eq!(parked(&d), vec![("c".into(), 0), ("gemma".into(), 0), ("tts".into(), 0)]);
+        assert_eq!(loaded(&d), vec![("c".into(), 0), ("gemma".into(), 1), ("tts".into(), 0)]);
+        // The next tts task builds a fresh instance and parks gemma.
+        d.push(task(3, "t", "q"), t0);
+        let t = d.pop(t0).unwrap();
+        assert_eq!(plan_of(&t), [vec![], vec![], names(&["gemma"]), vec![], names(&["tts"])]);
+    }
+
+    #[test]
+    fn unpark_failed_leaves_the_ledger_to_the_replacement_instance() {
+        let t0 = Instant::now();
+        let mut d = gemma_loaded_tts_parked(t0);
+        d.push(task(3, "t", "q"), t0);
+        assert_eq!(d.pop(t0).unwrap().unparks, names(&["tts"]));
+        let (vram, ram, pool) = (in_use(&d, "vram_gb"), in_use(&d, "ram_gb"), in_use(&d, "pool:tts"));
+        d.unpark_failed("tts").unwrap();
+        assert_eq!((in_use(&d, "vram_gb"), in_use(&d, "ram_gb"), in_use(&d, "pool:tts")), (vram, ram, pool));
+        assert_eq!(loaded(&d), vec![("c".into(), 0), ("gemma".into(), 0), ("tts".into(), 1)]);
+        assert_eq!(parked(&d), vec![("c".into(), 0), ("gemma".into(), 1), ("tts".into(), 0)]);
+        // The replacement is an ordinary loaded instance: releasing and evicting it frees the claim.
+        d.release_at(3, t0);
+        d.push(task(4, "g", "q"), t0);
+        let t = d.pop(t0).unwrap();
+        assert_eq!(plan_of(&t), [vec![], vec![], names(&["tts"]), names(&["gemma"]), vec![]]);
+        assert_eq!(in_use(&d, "vram_gb"), 7.4);
+    }
+
+    #[test]
+    fn failure_calls_reject_what_cannot_have_failed() {
+        let t0 = Instant::now();
+        let bad = |r: Result<()>| matches!(r, Err(Error::Config(_)));
+        let mut d = gemma_loaded_tts_parked(t0);
+        assert!(bad(d.park_failed("nope")) && bad(d.unpark_failed("nope")), "unknown pool");
+        assert!(bad(d.park_failed("c")) && bad(d.unpark_failed("c")), "c cannot park");
+        assert!(bad(d.park_failed("gemma")), "nothing of gemma is parked");
+        assert!(bad(d.unpark_failed("tts")), "nothing of tts is loaded");
+        d.park_failed("tts").unwrap();
+        assert!(bad(d.park_failed("tts")), "closed once");
+        assert_eq!((in_use(&d, "vram_gb"), in_use(&d, "ram_gb")), (7.4, 0.0));
+        let mut eager = with_res(&res(&[("gpu", 1.0), ("pool:m", 1.0)], &[]));
+        assert!(bad(eager.park_failed("m")) && bad(eager.unpark_failed("m")) && bad(eager.stage_done("m", true, t0)));
+        assert!(bad(eager.set_move_times("m", Some(1.0), None)));
+    }
+
+    #[test]
+    fn loaded_plus_parked_never_exceeds_the_pool_limit() {
+        // Room for everything, so only pool:gemma bounds the instances.
+        let mk = |instances: f64| parking(
+            &[("vram_gb", 40.0), ("ram_gb", 40.0), ("pool:gemma", instances), ("pool:tts", 1.0)],
+            &[("g", &[("pool:gemma", 1.0)])],
+            &[("gemma", &[("vram_gb", 7.4)], &[("ram_gb", 6.6)]), ("tts", &[("vram_gb", 7.2)], &[("ram_gb", 6.6)])],
+        );
+        let t0 = Instant::now();
+        // One gemma instance, parked: the task unparks it instead of building a second.
+        let mut d = mk(1.0);
+        d.set_needs(&[("gemma".to_string(), 1, Some(0.0))]);
+        d.lazy.pools[0].stageable = true;
+        assert_eq!(d.stage_begin(t0).as_deref(), Some("gemma"));
+        d.stage_done("gemma", true, t0).unwrap();
+        d.push(task(1, "g", "q"), t0);
+        d.push(task(2, "g", "q"), t0);
+        let t = d.pop(t0).unwrap();
+        assert_eq!((t.unparks, t.loads), (names(&["gemma"]), vec![]));
+        assert!(d.pop(t0).is_none(), "the second task waits for the only instance");
+        assert_eq!(parked(&d)[0], ("gemma".to_string(), 0));
+        // Two instances, one busy and one parked: the parked one is used, and no third is built.
+        let mut d = mk(2.0);
+        d.set_needs(&[("gemma".to_string(), 1, Some(0.0))]);
+        d.lazy.pools[0].stageable = true;
+        d.push(task(1, "g", "q"), t0);
+        assert_eq!(d.pop(t0).unwrap().loads, names(&["gemma"]));
+        assert_eq!(d.stage_begin(t0).as_deref(), Some("gemma"), "loaded 1 + parked 0 < 2");
+        d.stage_done("gemma", true, t0).unwrap();
+        assert_eq!(d.stage_begin(t0), None, "loaded 1 + parked 1 = 2");
+        for tok in 2..=3 {
+            d.push(task(tok, "g", "q"), t0);
+        }
+        let t = d.pop(t0).unwrap();
+        assert_eq!((t.unparks, t.loads), (names(&["gemma"]), vec![]));
+        assert!(d.pop(t0).is_none());
+        assert_eq!(loaded(&d)[0], ("gemma".to_string(), 2));
+    }
+
+    #[test]
+    fn rejects_unusable_parked_claims() {
+        let caps = [("vram_gb", 7.5), ("ram_gb", 8.0), ("pool:gemma", 1.0)];
+        let gemma: &[(&str, f64)] = &[("vram_gb", 7.4)];
+        let mk = |parks: &[(&str, f64)], stageable: bool| {
+            let mut r = parking_res(&caps, &[], &[("gemma", gemma, parks)]);
+            r.lazy.get_mut("gemma").unwrap().stageable = stageable;
+            Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r, Schedule::Throughput).map(|_| ())
+        };
+        let msg = |r: Result<()>| match r {
+            Err(Error::Config(m)) => m,
+            other => panic!("expected a config error, got {other:?}"),
+        };
+        let m = msg(mk(&[("cpu", 1.0)], false));
+        assert!(m.contains("gemma") && m.contains("cpu") && m.contains("declare"), "{m}");
+        assert!(msg(mk(&[("ram_gb", 0.0)], false)).contains("ram_gb"), "zero parked claim");
+        assert!(msg(mk(&[("ram_gb", f64::NAN)], false)).contains("ram_gb"));
+        assert!(msg(mk(&[("ram_gb", 9.0)], false)).contains("only 8"), "more than the worker has");
+        assert!(msg(mk(&[], true)).contains("stageable"), "stageable but cannot park");
+        assert!(mk(&[("ram_gb", 6.6)], false).is_ok() && mk(&[("ram_gb", 6.6)], true).is_ok());
+        assert!(mk(&[], false).is_ok(), "parking is optional");
+    }
+
+    // ---- staging and lookahead unpark ----
+
+    /// vram for both models, host RAM for one parked tts; `tweak` edits the resources before the start.
+    fn stager(tweak: impl FnOnce(&mut Resources)) -> Dispatcher {
+        let mut r = parking_res(
+            &[("vram_gb", 20.0), ("ram_gb", 16.0), ("pool:gemma", 1.0), ("pool:tts", 1.0)],
+            &[("g", &[("pool:gemma", 1.0)]), ("t", &[("pool:tts", 1.0)]), ("h", &[("ram_gb", 10.0)])],
+            &[("gemma", &[("vram_gb", 7.4)], &[]), ("tts", &[("vram_gb", 7.2)], &[("ram_gb", 6.6)])],
+        );
+        r.lazy.get_mut("tts").unwrap().stageable = true;
+        tweak(&mut r);
+        Dispatcher::new(&qs(&["q"]), false, &HashMap::new(), &r, Schedule::Throughput).unwrap()
+    }
+
+    fn tts_needed_in(d: &mut Dispatcher, secs: f64) {
+        d.set_needs(&[("tts".to_string(), 1, Some(secs))]);
+    }
+
+    fn lead(secs: f64) -> Duration {
+        Duration::from_secs_f64(secs)
+    }
+
+    #[test]
+    fn a_stage_is_granted_only_for_a_stageable_pool_with_demand_that_is_due() {
+        let t0 = Instant::now();
+        let mut d = stager(|r| r.lazy.get_mut("tts").unwrap().stageable = false);
+        tts_needed_in(&mut d, 0.0);
+        assert_eq!(d.stage_begin(t0), None, "not stageable");
+
+        let mut d = stager(|_| {});
+        assert_eq!(d.stage_begin(t0), None, "no demand");
+        d.set_needs(&[("tts".to_string(), 0, Some(0.0))]);
+        assert_eq!(d.stage_begin(t0), None, "demand 0");
+        d.set_needs(&[("tts".to_string(), 1, None)]);
+        assert_eq!(d.stage_begin(t0), None, "no idea when it is needed");
+        tts_needed_in(&mut d, DEFAULT_STAGE_LEAD.as_secs_f64() + 0.001);
+        assert_eq!(d.stage_begin(t0), None, "not due yet");
+        tts_needed_in(&mut d, DEFAULT_STAGE_LEAD.as_secs_f64());
+        assert_eq!(d.stage_begin(t0).as_deref(), Some("tts"));
+        assert_eq!(in_use(&d, "ram_gb"), 6.6);
+        assert_eq!(in_use(&d, "vram_gb"), 0.0, "staging never touches the GPU");
+        assert_eq!(parked(&d)[1], ("tts".to_string(), 1));
+        assert_eq!(loaded(&d)[1], ("tts".to_string(), 0));
+        // The gemma pool is not stageable, whatever its demand.
+        d.set_needs(&[("gemma".to_string(), 1, Some(0.0))]);
+        assert_eq!(d.stage_begin(t0), None);
+    }
+
+    #[test]
+    fn a_staged_instance_cannot_be_used_until_it_is_done_and_is_then_unparked() {
+        let t0 = Instant::now();
+        let mut d = stager(|_| {});
+        tts_needed_in(&mut d, 0.0);
+        assert!(d.stage_begin(t0).is_some());
+        assert_eq!(d.stage_begin(t0), None, "one at a time");
+        d.push(task(1, "t", "q"), t0);
+        assert!(d.pop(t0).is_none(), "the instance is not built yet, and pool:tts allows no other");
+        d.stage_done("tts", true, t0).unwrap();
+        assert_eq!(d.stage_begin(t0), None, "a parked instance exists");
+        let t = d.pop(t0).unwrap();
+        assert_eq!(plan_of(&t), [vec![], vec![], vec![], names(&["tts"]), vec![]]);
+        assert_eq!((in_use(&d, "vram_gb"), in_use(&d, "ram_gb")), (7.2, 0.0));
+        assert_eq!(parked(&d)[1], ("tts".to_string(), 0));
+    }
+
+    #[test]
+    fn a_staged_instance_is_not_dropped_for_room() {
+        // ram 8: the staged tts (6.6) leaves no room for a 3 GB task, and cannot be dropped while it is built.
+        let mut d = stager(|r| {
+            r.capacity.insert("ram_gb".into(), 8.0);
+            r.requests.insert("h".into(), limits(&[("ram_gb", 3.0)]));
+        });
+        let t0 = Instant::now();
+        tts_needed_in(&mut d, 0.0);
+        assert!(d.stage_begin(t0).is_some());
+        d.push(task(1, "h", "q"), t0);
+        assert!(d.pop(t0).is_none());
+        d.stage_done("tts", true, t0).unwrap();
+        assert_eq!(d.pop(t0).unwrap().drops, names(&["tts"]), "a finished parked instance may go");
+    }
+
+    #[test]
+    fn a_failed_stage_gives_the_room_back_and_backs_off() {
+        let t0 = Instant::now();
+        let mut d = stager(|_| {});
+        tts_needed_in(&mut d, 0.0);
+        assert!(d.stage_begin(t0).is_some());
+        d.stage_done("tts", false, t0).unwrap();
+        assert_eq!(in_use(&d, "ram_gb"), 0.0);
+        assert_eq!(parked(&d)[1], ("tts".to_string(), 0));
+        assert_eq!(d.stage_begin(t0 + LOOKAHEAD_BACKOFF - MS), None);
+        assert_eq!(d.stage_begin(t0 + LOOKAHEAD_BACKOFF).as_deref(), Some("tts"));
+        d.stage_done("tts", true, t0 + LOOKAHEAD_BACKOFF).unwrap();
+        let bad = |r: Result<()>| matches!(r, Err(Error::Config(_)));
+        assert!(bad(d.stage_done("tts", true, t0)), "finished once");
+        assert!(bad(d.stage_done("nope", true, t0)));
+    }
+
+    #[test]
+    fn a_stage_needs_the_pool_to_be_without_an_instance_and_the_room_free_without_drops() {
+        let t0 = Instant::now();
+        // An idle instance exists.
+        let mut d = stager(|r| r.lazy.get_mut("tts").unwrap().loaded = 1);
+        tts_needed_in(&mut d, 0.0);
+        assert_eq!(d.stage_begin(t0), None);
+        // The instance is busy: the pool is full (loaded 1 of 1).
+        d.push(task(1, "t", "q"), t0);
+        assert!(d.pop(t0).is_some());
+        assert_eq!(d.stage_begin(t0), None);
+        // An instance is loading (lookahead).
+        let mut d = stager(|_| {});
+        tts_needed_in(&mut d, 0.0);
+        assert_eq!(d.lookahead_begin(t0), Some((LookaheadKind::Build, "tts".to_string())));
+        assert_eq!(d.stage_begin(t0), None);
+        // The parked claim does not fit the free RAM, and nothing is dropped to make it.
+        let mut d = stager(|_| {});
+        tts_needed_in(&mut d, 0.0);
+        d.push(task(1, "h", "q"), t0);
+        assert!(d.pop(t0).is_some(), "a task holds 10 of the 16 GB");
+        assert_eq!(d.stage_begin(t0), None);
+        d.release(1);
+        assert_eq!(d.stage_begin(t0).as_deref(), Some("tts"));
+    }
+
+    #[test]
+    fn a_busy_worker_may_stage_but_not_speculate_on_the_gpu() {
+        let t0 = Instant::now();
+        let mut d = stager(|_| {});
+        d.set_needs(&[("tts".to_string(), 1, Some(0.0)), ("gemma".to_string(), 1, Some(0.0))]);
+        d.push(task(1, "g", "q"), t0);
+        d.push(task(2, "g", "q"), t0);
+        assert!(d.pop(t0).is_some(), "a gemma task is running");
+        assert_eq!(d.lookahead_begin(t0), None, "the second gemma task is due: no GPU speculation");
+        assert_eq!(d.stage_begin(t0).as_deref(), Some("tts"));
+        assert_eq!(in_use(&d, "vram_gb"), 7.4);
+    }
+
+    #[test]
+    fn the_stage_lead_comes_from_the_measured_move_times() {
+        let t0 = Instant::now();
+        // Each try is a backoff later than the last, so a failed stage does not hold the next one off.
+        let mut at = t0;
+        let mut granted = |d: &mut Dispatcher, secs: f64| {
+            tts_needed_in(d, secs);
+            at += LOOKAHEAD_BACKOFF;
+            let g = d.stage_begin(at).is_some();
+            if g {
+                d.stage_done("tts", false, at).unwrap();
+            }
+            g
+        };
+        let mut d = stager(|_| {});
+        assert_eq!(DEFAULT_STAGE_LEAD, lead(15.0));
+        assert!(granted(&mut d, 15.0) && !granted(&mut d, 15.001), "default before anything is measured");
+        d.set_move_times("tts", None, Some(2.0)).unwrap();
+        assert!(!granted(&mut d, 15.001), "an unpark time alone does not replace the default");
+        d.set_move_times("tts", Some(10.0), None).unwrap();
+        assert_eq!(STAGE_MARGIN, lead(5.0));
+        assert!(granted(&mut d, 17.0) && !granted(&mut d, 17.001), "10 s stage + 2 s unpark + 5 s margin");
+        d.set_move_times("tts", Some(1.0), Some(0.5)).unwrap();
+        assert!(granted(&mut d, 6.5) && !granted(&mut d, 6.501));
+        d.set_move_times("tts", Some(f64::NAN), Some(-1.0)).unwrap();
+        assert!(granted(&mut d, 6.5), "unusable values are ignored");
+    }
+
+    #[test]
+    fn lookahead_unparks_a_parked_pool_and_builds_otherwise() {
+        let t0 = Instant::now();
+        let mut d = stager(|_| {});
+        tts_needed_in(&mut d, 0.0);
+        assert!(d.stage_begin(t0).is_some());
+        d.stage_done("tts", true, t0).unwrap();
+        assert_eq!(in_use(&d, "ram_gb"), 6.6);
+        d.set_demand(&[("gemma".to_string(), 1), ("tts".to_string(), 1)]);
+        assert_eq!(d.lookahead_begin(t0), Some((LookaheadKind::Build, "gemma".to_string())), "gemma has nothing parked");
+        assert_eq!(d.lookahead_begin(t0), Some((LookaheadKind::Unpark, "tts".to_string())));
+        assert_eq!((in_use(&d, "vram_gb"), in_use(&d, "ram_gb")), (14.6, 0.0));
+        assert_eq!(parked(&d)[1], ("tts".to_string(), 0));
+        assert_eq!(loaded(&d), vec![("gemma".to_string(), 1), ("tts".to_string(), 1)]);
+        assert_eq!(d.lookahead_begin(t0), None);
+        d.push(task(1, "t", "q"), t0);
+        assert!(d.pop(t0).is_none(), "still being moved");
+        d.lookahead_done("tts", true, t0).unwrap();
+        let t = d.pop(t0).unwrap();
+        assert_eq!(plan_of(&t), <[Vec<String>; 5]>::default(), "the unparked instance is reused");
+    }
+
+    #[test]
+    fn a_failed_lookahead_unpark_closes_the_instance_and_backs_off() {
+        let t0 = Instant::now();
+        let mut d = stager(|_| {});
+        tts_needed_in(&mut d, 0.0);
+        assert!(d.stage_begin(t0).is_some());
+        d.stage_done("tts", true, t0).unwrap();
+        assert_eq!(d.lookahead_begin(t0).map(|(k, _)| k), Some(LookaheadKind::Unpark));
+        d.lookahead_done("tts", false, t0).unwrap();
+        assert_eq!((in_use(&d, "vram_gb"), in_use(&d, "ram_gb")), (0.0, 0.0));
+        assert_eq!(loaded(&d)[1], ("tts".to_string(), 0));
+        assert_eq!(parked(&d)[1], ("tts".to_string(), 0));
+        assert_eq!(d.lookahead_begin(t0 + LOOKAHEAD_BACKOFF - MS), None);
+        assert_eq!(d.lookahead_begin(t0 + LOOKAHEAD_BACKOFF).map(|(k, _)| k), Some(LookaheadKind::Build));
+    }
+
+    #[test]
+    fn lookahead_does_not_unpark_where_the_gpu_has_no_room_or_a_stage_is_running() {
+        let t0 = Instant::now();
+        // gemma stays loaded and idle: moving tts back would need an eviction.
+        let mut d = stager(|r| {
+            r.capacity.insert("vram_gb".into(), 7.5);
+            r.lazy.get_mut("gemma").unwrap().loaded = 1;
+        });
+        tts_needed_in(&mut d, 0.0);
+        assert!(d.stage_begin(t0).is_some());
+        assert_eq!(d.lookahead_begin(t0), None, "being staged");
+        d.stage_done("tts", true, t0).unwrap();
+        assert_eq!(d.lookahead_begin(t0), None, "7.4 + 7.2 > 7.5");
+        assert_eq!(parked(&d)[1], ("tts".to_string(), 1));
+    }
+
+    #[test]
+    fn ready_queue_stage_done_wakes_a_waiter_that_unparks() {
+        let q = Arc::new(ReadyQueue::new(stager(|_| {})));
+        q.set_needs(&[("tts".to_string(), 1, Some(0.0))]);
+        assert_eq!(q.stage_begin().as_deref(), Some("tts"));
+        assert_eq!(q.parked_usage()[1], ("tts".to_string(), 1));
+        q.push(task(1, "t", "q"), Instant::now());
+        assert!(q.recv_timeout(100 * MS).is_none(), "still being staged");
+
+        let q2 = q.clone();
+        let h = std::thread::spawn(move || q2.recv_timeout(Duration::from_secs(5)).map(|t| (t.token, t.unparks)));
+        std::thread::sleep(50 * MS);
+        let t = Instant::now();
+        q.stage_done("tts", true).unwrap();
+        assert_eq!(h.join().unwrap(), Some((1, names(&["tts"]))));
+        assert!(t.elapsed() < Duration::from_secs(1));
+        assert!(matches!(q.stage_done("tts", true), Err(Error::Config(_))));
+        q.unpark_failed("tts").unwrap();
+        q.set_move_times("tts", Some(1.0), Some(1.0)).unwrap();
     }
 }

@@ -511,6 +511,7 @@ impl Broker for MemoryBroker {
                 task: n.task.clone(),
                 queue: n.queue.clone(),
                 state: n.state,
+                parents: n.parents.clone(),
             }).collect(),
         }))
     }

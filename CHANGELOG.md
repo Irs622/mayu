@@ -6,6 +6,11 @@ All notable changes to mayu are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Parked models: `@app.pool("tts", vram_gb=6.9, parked={"ram_gb": 6.6})` with `@tts.park` and `@tts.unpark` hooks lets a lazy pool move an idle instance to host RAM instead of closing it, and move it back in about a second instead of rebuilding it. The worker parks a victim when its `parked=` amount fits in `--resources` (every resource named must be declared there), unparks a parked model before loading one, closes parked instances to make room, and scores a swap from RAM at a quarter of the loaded-model bonus. With `--lookahead`, victims go in order of when their pool is next needed, `--lookahead` unparks a parked model ahead of its task, and an optional `@tts.stage` hook builds the model straight into host RAM, even while the worker is busy, shortly before a workflow needs it (estimated from this worker's own run times and the workflow DAG). `close` runs on parked instances too. The README has a torch recipe.
+- Metrics `mayu_pool_parked`, `mayu_pool_parks_total`, `mayu_pool_unparks_total`, `mayu_pool_drops_total`, `mayu_pool_stages_total`, `mayu_pool_move_seconds` and `mayu_pool_next_need_seconds`, exported only for pools with `parked=`. Nothing changes for a worker whose pools don't use it: same scheduling, eviction order, logs and metrics. No wire or key-layout change.
+
 ## [0.2.0] - 2026-10-22
 
 ### Added
