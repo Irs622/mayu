@@ -292,7 +292,8 @@ fn strict_priority_runs_a_later_claimed_higher_queue_first() {
     let rt = start(&mem, two_queues(true, 1, 8));
     wait_until(|| mem.pending_len() == 3);
     mem.push(&Header::new("t", "hi", 0, "ct"), b"");
-    wait_until(|| mem.pending_len() == 4);
+    // Claimed by the broker is not yet handed to the dispatcher: wait for the dispatcher to hold all four.
+    wait_until(|| rt.queued() == 4);
     assert_eq!(rt.recv_timeout(RECV).unwrap().queue, "hi");
     rt.shutdown(Duration::from_secs(1));
 }

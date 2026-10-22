@@ -1173,6 +1173,10 @@ impl ReadyQueue {
         admit
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
     pub(crate) fn hold(&self, task: ReadyTask, at: Instant) {
         self.inner.lock().unwrap().hold(task, at);
         self.cv.notify_one();

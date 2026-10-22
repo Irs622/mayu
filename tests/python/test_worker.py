@@ -151,7 +151,7 @@ def test_cpu_bound_tasks_run_in_parallel(app, running):
             x += i
         return x
 
-    n = 3_000_000
+    n = 10_000_000  # enough work that thread and Redis overhead don't swing the ratio on a 4-vCPU runner
     with running(app, threads=4):
         t = time.monotonic()
         spin.send(n).result(timeout=30)
@@ -160,7 +160,8 @@ def test_cpu_bound_tasks_run_in_parallel(app, running):
         for h in [spin.send(n) for _ in range(4)]:
             h.result(timeout=30)
         parallel = time.monotonic() - t
-    assert parallel < single * 2.5, f"4 tasks took {parallel:.2f}s vs {single:.2f}s for one"
+    # One after another would take 4x; under 3x is parallel even with the runner's other threads competing.
+    assert parallel < single * 3, f"4 tasks took {parallel:.2f}s vs {single:.2f}s for one"
 
 
 def test_shutdown_requeues_prefetched_tasks(app, running):

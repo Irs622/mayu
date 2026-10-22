@@ -589,6 +589,12 @@ impl<B: Broker> Runtime<B> {
         self.inflight.lock().unwrap().len()
     }
 
+    /// Tasks the dispatcher holds that no thread has taken yet. For tests.
+    #[doc(hidden)]
+    pub fn queued(&self) -> usize {
+        self.ready.len()
+    }
+
     pub fn shutdown(&self, grace: Duration) {
         self.stop_fetching();
         let Some(h) = self.handles.lock().unwrap().take() else { return };

@@ -1,3 +1,4 @@
+import http.client
 import os
 import pathlib
 import signal
@@ -138,8 +139,8 @@ def test_metrics_survive_recycle(redis_url, queue):
             try:
                 if pred(_value(_scrape(port), series)):
                     return
-            except OSError:
-                pass  # between interpreters
+            except (OSError, http.client.HTTPException):
+                pass  # between interpreters (a scrape cut off by the re-exec ends in IncompleteRead)
             assert time.monotonic() < deadline, what
             time.sleep(0.1)
 
