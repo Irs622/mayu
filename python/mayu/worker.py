@@ -11,7 +11,7 @@ import traceback
 from . import _native, otel
 from . import gpu as gpu_mod
 from . import thp as thp_mod
-from .envproc import EnvChild, EnvUnavailable
+from .envproc import DEAD_GEN, EnvChild, EnvUnavailable, _Remote, _RemotePool
 from .exceptions import DiscardInstance, Retry, SoftTimeLimitExceeded, TimeLimitExceeded
 from .limits import TimeLimits
 from .pool import PoolContext, check_pool_name
@@ -258,7 +258,7 @@ class WorkerRunner:
         self.lazy = self.lazy and bool(self._loaded)  # a lazy worker with no pools is an ordinary one
         self.schedule = (schedule or "oldest") if self.lazy else None
         self.lookahead = bool(lookahead) and self.lazy  # like schedule: nothing to do for a worker without pools
-        parkable = [self.app.pools[p] for p in self.lazy_pools if self.app.pools[p].parked] if self.lazy else []
+        parkable = [self._pool(p) for p in self.lazy_pools if self._pool(p).parked] if self.lazy else []
         self._parkable = bool(parkable)  # false: no park, unpark or stage is ever asked of, or reported by, this worker
         self._stageable = any(p.stager is not None for p in parkable)
         self.task_resources = self._served_requests(left)
@@ -374,18 +374,25 @@ class WorkerRunner:
         self.app_path = app_path
 
     def _make_env_children(self) -> None:
-        """One (not yet started) child per env in use. Its pools are the loaded ones that belong to it."""
-        self._env_lock = threading.Lock()  # guards the two dicts below
-        self._env_live: dict[str, int] = {}  # env pool -> instances the ledger counts as alive
-        self._env_epoch: dict[str, int] = {}  # env -> the child generation the ledger describes
+        """One (not yet started) child per env in use, and a proxy for each loaded pool that belongs to one."""
         self._env_children: dict[str, EnvChild] = {}
+        self._remote: dict[str, _RemotePool] = {}  # env pool -> the stand-in the worker's pool code uses
         for name in self._env_used:
             env = self.app.envs[name]
-            pools = {p: n for p, n in self._loaded.items() if self.app.pools[p].env == name}
             python = self._env_pythons.get(name) or env.python
-            self._env_children[name] = EnvChild(self, env, python, self.app_path, pools,
-                                                self.app.result_ttl is not None, self.app.allow_pickle)
-            self._env_live.update(pools)
+            child = self._env_children[name] = EnvChild(self, env, python, self.app_path,
+                                                        self.app.result_ttl is not None, self.app.allow_pickle)
+            for p in self._loaded:
+                if self.app.pools[p].env == name:
+                    self._remote[p] = _RemotePool(self.app.pools[p], child)
+
+    def _pool(self, name: str):
+        """The pool whose behaviour the worker uses: a stand-in that calls into the env's child for an env pool."""
+        remote = self._remote.get(name)
+        return self.app.pools[name] if remote is None else remote
+
+    def _new_state(self, name: str, size: int, lazy: bool = False) -> _PoolState:
+        return _PoolState(self._pool(name), size, lazy)
 
     def _plan_pools(self, pools) -> dict[str, float]:
         """Checks `pools` against the served tasks; returns what each declared resource has left after reserving
@@ -425,10 +432,6 @@ class WorkerRunner:
                 log.warning("pool %r is sized but no task on the served queues uses it; not loading it", name)
         self._sized = {p: n for p, n in pools.items() if n}
         self._loaded = {p: n for p, n in pools.items() if n and p in used}
-        in_env = sorted(p for p in self._loaded if registered[p].env)
-        if self.lazy and in_env:
-            raise ValueError(f"pools in an env need --pool-mode eager (the env's child builds them once); "
-                             f"pool(s) {in_env} are in an env")
         reserved: dict[str, int] = {}  # milli-units, like the dispatcher
         parts: dict[str, list[str]] = {}
         for p, n in self._loaded.items():
@@ -486,7 +489,7 @@ class WorkerRunner:
     def _check_parked(self) -> None:
         """Lazy mode: a pool with `parked=` needs its hooks and room declared, and hooks need `parked=`."""
         for name in self._loaded:
-            pool = self.app.pools[name]
+            pool = self._pool(name)
             if pool.parked is None:
                 for hook, fn in (("park", pool.parker), ("unpark", pool.unparker), ("stage", pool.stager)):
                     if fn is not None:
@@ -554,13 +557,17 @@ class WorkerRunner:
     def start(self) -> None:
         thp_mod.apply(self.thp)  # before any thread exists, so every heap starts in the advised arena
         rate_limits = {t.name: t.rate_per_sec for t in self.app.registry.values() if t.rate_per_sec is not None}
-        self._load_pools()  # before the native worker: it starts fetching as soon as it exists
-        self._start_envs()
+        self._start_envs()  # before the pools: an env pool is built in its child
+        try:
+            self._load_pools()  # before the native worker: it starts fetching as soon as it exists
+        except BaseException:
+            self._stop_envs(time.monotonic() + 5.0)
+            raise
         try:
             self.native = self._start_native(rate_limits)
         except BaseException:
-            self._stop_envs(time.monotonic() + 5.0)
             self._close_pools()
+            self._stop_envs(time.monotonic() + 5.0)
             raise
         for name in self._preload if self.lazy else ():  # the dispatcher already counts them (lazy_pools)
             self.native.pool_loaded(name)
@@ -592,7 +599,7 @@ class WorkerRunner:
             rate_limits=rate_limits,
             resources=self.capacity or None,
             task_resources=self.task_resources or None,
-            lazy_pools={p: self._lazy_args(self.app.pools[p], claim, loaded)
+            lazy_pools={p: self._lazy_args(self._pool(p), claim, loaded)
                         for p, (claim, loaded) in self.lazy_pools.items()} or None,
             schedule=self.schedule,
             lookahead=self.lookahead,
@@ -636,7 +643,8 @@ class WorkerRunner:
         if self._lookahead_thread is not None:  # what it is building or staging still gets closed by _close_pools
             self._lookahead_stop.set()
             self._lookahead_thread.join(max(0.0, deadline - time.monotonic()))
-        self._stop_envs(deadline)
+        if self._env_children:  # env instances are closed over the pipe, so before the children go
+            self._close_env_pools(deadline)
         remaining_ms = int(max(0.0, deadline - time.monotonic()) * 1000)
         self.native.shutdown(max(remaining_ms, 1000))
         self._close_pools()  # what threads past the grace period still hold is not closed
@@ -660,18 +668,17 @@ class WorkerRunner:
     # -- envs ----------------------------------------------------------------
 
     def _start_envs(self) -> None:
-        """Spawns every env's child and waits until its app is imported and its pools are built, so a bad
-        interpreter, a version mismatch or a failing factory stops the worker before it fetches anything."""
+        """Spawns every env's child and waits until its app is imported, so a bad interpreter, a version mismatch or
+        an import error stops the worker before it fetches anything."""
         try:
             for child in self._env_children.values():
                 child.start()
         except BaseException:
             self._stop_envs(time.monotonic() + 5.0)
-            self._close_pools()
             raise
 
     def _stop_envs(self, deadline: float) -> None:
-        """Asks each child to finish and close its pools; kills what is still running at the deadline."""
+        """Asks each child to finish and exit (it closes what is left); kills what is still running at the deadline."""
         for child in self._env_children.values():
             try:
                 child.stop(max(1.0, deadline - time.monotonic()))
@@ -680,59 +687,121 @@ class WorkerRunner:
         for s in self._live_slots():  # a call that was cut short reports "run again" right away
             s.thread.join(1.0)
 
-    def _env_ready(self, child: EnvChild, gen) -> None:
-        """A child finished its handshake. A respawned one built all its pools afresh, so the ledger is brought to
-        what it holds."""
-        with self._env_lock:
-            self._env_epoch[child.name] = gen.epoch
-            for pool, n in child.pools.items():
-                delta = n - self._env_live[pool]
-                self._env_live[pool] = n
-                if delta:
-                    self._adjust(f"pool:{pool}", float(delta))
+    def _close_env_pools(self, deadline: float) -> None:
+        """Closes every idle instance (the children are still up to do it; ghosts close as no-ops), then stops the
+        children."""
+        self._close_pools()
+        self._stop_envs(deadline)
 
-    def _env_rebuilt(self, child: EnvChild, gen, pool: str, ok: bool) -> None:
-        with self._env_lock:
-            if self._env_epoch.get(child.name) != gen.epoch:
-                return  # a child that was replaced since
-            if ok:
-                self._env_live[pool] += 1
-                self._adjust(f"pool:{pool}", 1.0)
-            left = self._env_live[pool]
-        if ok:
-            self.native.pool_rebuilt(pool)
-            log.info("pool instance rebuilt", extra={"pool": pool, "env": child.name})
-        elif left == 0:
-            self._request_restart(f"pool {pool!r} has no instances left")
+    @staticmethod
+    def _unavailable(e: BaseException | None) -> EnvUnavailable | None:
+        """The `EnvUnavailable` in the cause chain of `e`: a child that cannot be started, not a failed factory."""
+        while e is not None:
+            if isinstance(e, EnvUnavailable):
+                return e
+            e = e.__cause__ or e.__context__
+        return None
+
+    def _retry_unavailable(self, token, e: EnvUnavailable) -> None:
+        self._end_span(token, e)
+        self.native.complete_retry(token, e.backoff_ms, str(e))
+        self._settled()
+
+    def _revive(self, held: list[_Held]) -> None:
+        """Rebuilds in place each held instance whose child died (a ghost), in the child that is (re)started for it.
+        The dispatcher already counts it as loaded, so the ledger is not touched. Revived entries replace the dead
+        ones in `held` (the list `_checked_out` holds) even when a later one fails."""
+        for i, h in enumerate(held):
+            if not h.instance.gen.dead:
+                continue
+            pool, state = h.state.pool, h.state
+            started = time.monotonic()
+            held[i] = h._replace(instance=pool.factory(PoolContext(pool.name, h.index, state.target)))
+            if not self.lazy:
+                self.native.pool_rebuilt(pool.name)
+            log.info("pool instance revived after its env runner died",
+                     extra={"pool": pool.name, "index": h.index, "load_seconds": round(time.monotonic() - started, 3)})
 
     def _run_env(self, ready, task, plan) -> None:
         """Runs a task in its env's child. The arguments are never deserialized here: their types may only exist
-        in the child's interpreter."""
+        in the child's interpreter. The instances it uses are checked out here like any task's and named to the
+        child, which looks them up; they come back (or are replaced) here when it is done, in `_run_sync`'s order.
+
+        When a child dies its instances are not touched: they stay in their pools as ghosts (dead `_Remote`
+        handles), and the dispatcher's counts stay right. Whatever touches a ghost settles it: a planned evict, drop
+        or park closes or fails as for any instance, an unpark fails cleanly, and a task that checks one out
+        revives it in place before the call."""
         token = ready.token
-        if plan:  # lazy mode: the task may have to make room for in-process models
+        held: list[_Held] = []
+        if task.pools or plan:  # in lazy mode a task without pools can still make room for a model
             try:
-                self._checkout(token, task, plan)
+                held = self._checkout(token, task, plan)
             except Exception as e:
-                self._report_error(token, task, e)
+                unavailable = self._unavailable(e)
+                if unavailable is not None:
+                    self._retry_unavailable(token, unavailable)
+                else:
+                    self._report_error(token, task, e)
                 return
         try:
-            gen, outcome = self._env_children[task.env].call(token, task.name, ready.content_type, ready.payload,
-                                                             task.hard_time_limit)
-        except EnvUnavailable as e:  # no child to run it: try again later, not at once
-            self._end_span(token, e)
-            self.native.complete_retry(token, e.backoff_ms, str(e))
-            self._settled()
-            return
+            self._revive(held)
         except Exception as e:
-            self._report_error(token, task, e)
+            self._release(token, held, (True, None), ())  # ghosts stay ghosts
+            unavailable = self._unavailable(e)
+            if unavailable is not None:
+                self._retry_unavailable(token, unavailable)
+            else:
+                self._report_error(token, task, RuntimeError(f"pool failed to load: {e!r}"))
             return
-        broken = outcome.get("broken")
-        if broken:  # before the report, like `_release`: it frees the task's `pool:` slots
-            with self._env_lock:
-                if self._env_epoch.get(task.env) == gen.epoch:
-                    for pool in broken:
-                        self._env_live[pool] -= 1
-                        self._adjust(f"pool:{pool}", -1.0)
+        child = self._env_children[task.env]
+        error = None
+        try:
+            gen, outcome = child.call(token, task.name, ready.content_type, ready.payload, task.hard_time_limit,
+                                      {h.param: [h.state.pool.name, h.index] for h in held},
+                                      otel.inject(self._span(token)), [h.instance for h in held])
+        except EnvUnavailable as e:  # no child to run it: try again later, not at once
+            outcome = {"o": "unavailable", "ms": e.backoff_ms, "error": str(e)}
+        except Exception as e:
+            outcome, error = {"o": "error"}, e
+        broken = []
+        if held:  # before the report, like `_run_sync`: it frees the task's `pool:` slots
+            # What the child judged broken, if it lives: a handle whose child died goes back as a ghost.
+            reported = set(outcome.get("broken") or ())
+            gone = {h.param for h in held if h.param in reported and not h.instance.gen.dead}
+            broken = self._release(token, held, (True, None), gone)
+        if error is not None:
+            self._report_error(token, task, error)
+        else:
+            self._report_env(token, task, outcome)
+        for h in broken:
+            self._rebuild_env(h)
+
+    def _rebuild_env(self, h: _Held) -> None:
+        """`_rebuild` for an instance of an env pool. Eager mode differs when no child can be started: the pool does
+        not shrink for good, the slot gets a ghost that the next task revives."""
+        if self.lazy:
+            self._rebuild(h)
+            return
+        pool, state = h.state.pool, h.state
+        self._close_instance(pool, h.instance)
+        started = time.monotonic()
+        try:
+            fresh = pool.factory(PoolContext(pool.name, h.index, state.target))
+        except EnvUnavailable as e:
+            log.warning("no env runner to rebuild instance %d of pool %r: %s; the next task that needs it will",
+                        h.index, pool.name, e)
+            fresh = _Remote(pool.name, h.index, DEAD_GEN)
+        except Exception:
+            log.exception("rebuilding instance %d of pool %r failed; the pool is one smaller", h.index, pool.name)
+            self._pool_shrunk(state)
+            return
+        state.push(h.index, fresh)
+        self._adjust(f"pool:{pool.name}", 1.0)
+        self.native.pool_rebuilt(pool.name)
+        log.info("pool instance rebuilt", extra={"pool": pool.name, "index": h.index,
+                                                 "load_seconds": round(time.monotonic() - started, 3)})
+
+    def _report_env(self, token, task, outcome: dict) -> None:
         kind = outcome["o"]
         if kind == "ok":
             self._end_span(token)
@@ -741,7 +810,7 @@ class WorkerRunner:
             except (TypeError, ValueError, OverflowError) as e:
                 self.native.complete_failure(token, f"bad link callback: {e!r}", traceback.format_exc())
             self._settled()
-        elif kind == "retry":
+        elif kind in ("retry", "unavailable"):
             self._end_span(token, RuntimeError(outcome["error"]))
             self.native.complete_retry(token, outcome["ms"], outcome["error"])
             self._settled()
@@ -764,7 +833,7 @@ class WorkerRunner:
         A lazy worker builds only the `preload` pools, one instance each, in the order given."""
         if self.lazy:
             for name, n in self._loaded.items():
-                self._states[name] = _PoolState(self.app.pools[name], n, lazy=True)
+                self._states[name] = self._new_state(name, n, lazy=True)
             for name in self._preload:
                 state = self._states[name]
                 index = state.take_index()
@@ -779,10 +848,8 @@ class WorkerRunner:
                                                         "load_seconds": round(time.monotonic() - started, 3)})
             return
         for name, n in self._loaded.items():
-            pool = self.app.pools[name]
-            if pool.env is not None:  # the env's child builds it
-                continue
-            state = self._states[name] = _PoolState(pool, n)
+            pool = self._pool(name)
+            state = self._states[name] = self._new_state(name, n)
             for index in range(n):
                 started = time.monotonic()
                 try:
@@ -958,7 +1025,7 @@ class WorkerRunner:
 
     def _report_move(self, name: str, kind: str, secs: float) -> None:
         """Tells the dispatcher how long a move took (parkable pools only: it sets how early a stage is due)."""
-        if not self.app.pools[name].parked:
+        if not self._states[name].pool.parked:
             return
         try:
             self.native.pool_timing(name, kind, secs)
@@ -1142,8 +1209,9 @@ class WorkerRunner:
             return True
         return isinstance(error, h.state.pool.discard_on)
 
-    def _release(self, token, held: list[_Held], outcome) -> list[_Held]:
+    def _release(self, token, held: list[_Held], outcome, broken_params=None) -> list[_Held]:
         """Returns the healthy instances to their pools and takes the broken ones' slots out of the ledger.
+        `broken_params` (a task in an env, whose child judged the error) names the broken ones instead.
 
         Runs before the outcome is reported: reporting releases the task's `pool:` slots, so the instances
         must already be back and the broken ones' slots already gone, or another task could be admitted
@@ -1151,7 +1219,10 @@ class WorkerRunner:
         """
         with self._held_lock:
             self._checked_out.pop(token, None)
-        broken = [] if outcome[0] else [h for h in held if self._is_broken(h, outcome[1])]
+        if broken_params is not None:
+            broken = [h for h in held if h.param in broken_params]
+        else:
+            broken = [] if outcome[0] else [h for h in held if self._is_broken(h, outcome[1])]
         for h in held:
             if not any(h is b for b in broken):
                 h.state.push(h.index, h.instance)
@@ -1246,9 +1317,19 @@ class WorkerRunner:
         if self.max_memory_per_process is not None and now >= self._next_memory_check:
             self._next_memory_check = now + 1.0
             rss = rss_mb()
+            if rss is not None and self._env_children:  # the children's memory is the worker's too
+                rss += self._env_rss()
             if rss is not None and rss > self.max_memory_per_process:
                 self._request_restart(
                     f"memory {rss:.0f} MB exceeds max_memory_per_process ({self.max_memory_per_process:g} MB)")
+
+    def _env_rss(self) -> float:
+        total = 0.0
+        for child in self._env_children.values():
+            gen = child.gen
+            if gen is not None and not gen.dead:
+                total += rss_mb(gen.proc.pid) or 0.0
+        return total
 
     # -- threads -------------------------------------------------------------
 

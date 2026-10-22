@@ -174,3 +174,18 @@ def test_without_opentelemetry_nothing_changes(app, running, monkeypatch, spans)
         assert plain.send().result(timeout=5) == 7
     assert otel.start_send("x", "q") == (None, None)
     assert [s.name for s in spans.get_finished_spans()] == []
+
+
+# -- a task in an env's child continues the worker's trace --------------------------------------------------------
+
+from test_envs import env_app, worker  # noqa: E402,F401  (fixtures)
+
+
+def test_a_task_in_an_env_runs_under_the_workers_process_span(env_app, worker, spans):
+    with worker():
+        h = env_app.trace_ids.send()
+        trace_id, span_id = h.result(timeout=20)
+    got = _wait_spans(spans, 2)
+    send, process = _one(got, "send envtest.trace_ids"), _one(got, "process envtest.trace_ids")
+    assert trace_id == format(send.context.trace_id, "032x"), "the child's spans join the producer's trace"
+    assert span_id == format(process.context.span_id, "016x"), "and nest under the worker's process span"

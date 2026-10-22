@@ -233,6 +233,19 @@ fails that task by the usual rules; every other call pending on a killed or cras
 (a crash means "runs again"). The soft limit runs inside the child. Tasks without
 `env=` take no new code path, and no wire or key-layout change is involved.
 
+Pools in an env support every pool feature (eager and lazy mode, preload, schedule, lookahead, linger, parked
+instances with park/unpark/stage, discard and rebuild). The child is a dumb host of instances keyed by
+`(pool, index)`; the worker owns all bookkeeping. For each env pool it keeps an ordinary `_PoolState` whose `pool` is a
+proxy exposing the same attributes and hooks, each a blocking RPC (`op`/`opdone`) to the child. The pool code
+(`_checkout`, `_evict`, `_park`, `_build`, `_rebuild`, `_lookahead_*`, ...) is therefore the code that runs for pools in
+the worker, and one ledger covers pools of the worker and of every env, so a model in one env can be evicted to make
+room for one in another. An instance is an opaque handle bound to a child generation. When a generation dies nothing is reconciled: its
+handles stay in their pools as ghosts and the dispatcher's counts stay exact. A planned evict or drop of a ghost is a
+no-op close, a planned park or an unpark of one fails through the existing failed-move paths, and a task that checks
+one out revives it in place (rebuilding it in the respawned child) before the call.
+Env tasks carry the process span's `traceparent` so the
+child's spans nest under it, and `--max-memory-per-process` adds the children's RSS.
+
 ---
 
 ## 6. Public API

@@ -116,8 +116,8 @@ class App:
         has a node waiting for it. ``parked`` (lazy mode only) is what one parked instance holds, like
         ``{"ram_gb": 6.6}``: instead of closing an idle instance to make room, the worker moves it there with the
         pool's ``@park`` hook and moves it back with ``@unpark``; ``@stage`` can build one straight into that state.
-        Eager mode ignores ``linger`` and ``parked``. With ``env=`` the factory runs in that env's child process
-        (eager mode only), never in the worker."""
+        Eager mode ignores ``linger`` and ``parked``. With ``env=`` the factory and the hooks run in that env's
+        child process, never in the worker, and the pool has every feature of one that runs in the worker."""
         check_pool_name(name)
         linger = check_linger(linger)
         if parked is not None:
@@ -128,9 +128,6 @@ class App:
         resources = check_resources(f"resources of pool {name!r}", resources)
         discard_on = check_discard_on(discard_on)
         env = env_name(self, env)
-        if env is not None and (linger is not None or parked is not None):
-            raise ValueError(f"pool {name!r} is in env {env!r}, whose pools are eager only; "
-                             f"linger and parked are for lazy pools")
 
         def register(factory):
             pool = Pool(self, name, factory, resources, discard_on, linger, parked, env)

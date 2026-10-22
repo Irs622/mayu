@@ -16,6 +16,7 @@ from mayu import App, DiscardInstance, Retry, SoftTimeLimitExceeded
 app = App(result_ttl=60)
 legacy = app.env("legacy", python=os.environ.get("MAYU_TEST_ENV_PYTHON") or sys.executable,
                  imports=["env_app_impl"])
+other = app.env("other", python=os.environ.get("MAYU_TEST_ENV_PYTHON") or sys.executable)  # a second child
 
 
 def _append(line):
@@ -163,6 +164,144 @@ def use_model(m=app.use("model")):
 @app.task(name="envtest.discard_model", env=legacy, max_retries=0)
 def discard_model(m=app.use("model")):
     raise DiscardInstance("broken")
+
+
+@app.task(name="envtest.trace_ids", env=legacy)
+def trace_ids():
+    """The trace and span the task runs under in the child (None without OpenTelemetry)."""
+    try:
+        from opentelemetry import trace
+    except ImportError:
+        return None
+    ctx = trace.get_current_span().get_span_context()
+    return [format(ctx.trace_id, "032x"), format(ctx.span_id, "016x")]
+
+
+@app.task(name="envtest.hold_memory", env=legacy)
+def hold_memory(mb, go):
+    """Holds `mb` MB of touched memory in the child until `go` exists."""
+    block = b"x" * (mb * 1_048_576)
+    deadline = time.monotonic() + 30
+    while not os.path.exists(go) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return len(block)
+
+
+# -- lazy, parked and mixed pools: every move is logged to MAYU_TEST_FILE with the pid of the process that made it ----
+
+LQ = app.default_queue + "-lazy"  # their tasks: a worker serves this queue to use these pools
+
+
+def _gpu_pool(name, env=None, **options):
+    def build(ctx):
+        _append(f"build {name} {ctx.index} {os.getpid()}")
+        return {"name": name, "pid": os.getpid(), "index": ctx.index, "where": "gpu"}
+
+    pool = app.pool(name, env=env, vram_gb=6, **options)(build)
+    pool.close(lambda m: _append(f"close {name} {m['index']} {m['where']} {os.getpid()}"))
+    return pool
+
+
+_gpu_pool("ea", legacy, linger=30)
+_gpu_pool("eb", other)
+_gpu_pool("loc")
+_pk = _gpu_pool("pk", legacy, parked={"ram_gb": 4})
+
+
+@_pk.park
+def _park_pk(m):
+    m["where"] = "ram"
+    _append(f"park pk {m['index']} {os.getpid()}")
+
+
+@_pk.unpark
+def _unpark_pk(m):
+    m["where"] = "gpu"
+    _append(f"unpark pk {m['index']} {os.getpid()}")
+
+
+@_pk.stage
+def _stage_pk(ctx):
+    _append(f"stage pk {ctx.index} {os.getpid()}")
+    return {"name": "pk", "pid": os.getpid(), "index": ctx.index, "where": "ram"}
+
+
+@app.task(name="envtest.use_ea", env=legacy, queue=LQ)
+def use_ea(m=app.use("ea")):
+    return m
+
+
+@app.task(name="envtest.use_eb", env=other, queue=LQ)
+def use_eb(m=app.use("eb")):
+    return m
+
+
+@app.task(name="envtest.use_loc", queue=LQ)
+def use_loc(m=app.use("loc")):
+    return m
+
+
+@app.task(name="envtest.use_pk", env=legacy, queue=LQ)
+def use_pk(m=app.use("pk")):
+    return m
+
+
+@app.task(name="envtest.discard_ea", env=legacy, queue=LQ, max_retries=0)
+def discard_ea(m=app.use("ea")):
+    raise DiscardInstance("broken")
+
+
+@app.task(name="envtest.crash_ea", env=legacy, queue=LQ)
+def crash_ea(path, m=app.use("ea")):
+    if not os.path.exists(path):
+        open(path, "w").close()
+        os._exit(1)
+    return m
+
+
+@app.task(name="envtest.hold", env=legacy, queue=LQ, resources={"gpu": 1})
+def hold(started, go):
+    """Says it started, then waits for `go` to exist; holds the worker's `gpu` meanwhile."""
+    open(started, "w").close()
+    deadline = time.monotonic() + 30
+    while not os.path.exists(go) and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+
+@app.task(name="envtest.big_ram", env=legacy, queue=LQ, resources={"ram_gb": 14})
+def big_ram():
+    return "ran"
+
+
+@app.task(name="envtest.crash_plain", env=legacy, queue=LQ)
+def crash_plain(path):
+    """Kills the child the first time, without using a pool."""
+    if not os.path.exists(path):
+        open(path, "w").close()
+        os._exit(1)
+    return "recovered"
+
+
+@app.task(name="envtest.count_ea", env=legacy, queue=LQ)
+def count_ea(path, m=app.use("ea")):
+    """Counts its runs in `path`, one line per attempt."""
+    with open(path, "a") as f:
+        f.write("x\n")
+    return m
+
+
+@app.task(name="envtest.count_model", env=legacy)
+def count_model(path, m=app.use("model")):
+    with open(path, "a") as f:
+        f.write("x\n")
+    return m
+
+
+@app.task(name="envtest.wait_go", env=legacy, queue=LQ)
+def wait_go(go):
+    deadline = time.monotonic() + 30
+    while not os.path.exists(go) and time.monotonic() < deadline:
+        time.sleep(0.02)
 
 
 # -- declared here, implemented in env_app_impl (which only the child imports) ----------------------------------------

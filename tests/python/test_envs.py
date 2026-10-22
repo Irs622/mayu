@@ -3,12 +3,15 @@ import os
 import pathlib
 import sys
 import time
+import urllib.request
 
 import pytest
 
 import mayu
 from mayu import App, Env, TaskFailed
 from mayu import env as env_module
+from mayu.envproc import _RemotePool
+from mayu.recycle import rss_mb
 from mayu.worker import WorkerRunner
 
 HERE = pathlib.Path(__file__).parent
@@ -135,10 +138,6 @@ def test_bad_env_options_are_rejected(app):
         app.task(env=3)
     with pytest.raises(ValueError, match="bad env name"):
         app.task(env="a,b")
-    with pytest.raises(ValueError, match="eager only"):
-        app.pool("m", env="legacy", linger=5)
-    with pytest.raises(ValueError, match="eager only"):
-        app.pool("m", env="legacy", parked={"ram_gb": 1})
     assert app.pools == {}
 
 
@@ -249,18 +248,19 @@ def test_a_task_and_its_pools_must_share_an_env(app):
         _runner(app2, app_path="m:app", pools={"inner": 1})
 
 
-def test_env_pools_need_eager_mode(app):
+def test_env_pools_work_in_either_pool_mode(app):
     legacy = app.env("legacy", python="p")
-    app.pool("inner", env=legacy)(lambda ctx: None)
+    app.pool("inner", env=legacy, linger=5, parked={"ram_gb": 1}, vram_gb=1)(lambda ctx: None).park(lambda m: None)
+    app.pools["inner"].unpark(lambda m: None)
 
     @app.task(env=legacy)
     def t(m=app.use("inner")): ...
 
-    with pytest.raises(ValueError, match="pools in an env need --pool-mode eager"):
-        _runner(app, app_path="m:app", pools={"inner": 1}, pool_mode="lazy")
-    w = _runner(app, app_path="m:app", pools={"inner": 2})
-    assert w.capacity == {"pool:inner": 2.0}
-    assert w._env_children["legacy"].pools == {"inner": 2}
+    w = _runner(app, app_path="m:app", pools={"inner": 2}, resources={"vram_gb": 4})
+    assert w.capacity == {"vram_gb": 2.0, "pool:inner": 2.0}
+    lazy = _runner(app, app_path="m:app", pools={"inner": 2}, pool_mode="lazy", resources={"vram_gb": 4, "ram_gb": 4})
+    assert lazy.capacity == {"vram_gb": 4.0, "ram_gb": 4.0, "pool:inner": 2.0} and lazy.lazy
+    assert lazy.lazy_pools["inner"][0] == {"vram_gb": 1.0} and lazy._parkable
 
 
 def test_env_pools_reserve_resources_like_any_pool(app):
@@ -395,7 +395,7 @@ def test_non_threadsafe_env_task_runs_one_at_a_time(env_app, worker):
 
 def test_pool_is_built_in_the_child_and_closed_at_stop(env_app, worker):
     with worker(pools={"model": 2}) as w:
-        assert w._states == {}  # the worker holds no instance
+        assert isinstance(w._states["model"].pool, _RemotePool)  # the worker holds handles, not instances
         assert w.capacity == {"pool:model": 2.0}
         seen = [env_app.use_model.send().result(timeout=WAIT) for _ in range(6)]
         assert {m["pid"] for m in seen} != {os.getpid()} and len({m["pid"] for m in seen}) == 1
@@ -453,7 +453,347 @@ def test_child_inherits_the_workers_log_configuration(app, monkeypatch):
 
     monkeypatch.setattr(log, "_configured", ("json", "DEBUG"))
     monkeypatch.setattr(envproc.subprocess, "Popen", popen)
-    child = envproc.EnvChild(None, app.env("legacy", python="p"), "p", "m:app", {}, True, False)
+    child = envproc.EnvChild(None, app.env("legacy", python="p"), "p", "m:app", True, False)
     with pytest.raises(envproc.EnvSpawnError, match="not really starting it"):
         child.start()
     assert (seen["MAYU_LOG_FORMAT"], seen["MAYU_LOG_LEVEL"]) == ("json", "DEBUG")
+
+
+# -- every pool feature in an env ------------------------------------------------------------------------------------
+
+LAZY = dict(pool_mode="lazy", metrics_port=0, metrics_host="127.0.0.1")
+RES = {"vram_gb": 8, "ram_gb": 16, "gpu": 1}
+
+
+@pytest.fixture
+def lazy(env_app, running):
+    """A lazy worker on the queue of env_app's lazy-pool tasks."""
+    def start(**kwargs):
+        kwargs.setdefault("heartbeat_interval", 0.05)
+        kwargs.setdefault("shutdown_grace", 10)
+        kwargs.setdefault("app_path", "env_app:app")
+        kwargs.setdefault("queues", [env_app.LQ])
+        kwargs.setdefault("resources", dict(RES))
+        kwargs.setdefault("threads", 2)
+        # every task on the queue needs its pool sized; a test names the ones it cares about
+        kwargs["pools"] = {**dict.fromkeys(("ea", "eb", "loc", "pk"), 1), **kwargs.get("pools", {})}
+        return running(env_app.app, **{**LAZY, **kwargs})
+
+    return start
+
+
+def _scrape(port):
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5) as r:
+        return r.read().decode()
+
+
+def _series(port, series):
+    for line in _scrape(port).splitlines():
+        if line.startswith(series + " "):
+            return float(line.rsplit(" ", 1)[1])
+    return None
+
+
+def _in_use(w, resource):
+    return next(in_use for name, _, in_use in w.native.resource_usage() if name == resource)
+
+
+def _capacity(w, resource):
+    return next(cap for name, cap, _ in w.native.resource_usage() if name == resource)
+
+
+def _moves(env_app, *ops):
+    """The logged pool moves as (op, pool), in the order they happened, limited to `ops` if given."""
+    return [tuple(line.split()[:2]) for line in _logged(env_app) if not ops or line.split()[0] in ops]
+
+
+def _pids(env_app, op, pool):
+    return [int(line.split()[-1]) for line in _logged(env_app) if line.startswith(f"{op} {pool} ")]
+
+
+def _vram_never_over(env_app, budget, size=6):
+    """Replays the log: builds add `size` GPU memory, closes of an instance on the GPU give it back."""
+    used = 0
+    for line in _logged(env_app):
+        op, pool, _, *rest = line.split()
+        if op == "build" or (op == "unpark"):
+            used += size
+        elif op == "park" or (op == "close" and rest[0] == "gpu"):
+            used -= size
+        assert used <= budget, f"over budget at {line!r}"
+
+
+def test_a_lazy_env_pool_loads_on_the_first_task_and_is_closed_in_the_child(env_app, lazy):
+    with lazy(pools={"ea": 1}) as w:
+        assert _logged(env_app) == [], "nothing is loaded before a task needs it"
+        first = env_app.use_ea.send().result(timeout=WAIT)
+        assert first["pid"] != os.getpid()
+        assert _logged(env_app) == [f"build ea 0 {first['pid']}"]
+        assert env_app.use_ea.send().result(timeout=WAIT)["pid"] == first["pid"]
+        assert len(_logged(env_app)) == 1, "resident: no second build"
+        assert _series(w.metrics_port, 'mayu_pool_loaded{pool="ea"}') == 1.0
+        assert _series(w.metrics_port, 'mayu_pool_loads_total{pool="ea"}') == 1.0
+    assert _logged(env_app)[1:] == [f"close ea 0 gpu {first['pid']}"], "closed in the child at shutdown"
+
+
+def test_preloading_an_env_pool_builds_it_before_any_task(env_app, lazy):
+    with lazy(pools={"ea": 1}, preload=["ea"]) as w:
+        built = _pids(env_app, "build", "ea")
+        assert len(built) == 1 and built[0] != os.getpid()
+        assert _series(w.metrics_port, 'mayu_pool_loaded{pool="ea"}') == 1.0
+        assert env_app.use_ea.send().result(timeout=WAIT)["pid"] == built[0]
+        assert len(_pids(env_app, "build", "ea")) == 1
+
+
+def test_a_model_in_one_env_is_evicted_to_make_room_for_one_in_another(env_app, lazy):
+    with lazy(pools={"ea": 1, "eb": 1}) as w:
+        a1 = env_app.use_ea.send().result(timeout=WAIT)
+        b = env_app.use_eb.send().result(timeout=WAIT)
+        a2 = env_app.use_ea.send().result(timeout=WAIT)
+        assert len({a1["pid"], b["pid"], os.getpid()}) == 3, "two children, apart from the worker"
+        assert a2["pid"] == a1["pid"], "the same legacy child"
+        assert _moves(env_app) == [("build", "ea"), ("close", "ea"), ("build", "eb"), ("close", "eb"),
+                                   ("build", "ea")]
+        assert _pids(env_app, "close", "ea") == [a1["pid"]] and _pids(env_app, "close", "eb") == [b["pid"]]
+        _vram_never_over(env_app, 8)
+        assert _in_use(w, "vram_gb") == 6.0
+        assert _series(w.metrics_port, 'mayu_pool_evictions_total{pool="ea"}') == 1.0
+    assert _moves(env_app)[-1] == ("close", "ea")
+
+
+def test_env_and_in_process_models_share_the_room(env_app, lazy):
+    with lazy(pools={"ea": 1, "loc": 1}):
+        for task in (env_app.use_loc, env_app.use_ea, env_app.use_loc, env_app.use_ea):
+            task.send().result(timeout=WAIT)
+        assert _moves(env_app) == [("build", "loc"), ("close", "loc"), ("build", "ea"), ("close", "ea"),
+                                   ("build", "loc"), ("close", "loc"), ("build", "ea")]
+        assert set(_pids(env_app, "build", "loc")) == {os.getpid()}
+        assert os.getpid() not in _pids(env_app, "build", "ea")
+        _vram_never_over(env_app, 8)
+    assert _logged(env_app)[-1].startswith("close ea 0")
+    assert len([line for line in _logged(env_app) if line.startswith("close")]) == 4  # nothing leaked
+
+
+def test_a_parked_env_pool_is_parked_and_unparked_in_the_child_instead_of_rebuilt(env_app, lazy):
+    with lazy(pools={"pk": 1, "ea": 1}) as w:
+        first = env_app.use_pk.send().result(timeout=WAIT)
+        assert first["where"] == "gpu"
+        env_app.use_ea.send().result(timeout=WAIT)  # no room for both: pk moves to host RAM
+        assert _series(w.metrics_port, 'mayu_pool_parked{pool="pk"}') == 1.0
+        assert _in_use(w, "ram_gb") == 4.0
+        again = env_app.use_pk.send().result(timeout=WAIT)
+        assert again["where"] == "gpu" and again["pid"] == first["pid"]
+        assert _moves(env_app) == [("build", "pk"), ("park", "pk"), ("build", "ea"), ("close", "ea"),
+                                   ("unpark", "pk")]
+        assert _pids(env_app, "park", "pk") == _pids(env_app, "unpark", "pk") == [first["pid"]]
+        assert _series(w.metrics_port, 'mayu_pool_parked{pool="pk"}') == 0.0
+        assert _series(w.metrics_port, 'mayu_pool_move_seconds_count{pool="pk",kind="park"}') == 1.0
+        assert _in_use(w, "ram_gb") == 0.0
+    assert _logged(env_app)[-1].startswith("close pk 0 gpu")
+
+
+def test_a_parked_env_instance_is_dropped_in_the_child_when_its_ram_is_needed(env_app, lazy):
+    with lazy() as w:
+        pid = env_app.use_pk.send().result(timeout=WAIT)["pid"]
+        env_app.use_ea.send().result(timeout=WAIT)  # pk parks (4 of 16 GB of RAM)
+        assert env_app.big_ram.send().result(timeout=WAIT) == "ran"  # 14 GB of RAM: the parked copy has to go
+        assert _moves(env_app) == [("build", "pk"), ("park", "pk"), ("build", "ea"), ("close", "pk")]
+        assert [line for line in _logged(env_app) if line.startswith("close pk")] == [f"close pk 0 ram {pid}"]
+        assert _series(w.metrics_port, 'mayu_pool_drops_total{pool="pk"}') == 1.0
+        assert _series(w.metrics_port, 'mayu_pool_parked{pool="pk"}') == 0.0 and _in_use(w, "ram_gb") == 0.0
+
+
+def test_a_stage_hook_builds_an_env_instance_into_the_parked_state_ahead_of_its_node(env_app, lazy, tmp_path):
+    started, go = tmp_path / "started", tmp_path / "go"
+    wf = env_app.app.workflow("staged")
+    na = wf.add(env_app.hold.s(str(started), str(go)))
+    nb = wf.add(env_app.use_pk, after=[na])
+    with lazy(pools={"pk": 1}, resources={"vram_gb": 7.5, "ram_gb": 16, "gpu": 1}, lookahead=True) as w:
+        try:
+            handle = wf.send()
+            _until(started.exists, "the first node to start")
+            _until(lambda: len(_moves(env_app, "stage")) == 1, "the stage hook to run while the node holds the GPU")
+            _until(lambda: len(_moves(env_app, "unpark")) == 1, "the staged instance to move to the GPU")
+            assert not go.exists()
+        finally:
+            go.touch()
+        got = handle.node(nb).result(timeout=WAIT)
+        assert got["where"] == "gpu" and got["pid"] != os.getpid()
+        assert _moves(env_app) == [("stage", "pk"), ("unpark", "pk")], "the factory never ran"
+        assert _pids(env_app, "stage", "pk") == _pids(env_app, "unpark", "pk") == [got["pid"]]
+        assert _series(w.metrics_port, 'mayu_pool_stages_total{pool="pk"}') == 1.0
+
+
+def test_lookahead_builds_an_env_pool_while_the_node_before_it_runs(env_app, lazy, tmp_path):
+    started, go = tmp_path / "started", tmp_path / "go"
+    wf = env_app.app.workflow("ahead")
+    na = wf.add(env_app.hold.s(str(started), str(go)))
+    nb = wf.add(env_app.use_ea, after=[na])
+    with lazy(pools={"ea": 1}, lookahead=True) as w:
+        try:
+            handle = wf.send()
+            _until(started.exists, "the first node to start")
+            _until(lambda: len(_pids(env_app, "build", "ea")) == 1, "the model to be built ahead")
+            assert not go.exists()
+            _until(lambda: _series(w.metrics_port, 'mayu_pool_lookahead_loads_total{pool="ea"}') == 1.0,
+                   "the lookahead load to be counted")
+        finally:
+            go.touch()
+        got = handle.node(nb).result(timeout=WAIT)
+        assert got["pid"] == _pids(env_app, "build", "ea")[0] and len(_pids(env_app, "build", "ea")) == 1
+
+
+def test_linger_keeps_an_env_model_a_waiting_node_still_needs(env_app, lazy, tmp_path):
+    go = tmp_path / "go"
+    wf = env_app.app.workflow("linger")
+    g1 = wf.add(env_app.use_ea)
+    nc = wf.add(env_app.wait_go.s(str(go)), after=[g1])
+    wf.add(env_app.use_ea, after=[nc])
+    with lazy(pools={"ea": 1, "eb": 1}, threads=3) as w:
+        try:
+            handle = wf.send()
+            handle.node(g1).result(timeout=WAIT)
+            _until(lambda: (_series(w.metrics_port, 'mayu_pool_demand{pool="ea"}') or 0) >= 1.0, "ea to be wanted")
+            lone = env_app.use_eb.send()
+            _until(lambda: _series(w.metrics_port, "mayu_tasks_inflight") == 2.0, "the lone task to wait")
+            assert _pids(env_app, "build", "eb") == [] and _pids(env_app, "close", "ea") == []
+        finally:
+            go.touch()
+        lone.result(timeout=WAIT)
+        assert handle.wait(timeout=WAIT) == "done"
+        assert len(_pids(env_app, "build", "ea")) == 1, "ea stayed for its waiting node"
+
+
+def test_a_discarded_lazy_env_instance_is_closed_and_the_next_task_loads_a_fresh_one(env_app, lazy):
+    with lazy(pools={"ea": 1}) as w:
+        first = env_app.use_ea.send().result(timeout=WAIT)
+        with pytest.raises(TaskFailed, match="DiscardInstance"):
+            env_app.discard_ea.send().result(timeout=WAIT)
+        _until(lambda: _series(w.metrics_port, 'mayu_pool_loaded{pool="ea"}') == 0.0, "the instance to unload")
+        assert _in_use(w, "vram_gb") == 0.0
+        second = env_app.use_ea.send().result(timeout=WAIT)
+        assert second["pid"] == first["pid"]
+        assert _moves(env_app) == [("build", "ea"), ("close", "ea"), ("build", "ea")]
+        assert _series(w.metrics_port, 'mayu_pool_rebuilds_total{pool="ea"}') is None, "lazy: unloaded, not rebuilt"
+
+
+def test_a_discarded_eager_env_instance_is_closed_and_rebuilt_through_the_worker(env_app, worker):
+    with worker(pools={"model": 2}) as w:
+        _until(lambda: _capacity(w, "pool:model") == 2.0, "the pool")
+        with pytest.raises(TaskFailed, match="DiscardInstance"):
+            env_app.discard_model.send().result(timeout=WAIT)
+        _until(lambda: _capacity(w, "pool:model") == 2.0 and len(_logged(env_app)) == 1, "the rebuild")
+        assert _logged(env_app)[0].startswith("closed ")
+        assert len({env_app.use_model.send().result(timeout=WAIT)["serial"] for _ in range(8)}) <= 2
+
+
+def _no_bug(caplog):
+    assert [r.getMessage() for r in caplog.records if "mayu bug" in r.getMessage()] == []
+
+
+def test_a_task_that_finds_a_ghost_revives_it_in_place_and_is_not_retried(env_app, worker, tmp_path, caplog):
+    count = tmp_path / "count"
+    with worker(pools={"model": 2}) as w:
+        before = {env_app.use_model.send().result(timeout=WAIT)["pid"] for _ in range(4)}
+        assert env_app.crash_once.send(str(tmp_path / "flag")).result(timeout=WAIT) == "recovered"
+        # the pool lists and the ledger are untouched by the crash: two ghosts, capacity 2
+        assert _capacity(w, "pool:model") == 2.0 and len(w._states["model"].free) == 2
+        got = env_app.count_model.send(str(count)).result(timeout=WAIT)
+        assert got["pid"] not in before, "revived in the new child"
+        assert count.read_text().splitlines() == ["x"], "the task that hit the ghost ran once"
+        assert _capacity(w, "pool:model") == 2.0 and w._states["model"].size == 2
+        assert env_app.use_model.send().result(timeout=WAIT)["pid"] == got["pid"]
+    _no_bug(caplog)
+
+
+def test_an_eager_env_instance_held_by_a_crashing_task_comes_back_as_a_ghost(env_app, worker, tmp_path, caplog):
+    with worker(pools={"model": 1}) as w:
+        first = env_app.use_model.send().result(timeout=WAIT)
+        env_app.crash_once.send(str(tmp_path / "flag")).result(timeout=WAIT)
+        second = env_app.use_model.send().result(timeout=WAIT)
+        assert second["pid"] != first["pid"]
+        assert _capacity(w, "pool:model") == 1.0
+    _no_bug(caplog)
+
+
+def test_a_ghost_that_was_to_be_evicted_closes_as_a_no_op_and_counts_as_evicted(env_app, lazy, tmp_path, caplog):
+    with lazy() as w:
+        env_app.use_ea.send().result(timeout=WAIT)
+        assert env_app.crash_plain.send(str(tmp_path / "flag")).result(timeout=WAIT) == "recovered"
+        assert _series(w.metrics_port, 'mayu_pool_loaded{pool="ea"}') == 1.0, "the ghost is still counted"
+        b = env_app.use_eb.send().result(timeout=WAIT)  # needs the room the ghost holds
+        assert b["where"] == "gpu"
+        assert _series(w.metrics_port, 'mayu_pool_evictions_total{pool="ea"}') == 1.0
+        assert _series(w.metrics_port, 'mayu_pool_loaded{pool="ea"}') == 0.0
+        assert _in_use(w, "vram_gb") == 6.0
+        assert [line for line in _logged(env_app) if line.startswith("close ea")] == []
+    _no_bug(caplog)
+
+
+def test_lazy_ghosts_idle_and_parked_leave_the_ledger_consistent(env_app, lazy, tmp_path, caplog):
+    with lazy() as w:
+        env_app.use_pk.send().result(timeout=WAIT)
+        env_app.use_ea.send().result(timeout=WAIT)  # pk parked in the child, ea loaded
+        assert env_app.crash_plain.send(str(tmp_path / "flag")).result(timeout=WAIT) == "recovered"
+        # nothing was settled by the crash: both ghosts are still counted
+        assert _series(w.metrics_port, 'mayu_pool_parked{pool="pk"}') == 1.0
+        assert _series(w.metrics_port, 'mayu_pool_loaded{pool="ea"}') == 1.0
+        fresh = env_app.use_pk.send().result(timeout=WAIT)  # the unpark of the ghost fails; a fresh one is built
+        assert fresh["where"] == "gpu" and fresh["pid"] != os.getpid()
+        assert len(_pids(env_app, "build", "pk")) == 2 and _moves(env_app, "unpark") == []
+        assert _series(w.metrics_port, 'mayu_pool_parked{pool="pk"}') == 0.0
+        assert _series(w.metrics_port, 'mayu_pool_loaded{pool="pk"}') == 1.0
+        assert _series(w.metrics_port, 'mayu_pool_loaded{pool="ea"}') == 0.0
+        assert _in_use(w, "vram_gb") == 6.0 and _in_use(w, "ram_gb") == 0.0
+    _no_bug(caplog)
+
+
+def test_a_task_holding_a_lazy_ghost_revives_it_without_a_retry(env_app, lazy, tmp_path, caplog):
+    count = tmp_path / "count"
+    with lazy() as w:
+        env_app.use_ea.send().result(timeout=WAIT)
+        env_app.crash_plain.send(str(tmp_path / "flag")).result(timeout=WAIT)
+        got = env_app.count_ea.send(str(count)).result(timeout=WAIT)
+        assert got["pid"] != os.getpid() and count.read_text().splitlines() == ["x"]
+        assert _series(w.metrics_port, 'mayu_pool_loaded{pool="ea"}') == 1.0
+        assert _in_use(w, "vram_gb") == 6.0
+    _no_bug(caplog)
+
+
+def test_a_worker_without_env_tasks_keeps_plain_pools_and_has_no_child(app, running):
+    from mayu import Pool
+
+    app.pool("plain")(lambda ctx: object())
+
+    @app.task
+    def t(m=app.use("plain")):
+        return type(m).__name__
+
+    with running(app, threads=1, pools={"plain": 1}) as w:
+        assert w._env_children == {} and w._remote == {}
+        assert type(w._states["plain"]) is not _RemotePool and type(w._states["plain"].pool) is Pool
+        assert w._pool("plain") is app.pools["plain"]
+        assert t.send().result(timeout=WAIT) == "object"
+    with running(app, threads=1, pools={"plain": 1}, pool_mode="lazy") as w:
+        assert type(w._states["plain"]).__name__ == "_PoolState" and type(w._states["plain"].pool) is Pool
+
+
+def test_max_memory_per_process_counts_the_env_child(env_app, worker, tmp_path):
+    go = tmp_path / "go"
+    own = rss_mb()
+    with worker(max_memory_per_process=own + 150) as w:
+        assert env_app.add.send(1, 2).result(timeout=WAIT) == 3  # the child exists, and is well under the limit
+        assert w.restart_reason is None
+        try:
+            held = env_app.hold_memory.send(400, str(go))
+            _until(lambda: w.restart_reason, "the worker to ask for a restart", timeout=30)
+        finally:
+            go.touch()
+        assert "memory" in w.restart_reason and "max_memory_per_process" in w.restart_reason
+        assert held.result(timeout=WAIT) == 400 * 1_048_576
+    assert w.restart_reason
+
+
+def test_rss_of_another_process(tmp_path):
+    assert rss_mb(os.getpid()) == pytest.approx(rss_mb(), rel=0.2)
+    assert rss_mb(2**22 + 1) is None

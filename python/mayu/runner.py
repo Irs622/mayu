@@ -1,8 +1,9 @@
 """``python -m mayu.runner``: the child of an env, run by a worker in the env's own interpreter.
 
-It loads the app, builds the env's pools, and runs the tasks the worker sends over the pipes (see `mayu.env` for the
-protocol). The worker owns fetching, acks and retries; the child only reports outcomes, so a crash here means the
-worker settles the in-flight tasks as "run again".
+It loads the app and runs what the worker sends over the pipes (see `mayu.env` for the protocol): tasks, and the
+operations that build, stage, park, unpark and close pool instances. The worker owns fetching, acks, retries and
+every pool's bookkeeping; the child only hosts the instances and reports outcomes, so a crash here means the worker
+settles the in-flight tasks as "run again" and reconciles the instances that died with it.
 """
 import argparse
 import asyncio
@@ -17,6 +18,7 @@ import time
 import traceback
 
 from . import env as wire
+from . import otel
 from .exceptions import Retry, SoftTimeLimitExceeded
 from .limits import TimeLimits
 from .log import configure_logging
@@ -24,7 +26,7 @@ from .pool import PoolContext
 from .progress import _async_current, _slot_local
 from .serializers import for_content_type
 from .supervisor import watch_parent
-from .worker import WorkerRunner, _BadLink, _Held, _PoolState, _with_time_limits
+from .worker import WorkerRunner, _BadLink, _Held, _with_time_limits
 
 log = logging.getLogger("mayu.runner")
 
@@ -83,6 +85,13 @@ class _ChildSlot:
         self.token = None
 
 
+class _PoolRef:
+    """Enough of a `_PoolState` for `WorkerRunner._is_broken`."""
+
+    def __init__(self, pool):
+        self.pool = pool
+
+
 class _Child:
     def __init__(self, app, env: wire.Env, out: _Out, store_result: bool, allow_pickle: bool):
         self.app = app
@@ -90,7 +99,10 @@ class _Child:
         self.out = out
         self.store_result = store_result
         self.allow_pickle = allow_pickle
-        self.states: dict[str, _PoolState] = {}
+        # The instances the worker built, by (pool, index). The lock is taken by operation threads and by a task
+        # thread before its limit is armed, never while a soft-limit exception can be pending.
+        self.instances: dict[tuple[str, int], object] = {}
+        self.ilock = threading.Lock()
         self.limits = TimeLimits()
         self.serial = threading.Lock()  # threadsafe=False tasks run one at a time
         self._threads: set[threading.Thread] = set()
@@ -105,49 +117,62 @@ class _Child:
             except Exception:
                 log.exception("time limit step failed")
 
-    # -- pools ---------------------------------------------------------------
+    # -- pool operations -----------------------------------------------------
 
-    def build_pools(self, pools: dict[str, int]) -> None:
+    def _pool(self, name: str):
+        pool = self.app.pools.get(name)
+        if pool is None:
+            raise RuntimeError(f"the app has no pool {name!r}")
+        if pool.env != self.env.name:
+            raise RuntimeError(f"pool {name!r} belongs to env {pool.env!r}, not {self.env.name!r}")
+        return pool
+
+    def submit_op(self, msg: dict) -> None:
+        self._spawn(self._op, msg)
+
+    def _op(self, msg: dict) -> None:
+        reply = {"t": "opdone", "id": msg["id"], "ok": True}
         try:
-            for name, n in pools.items():
-                pool = self.app.pools.get(name)
-                if pool is None:
-                    raise RuntimeError(f"the app has no pool {name!r}")
-                if pool.env != self.env.name:
-                    raise RuntimeError(f"pool {name!r} belongs to env {pool.env!r}, not {self.env.name!r}")
-                state = self.states[name] = _PoolState(pool, n)
-                for index in range(n):
-                    started = time.monotonic()
-                    try:
-                        instance = pool.factory(PoolContext(name, index, n))
-                    except Exception as e:
-                        raise RuntimeError(f"pool {name!r} instance {index} failed to load: {e!r}") from e
-                    state.push(index, instance)
-                    log.info("pool instance loaded", extra={"pool": name, "index": index, "size": n,
-                                                            "load_seconds": round(time.monotonic() - started, 3)})
-        except BaseException:
-            self.close_pools()
-            raise
+            self._do_op(msg)
+        except BaseException as e:
+            log.exception("%s of pool %r instance %s failed", msg.get("op"), msg.get("pool"), msg.get("index"))
+            reply.update(ok=False, error=repr(e))
+        self.out.put(reply)
 
-    def close_pools(self) -> None:
-        for state in reversed(list(self.states.values())):
-            for _, instance in sorted(state.drain(), key=lambda entry: entry[0], reverse=True):
-                WorkerRunner._close_instance(state.pool, instance)
+    def _do_op(self, msg: dict) -> None:
+        op, name, index = msg["op"], msg["pool"], msg["index"]
+        pool = self._pool(name)
+        key = (name, index)
+        if op in ("build", "stage"):
+            fn = pool.factory if op == "build" else pool.stager
+            if fn is None:
+                raise RuntimeError(f"pool {name!r} has no stage function")
+            instance = fn(PoolContext(name, index, msg["size"]))
+            with self.ilock:
+                self.instances[key] = instance
+        elif op == "close":
+            with self.ilock:
+                instance = self.instances.pop(key, None)
+            if instance is not None and pool.closer is not None:  # a missing one is already closed
+                pool.closer(instance)
+        elif op in ("park", "unpark"):
+            with self.ilock:
+                instance = self.instances.get(key)
+            hook = pool.parker if op == "park" else pool.unparker
+            if instance is None or hook is None:
+                raise RuntimeError(f"pool {name!r} has no instance {index} to {op}" if instance is None
+                                   else f"pool {name!r} has no {op} function")
+            hook(instance)
+        else:
+            raise RuntimeError(f"unknown operation {op!r}")
 
-    def _rebuild(self, h: _Held) -> None:
-        pool, state = h.state.pool, h.state
-        WorkerRunner._close_instance(pool, h.instance)
-        started = time.monotonic()
-        try:
-            fresh = pool.factory(PoolContext(pool.name, h.index, state.target))
-        except Exception:
-            log.exception("rebuilding instance %d of pool %r failed; the pool is one smaller", h.index, pool.name)
-            self.out.put({"t": "rebuilt", "pool": pool.name, "ok": False})
-            return
-        state.push(h.index, fresh)  # before telling the worker, which then grows its ledger
-        self.out.put({"t": "rebuilt", "pool": pool.name, "ok": True})
-        log.info("pool instance rebuilt", extra={"pool": pool.name, "index": h.index,
-                                                 "load_seconds": round(time.monotonic() - started, 3)})
+    def close_all(self) -> None:
+        """Closes what the worker did not (it normally closes every instance before it stops us)."""
+        with self.ilock:
+            left = sorted(self.instances.items(), reverse=True)
+            self.instances.clear()
+        for (name, _), instance in left:
+            WorkerRunner._close_instance(self.app.pools[name], instance)
 
     # -- calls ---------------------------------------------------------------
 
@@ -179,15 +204,13 @@ class _Child:
     def _call(self, msg: dict) -> None:
         call_id = msg["id"]
         _slot_local.slot = slot = _ChildSlot(self.out, threading.get_ident())
-        broken: list[_Held] = []
+        broken: list[str] = []  # params whose instance the task broke; the worker closes and replaces them
         try:
             outcome = self._execute(msg, slot, broken)
         except BaseException as e:  # not expected: _execute turns every task error into an outcome
             outcome = {"o": "fail", "error": repr(e), "traceback": traceback.format_exc()}
-        outcome.update(t="done", id=call_id, broken=[h.state.pool.name for h in broken])
+        outcome.update(t="done", id=call_id, broken=broken)
         self.out.put(outcome)
-        for h in broken:  # after the report: the worker takes the instance out of its ledger first
-            self._spawn(self._rebuild, h)
 
     def _execute(self, msg: dict, slot: _ChildSlot, broken: list) -> dict:
         name = msg["task"]
@@ -203,70 +226,66 @@ class _Child:
             serializer = for_content_type(msg["ct"], allow_pickle=self.allow_pickle)
             args, kwargs, *extra = serializer.loads(msg["payload"])
             links = extra[0].get("links", ()) if extra else ()
+            tp = msg.get("tp")
             if task.is_async:
-                ok, value = True, self._run_async(task, msg["id"], args, kwargs)
+                ok, value = True, self._run_async(task, msg["id"], args, kwargs, tp)
             elif task.threadsafe:
-                ok, value = self._run_sync(task, slot, msg["id"], args, kwargs, broken)
+                ok, value = self._run_sync(task, slot, msg, args, kwargs, broken)
             else:
                 with self.serial:
-                    ok, value = self._run_sync(task, slot, msg["id"], args, kwargs, broken)
+                    ok, value = self._run_sync(task, slot, msg, args, kwargs, broken)
         except BaseException as e:
             return self._error(task, e)
         if not ok:
             return self._error(task, value)
         return self._success(serializer, links, value)
 
-    def _run_async(self, task, call_id: int, args, kwargs):
+    def _run_async(self, task, call_id: int, args, kwargs, tp):
         async def main():
             _async_current.set((self.out, call_id))  # in the task's own context: `mayu.progress` finds it
-            return await _with_time_limits(task.fn(*args, **kwargs), task.soft_time_limit, None)
+            with otel.activate_remote(tp):
+                return await _with_time_limits(task.fn(*args, **kwargs), task.soft_time_limit, None)
 
         return asyncio.run(main())
 
-    def _run_sync(self, task, slot: _ChildSlot, call_id: int, args, kwargs, broken: list) -> tuple[bool, object]:
+    def _run_sync(self, task, slot: _ChildSlot, msg: dict, args, kwargs, broken: list) -> tuple[bool, object]:
         """Mirrors `WorkerRunner._run_sync`: the soft-limit exception can land on any bytecode of this thread from
         arm until disarm returns, so one catch-and-resume loop covers that span and every step in it is idempotent."""
+        call_id = msg["id"]
         held: list[_Held] = []
-        try:
-            for param, name in task.pools.items():
-                state = self.states.get(name)
-                entry = None if state is None else state.take()
-                if entry is None:  # the worker's ledger admitted this task, so an instance must be free
-                    raise RuntimeError(f"pool {name!r} has no free instance; this is a mayu bug")
-                held.append(_Held(param, state, *entry))
-        except Exception:
-            for h in held:
-                h.state.push(h.index, h.instance)
-            raise
+        with self.ilock:  # before the limit is armed
+            for param, (name, index) in (msg.get("pools") or {}).items():
+                instance = self.instances.get((name, index))
+                if instance is None:  # the worker checked it out, so it must have built it
+                    raise RuntimeError(f"pool {name!r} has no instance {index}; this is a mayu bug")
+                held.append(_Held(param, _PoolRef(self.app.pools[name]), index, instance))
         kwargs = {**kwargs, **{h.param: h.instance for h in held}}
         run = outcome = None
         armed = settled = False
-        while not settled:
-            try:
-                if not armed:
-                    run = self.limits.arm(call_id, slot.ident, task.soft_time_limit, None)
-                    armed = True
-                if outcome is None:
-                    slot.token = call_id
-                    try:
-                        outcome = (True, task.fn(*args, **kwargs))
-                    except BaseException as e:
-                        outcome = (False, e)
-                    slot.token = None
-                if run is not None:
-                    self.limits.disarm(run)
-                settled = True
-            except SoftTimeLimitExceeded as e:
-                slot.token = None  # the limit can land between the body and the clear above
-                if outcome is None:
-                    outcome = (False, e)  # the limit fired before/around the task body
-                # otherwise it landed after the task finished: drop it and finish settling
+        with otel.activate_remote(msg.get("tp")):  # attached before arm and detached after disarm, like the span
+            while not settled:
+                try:
+                    if not armed:
+                        run = self.limits.arm(call_id, slot.ident, task.soft_time_limit, None)
+                        armed = True
+                    if outcome is None:
+                        slot.token = call_id
+                        try:
+                            outcome = (True, task.fn(*args, **kwargs))
+                        except BaseException as e:
+                            outcome = (False, e)
+                        slot.token = None
+                    if run is not None:
+                        self.limits.disarm(run)
+                    settled = True
+                except SoftTimeLimitExceeded as e:
+                    slot.token = None  # the limit can land between the body and the clear above
+                    if outcome is None:
+                        outcome = (False, e)  # the limit fired before/around the task body
+                    # otherwise it landed after the task finished: drop it and finish settling
         ok, value = outcome
-        for h in held:  # healthy instances go back before the report: it frees the worker's `pool:` slot
-            if not ok and WorkerRunner._is_broken(h, value):
-                broken.append(h)
-            else:
-                h.state.push(h.index, h.instance)
+        if not ok:
+            broken.extend(h.param for h in held if WorkerRunner._is_broken(h, value))
         return outcome
 
     def _success(self, serializer, links, value) -> dict:
@@ -306,9 +325,7 @@ def _load(args, start: dict, out: _Out) -> _Child:
         raise RuntimeError(f"the app has no env {args.env!r}; declare it with app.env({args.env!r}, python=...)")
     for module in env.imports:
         importlib.import_module(module)
-    child = _Child(app, env, out, bool(start.get("store_result")), bool(start.get("allow_pickle")))
-    child.build_pools(start.get("pools") or {})
-    return child
+    return _Child(app, env, out, bool(start.get("store_result")), bool(start.get("allow_pickle")))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -345,8 +362,10 @@ def main(argv: list[str] | None = None) -> int:
             break
         if msg.get("t") == "run":
             child.submit(msg)
+        elif msg.get("t") == "op":
+            child.submit_op(msg)
     child.wait()
-    child.close_pools()
+    child.close_all()
     out.close()
     return 0
 

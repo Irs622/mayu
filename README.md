@@ -635,14 +635,26 @@ Tasks without `env=` are unaffected, and a worker that serves none starts no chi
   parent: it kills the child, fails that task with `TimeLimitExceeded`, and retries the task's
   neighbours in that child. The next call starts a fresh child (backing off from 1 s to 30 s if it
   can't), so there are no zombies.
-- **Pools:** `@app.pool(..., env=...)` instances are built in the child at startup (sized by `--pools`,
-  reserved like any pool) and rebuilt there after `DiscardInstance`. A task and its pools must have the
-  same env, and env pools need `--pool-mode eager`.
+- **Pools:** `@app.pool(..., env=...)` instances live in the child and have every feature of a pool in the
+  worker: eager and `--pool-mode lazy`, `--preload`, `--schedule`, `--lookahead`, `linger=`, `parked=` with
+  `@park`, `@unpark` and `@stage`, and `DiscardInstance` / `discard_on` (the instance is closed and rebuilt, or
+  unloaded in lazy mode). The factory and the hooks run in the child, so the module that declares the pool and its
+  hooks must also import in the worker, with any library only the env has imported inside the function bodies.
+  The worker keeps the bookkeeping of every pool and tells the child what to build, close, park and unpark, so
+  all pools, in the worker or in any env, share one ledger: with a GPU that holds one model, a task for a model in
+  one env evicts (or parks) the model of another env or of the worker to make room. A task and its pools must
+  have the same env. When a child dies its instances are kept as placeholders and the ledger is left alone:
+  whatever needs one next settles it (a task rebuilds it in place in the new child, an eviction closes it as a
+  no-op, an unpark of a parked one builds a fresh model), and the task that finds one is not retried.
 - **Version:** the interpreter needs mayu with the same major.minor installed (`pip install mayu` in
   that venv); the Python version may differ.
-- **Limits:** `--max-memory-per-process` and `--max-tasks-per-process` look at the parent only, tracing
-  spans are recorded in the parent, and a `threadsafe=False` task is serialized in the child, not in the
-  parent. A parent slot is held while its call runs, so `--threads` bounds concurrency per env too.
+- **Tracing:** with OpenTelemetry installed in both interpreters, spans a task starts in the child nest under the
+  worker's `process <task>` span, so they join the producer's trace. The child exports them itself: configure its
+  tracer provider where your app is imported.
+- **Memory and limits:** `--max-memory-per-process` compares the worker's memory plus its children's with the limit
+  (on Linux, from `/proc`; a worker with no env tasks looks at itself only). `--max-tasks-per-process` counts every
+  task. A `threadsafe=False` task is serialized in the child, not in the parent. A parent slot is held while its
+  call runs, so `--threads` bounds concurrency per env too.
 
 ## Declaring tasks without their code
 

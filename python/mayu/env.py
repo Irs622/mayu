@@ -4,11 +4,15 @@ This module holds what the worker (parent) and ``mayu.runner`` (child) share: `E
 length-prefixed msgpack over two pipes. Messages are maps with a type in ``t``:
 
   child -> parent  hello (protocol, mayu, python, gil, pid), ready, fatal (message), done (id, o, ...),
-                   progress (id, done, total), rebuilt (pool, ok)
-  parent -> child  start (pools, store_result, allow_pickle), run (id, task, ct, payload), stop
+                   progress (id, done, total), opdone (id, ok, error)
+  parent -> child  start (store_result, allow_pickle), run (id, task, ct, payload, pools, tp), op (id, op, pool,
+                   index, size), stop
 
-``done`` carries ``o``: ``ok`` (result, links), ``retry`` (ms, error) or ``fail`` (error, traceback), and ``broken``,
-the pools whose instance the task broke.
+The child only hosts pool instances, keyed by ``(pool, index)``; the worker keeps all the bookkeeping and drives
+every step. ``op`` is ``build`` or ``stage`` (with ``size``), or ``close``, ``park`` or ``unpark``, and is answered
+by ``opdone``. ``run`` names the instances the task uses as ``pools`` = ``{param: [pool, index]}`` and carries the
+parent's traceparent ``tp`` (or None). ``done`` carries ``o``: ``ok`` (result, links), ``retry`` (ms, error) or
+``fail`` (error, traceback), and ``broken``, the params whose instance the task broke.
 """
 import dataclasses
 import importlib.metadata
@@ -21,7 +25,7 @@ import msgpack
 
 from .pool import _BAD_NAME
 
-PROTOCOL = 1
+PROTOCOL = 2
 _LEN = struct.Struct(">I")
 
 

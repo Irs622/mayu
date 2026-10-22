@@ -30,6 +30,28 @@ def start_send(task_name: str, queue: str):
     return span, carrier.get("traceparent")
 
 
+def inject(span) -> str | None:
+    """The `traceparent` of `span`, for a child process to continue; None without OpenTelemetry or a span."""
+    if span is None or _trace is None:
+        return None
+    carrier: dict = {}
+    _propagate.inject(carrier, context=_trace.set_span_in_context(span))
+    return carrier.get("traceparent")
+
+
+@contextlib.contextmanager
+def activate_remote(traceparent: str | None):
+    """Makes the span a `traceparent` names current in this thread (or coroutine); a no-op without one."""
+    if not traceparent or _trace is None:
+        yield
+        return
+    token = _context.attach(_propagate.extract({"traceparent": traceparent}))
+    try:
+        yield
+    finally:
+        _context.detach(token)
+
+
 def set_message_id(span, task_id: str) -> None:
     if span is not None:
         span.set_attribute("messaging.message.id", task_id)
