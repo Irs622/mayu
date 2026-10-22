@@ -14,6 +14,7 @@ from . import thp as thp_mod
 from .exceptions import DiscardInstance, Retry, SoftTimeLimitExceeded, TimeLimitExceeded
 from .limits import TimeLimits
 from .pool import PoolContext, check_pool_name
+from .progress import _async_current, _slot_local
 from .recycle import rss_mb
 from .serializers import for_content_type
 from .task import check_resources
@@ -35,7 +36,8 @@ def _ms(seconds: float) -> int:
     return max(1, int(seconds * 1000))
 
 
-async def _in_span(span, coro):
+async def _in_span(span, coro, native, token):
+    _async_current.set((native, token))  # in the task's own context: `mayu.progress` finds its task
     with otel.activate(span):
         return await coro
 
@@ -63,9 +65,11 @@ class _BadLink(Exception):
 class _Slot:
     """One task-running OS thread. A zombie's thread is abandoned: never joined, given no new work."""
 
-    def __init__(self, name: str, serial: bool = False):
+    def __init__(self, name: str, serial: bool = False, native=None):
         self.name = name
         self.serial = serial
+        self.native = native  # what `mayu.progress` reports through
+        self.token = None  # the task body running on this thread, set only around the call
         self.thread: threading.Thread | None = None
         self.ident: int | None = None
         self.zombie = False
@@ -1081,7 +1085,7 @@ class WorkerRunner:
     def _start_slot(self, serial: bool = False) -> _Slot:
         with self._slots_lock:
             kind = "serial" if serial else "worker"
-            slot = _Slot(f"mayu-{kind}-{self._slot_seq}", serial=serial)
+            slot = _Slot(f"mayu-{kind}-{self._slot_seq}", serial=serial, native=self.native)
             self._slot_seq += 1
             self._slots.append(slot)
         target = self._serial_main if serial else self._thread_main
@@ -1103,6 +1107,7 @@ class WorkerRunner:
 
     def _thread_main(self, slot: _Slot) -> None:
         slot.ident = threading.get_ident()
+        _slot_local.slot = slot
         native = self.native
         while self._running.is_set() and not slot.zombie:
             ready = native.recv(_RECV_TIMEOUT_MS)
@@ -1111,6 +1116,7 @@ class WorkerRunner:
 
     def _serial_main(self, slot: _Slot) -> None:
         slot.ident = threading.get_ident()
+        _slot_local.slot = slot
         while not slot.zombie:
             try:
                 token, task, serializer, args, kwargs, links, plan = self._serial_q.get(
@@ -1242,13 +1248,16 @@ class WorkerRunner:
                                                context=(task, slot))
                         armed = True
                     if outcome is None:
+                        slot.token = token
                         try:
                             outcome = (True, task.fn(*args, **kwargs))
                         except BaseException as e:
                             outcome = (False, e)
+                        slot.token = None
                     owned = run is None or self._limits.disarm(run)
                     settled = True
                 except SoftTimeLimitExceeded as e:
+                    slot.token = None  # the limit can land between the body and the clear above
                     if outcome is None:
                         outcome = (False, e)  # the limit fired before/around the task body
                     # otherwise it landed after the task finished: drop it and finish settling
@@ -1266,7 +1275,8 @@ class WorkerRunner:
 
     def _submit_async(self, token, task, serializer, args, kwargs, links=()) -> None:
         coro = _in_span(self._span(token),
-                        _with_time_limits(task.fn(*args, **kwargs), task.soft_time_limit, task.hard_time_limit))
+                        _with_time_limits(task.fn(*args, **kwargs), task.soft_time_limit, task.hard_time_limit),
+                        self.native, token)
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         with self._pending_lock:
             self._pending_async.add(fut)

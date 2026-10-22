@@ -404,7 +404,7 @@ impl<B: Broker> Runtime<B> {
         let now = Instant::now();
         let mut m = self.inflight.lock().unwrap();
         let Some(f) = m.get_mut(&token) else { return false };
-        match &mut f.progress {
+        let ok = match &mut f.progress {
             Some(p) => p.report(now, done, total),
             none => match Progress::new(now, done, total) {
                 Some(p) => {
@@ -413,7 +413,11 @@ impl<B: Broker> Runtime<B> {
                 }
                 None => false,
             },
+        };
+        if ok {
+            self.metrics.progress_reported(&f.delivery.queue, &f.delivery.header.task);
         }
+        ok
     }
 
     /// Tasks running now, oldest first, at most `MAX_PUBLISHED`.

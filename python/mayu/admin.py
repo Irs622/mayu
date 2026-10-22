@@ -17,9 +17,17 @@ def _workflows(client) -> list[dict]:
     return [{k: w[k] for k in keep} for w in client.workflows() if w["state"] != "done"]
 
 
+def _running(workers: list[dict]) -> list[dict]:
+    """Tasks the workers last published as running, oldest first (as fresh as each worker's last heartbeat)."""
+    keys = ("task", "id", "done", "total", "fraction", "remaining_s", "workflow_id", "node", "started_ms")
+    out = [{"worker": w["worker_id"], **{k: t[k] for k in keys}} for w in workers for t in w["tasks"]]
+    return sorted(out, key=lambda t: t["started_ms"])
+
+
 def inspect(app, queues: list[str] | None = None) -> dict:
     client = app.client
-    out = {"queues": {}, "workers": client.workers(), "workflows": _workflows(client)}
+    workers = client.workers()
+    out = {"queues": {}, "workers": workers, "running": _running(workers), "workflows": _workflows(client)}
     for q in _queues(app, queues):
         s = client.queue_stats(q)
         out["queues"][q] = {"ready": max(0, s["stream"] - s["pending"]), "claimed": s["pending"],
@@ -41,6 +49,13 @@ def _ago(ms: int) -> str:
     return f"{s // 3600}h{s % 3600 // 60}m"
 
 
+def _progress_cell(t: dict) -> str:
+    if t["fraction"] is None:
+        return "-"
+    pct = f"{round(t['fraction'] * 100)} %"
+    return f"{t['done']:g}/{t['total']:g} ({pct})" if t["total"] is not None else pct
+
+
 def format_inspect(data: dict, now_ms: int) -> str:
     rows = [["QUEUE", "READY", "CLAIMED", "DELAYED", "DEAD"]]
     for q, s in data["queues"].items():
@@ -55,6 +70,13 @@ def format_inspect(data: dict, now_ms: int) -> str:
         parts.append(_table(wrows))
     else:
         parts.append("(none)")
+    if data.get("running"):  # only when something runs, so an idle `inspect` reads as it always did
+        parts += ["", f"RUNNING ({len(data['running'])})"]
+        rrows = [["TASK", "ID", "WORKER", "PROGRESS", "LEFT", "WORKFLOW"]]
+        for t in data["running"]:
+            left = "-" if t["remaining_s"] is None else "~" + _ago(int(t["remaining_s"] * 1000))
+            rrows.append([t["task"], t["id"], t["worker"], _progress_cell(t), left, t["workflow_id"] or "-"])
+        parts.append(_table(rrows))
     parts += ["", f"WORKFLOWS ({len(data['workflows'])})"]
     if data["workflows"]:
         frows = [["ID", "NAME", "STATE", "WAITING", "QUEUED", "DONE", "DEAD", "AGE"]]

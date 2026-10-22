@@ -66,6 +66,7 @@ struct Counters {
     pool_stages: BTreeMap<String, u64>,
     /// (pool, kind) -> (moves, seconds); only pools that can park report these.
     pool_moves: BTreeMap<(String, &'static str), (u64, f64)>,
+    progress_reports: BTreeMap<Key, u64>,
 }
 
 /// Sampled when `/metrics` is scraped.
@@ -149,6 +150,11 @@ impl Metrics {
 
     pub fn broker_error(&self, op: &'static str) {
         *self.c.lock().unwrap().broker_errors.entry(op).or_default() += 1;
+    }
+
+    /// A running task's progress report was recorded.
+    pub fn progress_reported(&self, queue: &str, task: &str) {
+        *self.c.lock().unwrap().progress_reports.entry(key(queue, task)).or_default() += 1;
     }
 
     pub fn pool_rebuilt(&self, pool: &str) {
@@ -278,6 +284,12 @@ impl Metrics {
             for ((p, kind), (n, secs)) in &c.pool_moves {
                 sample(&mut out, "mayu_pool_move_seconds_sum", &[("pool", p), ("kind", kind)], secs);
                 sample(&mut out, "mayu_pool_move_seconds_count", &[("pool", p), ("kind", kind)], n);
+            }
+        }
+        if !c.progress_reports.is_empty() {
+            family(&mut out, "mayu_task_progress_reports_total", "counter", "Progress reports recorded from running tasks.");
+            for ((q, t), n) in &c.progress_reports {
+                sample(&mut out, "mayu_task_progress_reports_total", &[("queue", q), ("task", t)], n);
             }
         }
         drop(c);
@@ -428,6 +440,16 @@ mod tests {
         assert_eq!(value(&b, r#"mayu_tasks_deferred_total{queue="q",task="t"}"#), Some(1.0));
         assert_eq!(value(&b, r#"mayu_tasks_reclaimed_total{queue="q"}"#), Some(1.0));
         assert_eq!(value(&b, r#"mayu_broker_errors_total{op="fetch"}"#), Some(1.0));
+    }
+
+    #[test]
+    fn progress_reports_are_counted_and_only_emitted_once_seen() {
+        let m = Metrics::default();
+        assert!(!m.render(&Gauges::default()).contains("mayu_task_progress_reports_total"));
+        m.progress_reported("q", "t");
+        m.progress_reported("q", "t");
+        let b = m.render(&Gauges::default());
+        assert_eq!(value(&b, r#"mayu_task_progress_reports_total{queue="q",task="t"}"#), Some(2.0));
     }
 
     #[test]
