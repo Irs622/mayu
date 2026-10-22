@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
@@ -12,6 +12,7 @@ use crate::dispatch::{Admit, Dispatcher, ReadyQueue, Resources, Schedule};
 use crate::broker::{Broker, Delivery, StoredResult, WorkerInfo};
 use crate::envelope::{Header, now_ms};
 use crate::error::{Error, Result};
+use crate::eta::{self, Durations, MoveKind, PoolEta};
 use crate::metrics::{Gauges, GpuStat, Metrics, Settled};
 use crate::policy::{Action, Outcome, RetryPolicy, decide, full_jitter};
 use crate::result::ResultRecord;
@@ -181,6 +182,14 @@ impl Active {
     }
 }
 
+/// What the progress estimate knows. Exists when a lazy pool can park; only used for ordering and staging
+/// when `--lookahead` is on too, so every other worker never touches it.
+struct EtaState {
+    durations: Mutex<Durations>,
+    /// (pool, seconds until next needed) as last computed by the lookahead loop; pools with no need left out.
+    needs: Mutex<Vec<(String, f64)>>,
+}
+
 pub struct Runtime<B: Broker> {
     rt: tokio::runtime::Runtime,
     broker: Arc<B>,
@@ -192,6 +201,10 @@ pub struct Runtime<B: Broker> {
     metrics: Arc<Metrics>,
     metrics_addr: Option<SocketAddr>,
     handles: Mutex<Option<Handles>>,
+    /// Lazy pools, and the ones that can park (a parked claim); pool moves are only recorded for the latter.
+    pools: HashSet<String>,
+    parkable: HashSet<String>,
+    eta: Option<Arc<EtaState>>,
 }
 
 impl<B: Broker> Runtime<B> {
@@ -241,6 +254,16 @@ impl<B: Broker> Runtime<B> {
         let lookahead = !cfg.resources.lazy.is_empty()
             && (cfg.lookahead || cfg.resources.lazy.values().any(|p| p.linger.is_some()));
         let active = lookahead.then(|| Arc::new(Active::new()));
+        let pools: HashSet<String> = cfg.resources.lazy.keys().cloned().collect();
+        let mut parkable: Vec<String> = cfg.resources.lazy.iter()
+            .filter(|(_, p)| !p.parked_claim.is_empty()).map(|(n, _)| n.clone()).collect();
+        parkable.sort();
+        let eta = (!parkable.is_empty()).then(|| Arc::new(EtaState {
+            durations: Mutex::new(Durations::default()),
+            needs: Mutex::new(Vec::new()),
+        }));
+        // Run times are only gathered, and needs only computed, for a worker that can use them to park or stage.
+        let eta_in_use = if cfg.lookahead && lookahead { eta.clone() } else { None };
 
         let fetch = rt.spawn(critical("fetch", fetch_loop(FetchCtx {
             broker: broker.clone(),
@@ -269,6 +292,7 @@ impl<B: Broker> Runtime<B> {
             Duration::from_millis(cfg.visibility_timeout_ms),
             metrics.clone(),
             active.clone(),
+            eta_in_use.clone(),
         )));
         let promote = rt.spawn(critical("promote",
             promote_loop(broker.clone(), cfg.queues.clone(), cfg.promote_interval_ms, stop_rx.clone(), metrics.clone())));
@@ -281,6 +305,8 @@ impl<B: Broker> Runtime<B> {
                 pools: cfg.resources.lazy.keys().cloned().collect(),
                 stop: stop_rx,
                 metrics: metrics.clone(),
+                inflight: inflight.clone(),
+                eta: eta_in_use,
             })))
         });
         let keepalive = rt.spawn(critical("keepalive",
@@ -309,9 +335,11 @@ impl<B: Broker> Runtime<B> {
                 let (b, m, inf, queues, concurrency) =
                     (broker.clone(), metrics.clone(), inflight.clone(), cfg.queues.clone(), cfg.concurrency);
                 let ready = ready.clone();
+                let pv = Arc::new(PoolView { parkable: parkable.clone(), eta: eta.clone() });
                 let render: crate::http::Render = Arc::new(move || {
                     let (b, m, inf, queues, ready) = (b.clone(), m.clone(), inf.clone(), queues.clone(), ready.clone());
-                    Box::pin(async move { scrape(&*b, &m, &inf, &ready, &queues, concurrency, lookahead).await })
+                    let pv = pv.clone();
+                    Box::pin(async move { scrape(&*b, &m, &inf, &ready, &pv, &queues, concurrency, lookahead).await })
                 });
                 // Not `critical`: a broken metrics endpoint must not take the worker down.
                 (Some(rt.spawn(crate::http::serve(l, render))), Some(addr))
@@ -331,6 +359,9 @@ impl<B: Broker> Runtime<B> {
             handles: Mutex::new(Some(Handles {
                 fetch, complete, promote, keepalive, heartbeat, lookahead: lookahead_task, metrics: metrics_task,
             })),
+            pools,
+            parkable: parkable.into_iter().collect(),
+            eta,
         })
     }
 
@@ -414,6 +445,81 @@ impl<B: Broker> Runtime<B> {
     /// See `Dispatcher::lookahead_done`.
     pub fn lookahead_done(&self, pool: &str, ok: bool) -> Result<()> {
         self.ready.lookahead_done(pool, ok)
+    }
+
+    /// See `Dispatcher::stage_begin`.
+    pub fn stage_begin(&self) -> Option<String> {
+        self.ready.stage_begin()
+    }
+
+    /// See `Dispatcher::stage_done`.
+    pub fn stage_done(&self, pool: &str, ok: bool) -> Result<()> {
+        self.ready.stage_done(pool, ok)
+    }
+
+    /// See `Dispatcher::park_failed`.
+    pub fn park_failed(&self, pool: &str) -> Result<()> {
+        self.ready.park_failed(pool)
+    }
+
+    /// See `Dispatcher::unpark_failed`.
+    pub fn unpark_failed(&self, pool: &str) -> Result<()> {
+        self.ready.unpark_failed(pool)
+    }
+
+    /// (pool, instances parked or being staged) for each lazy pool.
+    pub fn parked_usage(&self) -> Vec<(String, u32)> {
+        self.ready.parked_usage()
+    }
+
+    /// A lazy pool instance was moved to host RAM (after the move).
+    pub fn pool_parked(&self, pool: &str) {
+        self.metrics.pool_parked(pool);
+    }
+
+    /// A lazy pool instance was moved back from host RAM (after the move).
+    pub fn pool_unparked(&self, pool: &str) {
+        self.metrics.pool_unparked(pool);
+    }
+
+    /// A parked lazy pool instance was closed to make room (after the close).
+    pub fn pool_dropped(&self, pool: &str) {
+        self.metrics.pool_dropped(pool);
+    }
+
+    /// A lazy pool instance was built straight into host RAM (after the build).
+    pub fn pool_staged(&self, pool: &str) {
+        self.metrics.pool_staged(pool);
+    }
+
+    /// Reports how long a `build`, `stage`, `park` or `unpark` of a pool instance took. Stage and unpark times
+    /// set how early a stage is due (`Dispatcher::set_move_times`). Ignored for a pool that can't park, so a
+    /// worker without parked pools reports nothing new. An unknown pool is an error.
+    pub fn pool_timing(&self, pool: &str, kind: MoveKind, secs: f64) -> Result<()> {
+        if !self.pools.contains(pool) {
+            return Err(Error::Config(format!("{pool:?} is not a lazy pool")));
+        }
+        let Some(eta) = self.eta.as_ref().filter(|_| self.parkable.contains(pool)) else { return Ok(()) };
+        let (stage, unpark) = {
+            let mut d = eta.durations.lock().unwrap();
+            if d.record_move(pool, kind, secs).is_none() {
+                return Ok(());
+            }
+            (d.move_secs(pool, MoveKind::Stage), d.move_secs(pool, MoveKind::Unpark))
+        };
+        self.metrics.pool_move(pool, kind.as_str(), secs);
+        if matches!(kind, MoveKind::Stage | MoveKind::Unpark) {
+            self.ready.set_move_times(pool, stage, unpark)?;
+        }
+        Ok(())
+    }
+
+    /// Seeds the run time the progress estimate assumes for `task`, as if it had run for `secs`. For tests.
+    #[doc(hidden)]
+    pub fn seed_task_secs(&self, task: &str, secs: f64) {
+        if let Some(eta) = &self.eta {
+            eta.durations.lock().unwrap().record_task(task, secs);
+        }
     }
 
     /// See `Dispatcher::blocked`.
@@ -776,6 +882,7 @@ async fn completion_loop<B: Broker>(
     record_deadline: Duration,
     metrics: Arc<Metrics>,
     active: Option<Arc<Active>>,
+    eta: Option<Arc<EtaState>>,
 ) {
     // Outcomes are decided here, in order, but written concurrently: a write is one broker round
     // trip, and awaiting each before taking the next capped a worker at 1 / RTT. Each write holds
@@ -831,6 +938,9 @@ async fn completion_loop<B: Broker>(
             Record::Retry(_) => Settled::Retry,
             Record::Dead(..) => Settled::Dead,
         };
+        if let (Some(eta), Settled::Success, Some(started)) = (&eta, how, started) {
+            eta.durations.lock().unwrap().record_task(&d.header.task, started.elapsed().as_secs_f64());
+        }
         // Buffer through broker outages (bounded by the prefetch permits this message holds).
         let (broker, metrics, sem) = (broker.clone(), metrics.clone(), sem.clone());
         let active = active.clone().filter(|_| d.header.workflow_id.is_some());
@@ -904,6 +1014,9 @@ struct LookaheadCtx<B> {
     pools: Vec<String>,
     stop: watch::Receiver<bool>,
     metrics: Arc<Metrics>,
+    inflight: Inflight,
+    /// Some when pools park and `--lookahead` is on: the loop also estimates when each pool is next needed.
+    eta: Option<Arc<EtaState>>,
 }
 
 /// Served task -> the lazy pools its request names as `pool:<name>`; tasks using none are left out.
@@ -934,9 +1047,23 @@ async fn lookahead_loop<B: Broker>(mut c: LookaheadCtx<B>) {
         let ids: Vec<String> = c.active.seen.lock().unwrap().keys().cloned().collect();
         let mut demand: HashMap<&str, u32> = c.pools.iter().map(|p| (p.as_str(), 0)).collect();
         let mut finished = Vec::new();
+        // Run times so far, and how long each task this worker runs has been going (by task id).
+        let (durations, elapsed) = match &c.eta {
+            Some(eta) => {
+                let elapsed: HashMap<String, f64> = c.inflight.lock().unwrap().values()
+                    .filter_map(|f| Some((f.delivery.header.id.clone(), f.started?.elapsed().as_secs_f64())))
+                    .collect();
+                (eta.durations.lock().unwrap().clone(), elapsed)
+            }
+            None => (Durations::default(), HashMap::new()),
+        };
+        let mut etas: HashMap<String, PoolEta> = HashMap::new();
         for id in ids {
             match c.broker.workflow(&id).await {
                 Ok(Some(wf)) if wf.summary().state == "running" => {
+                    if c.eta.is_some() {
+                        eta::add_workflow(&mut etas, &wf, &durations, &elapsed, &c.task_pools);
+                    }
                     for n in wf.nodes.iter().filter(|n| matches!(n.state, NodeState::Waiting | NodeState::Queued)) {
                         for p in c.task_pools.get(&n.task).into_iter().flatten() {
                             if let Some(d) = demand.get_mut(p.as_str()) {
@@ -959,7 +1086,22 @@ async fn lookahead_loop<B: Broker>(mut c: LookaheadCtx<B>) {
             }
         }
         let demand: Vec<(String, u32)> = demand.into_iter().map(|(p, n)| (p.to_string(), n)).collect();
-        c.ready.set_demand(&demand);
+        let Some(eta) = &c.eta else {
+            c.ready.set_demand(&demand);
+            continue;
+        };
+        let needs: Vec<(String, u32, Option<f64>)> = demand.into_iter().map(|(p, n)| {
+            let e = etas.get(&p);
+            if let Some(e) = e.filter(|_| n > 0) {
+                tracing::debug!(pool = %p, next_need = ?e.next_need, done = e.done, total = e.total, "pool progress");
+            }
+            let next = e.and_then(|e| e.next_need).filter(|_| n > 0);
+            (p, n, next)
+        }).collect();
+        let mut known: Vec<(String, f64)> = needs.iter().filter_map(|(p, _, s)| Some((p.clone(), (*s)?))).collect();
+        known.sort_by(|a, b| a.0.cmp(&b.0));
+        *eta.needs.lock().unwrap() = known;
+        c.ready.set_needs(&needs);
     }
 }
 
@@ -1039,12 +1181,21 @@ async fn heartbeat_loop<B: Broker>(
     }
 }
 
+/// What a scrape needs to report about parkable pools.
+struct PoolView {
+    /// Sorted.
+    parkable: Vec<String>,
+    eta: Option<Arc<EtaState>>,
+}
+
 /// One `/metrics` body: counters, process gauges, and queue depths if the broker answers in time.
+#[allow(clippy::too_many_arguments)]
 async fn scrape<B: Broker>(
     broker: &B,
     metrics: &Metrics,
     inflight: &Inflight,
     ready: &ReadyQueue,
+    pools: &PoolView,
     queues: &[String],
     concurrency: usize,
     lookahead: bool,
@@ -1069,8 +1220,16 @@ async fn scrape<B: Broker>(
         }
     }
     let demand = if lookahead { ready.demand() } else { Vec::new() };
+    // Only pools that can park report parked instances and needs, so other workers' output is unchanged.
+    let parked = if pools.parkable.is_empty() {
+        Vec::new()
+    } else {
+        ready.parked_usage().into_iter().filter(|(p, _)| pools.parkable.contains(p)).collect()
+    };
+    let next_need = pools.eta.as_ref().map(|e| e.needs.lock().unwrap().clone()).unwrap_or_default();
     metrics.render(&Gauges {
         concurrency, inflight: n, running, queues: stats, resources: ready.usage(), loaded: ready.lazy_usage(), demand,
+        parked, next_need,
     })
 }
 

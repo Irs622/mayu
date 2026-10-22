@@ -2,6 +2,7 @@ pub mod broker;
 pub mod dispatch;
 pub mod envelope;
 pub mod error;
+pub mod eta;
 mod http;
 pub mod memory;
 pub mod metrics;
@@ -19,6 +20,7 @@ pub use envelope::{
     Header, decode_delayed_member, decode_header, encode_delayed_member, encode_header, now_ms,
 };
 pub use error::{Error, Result};
+pub use eta::{Durations, MoveKind};
 pub use memory::{DeadEntry, MemoryBroker};
 pub use metrics::{DURATION_BUCKETS, Gauges, GpuStat, Metrics, Settled};
 pub use policy::{Action, Link, Outcome, RetryPolicy, backoff_ms, decide, full_jitter};

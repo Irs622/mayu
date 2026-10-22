@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use mayu_core::{
-    Broker, GpuStat, Header, LazyPool, Link, Outcome, ReadyTask, Resources, Runtime, RuntimeConfig, Schedule, WorkflowNode,
-    WorkflowSpec, WorkflowState,
+    Broker, GpuStat, Header, LazyPool, Link, MoveKind, Outcome, ReadyTask, Resources, Runtime, RuntimeConfig, Schedule,
+    WorkflowNode, WorkflowSpec, WorkflowState,
 };
 use mayu_redis::RedisBroker;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -22,13 +22,33 @@ fn core_err(e: mayu_core::Error) -> PyErr {
     }
 }
 
-/// pool name -> (resources one loaded instance holds, instances loaded at start, idle seconds to linger)
-type LazyPoolArgs = HashMap<String, (HashMap<String, f64>, u32, Option<f64>)>;
+/// (resources one loaded instance holds, instances loaded at start, idle seconds to linger)
+type LazyArgs = (HashMap<String, f64>, u32, Option<f64>);
+
+/// `LazyArgs`, then what one parked instance holds and whether an instance can be staged.
+type ParkableArgs = (HashMap<String, f64>, u32, Option<f64>, HashMap<String, f64>, bool);
+
+/// A pool's settings: `LazyArgs`, and optionally what one parked instance holds and whether it can be staged.
+/// The shorter form is what a worker without parked pools passes.
+#[derive(FromPyObject)]
+enum LazyPoolArg {
+    Parkable(ParkableArgs),
+    Plain(LazyArgs),
+}
+
+/// pool name -> its settings
+type LazyPoolArgs = HashMap<String, LazyPoolArg>;
 
 /// (index, uuid, utilization, memory used, memory total, process memory, power watts, temperature C)
 type GpuArgs = (u32, String, f64, u64, u64, Option<u64>, Option<f64>, Option<f64>);
 
-fn lazy_pool(name: &str, (claim, loaded, linger): (HashMap<String, f64>, u32, Option<f64>)) -> PyResult<LazyPool> {
+fn lazy_pool(name: &str, arg: LazyPoolArg) -> PyResult<LazyPool> {
+    let ((claim, loaded, linger), parked_claim, stageable) = match arg {
+        LazyPoolArg::Parkable((claim, loaded, linger, parked_claim, stageable)) => {
+            ((claim, loaded, linger), parked_claim, stageable)
+        }
+        LazyPoolArg::Plain(args) => (args, HashMap::new(), false),
+    };
     let linger = linger
         .map(|secs| match Duration::try_from_secs_f64(secs) {
             Ok(d) if !d.is_zero() => Ok(d),
@@ -37,7 +57,7 @@ fn lazy_pool(name: &str, (claim, loaded, linger): (HashMap<String, f64>, u32, Op
             ))),
         })
         .transpose()?;
-    Ok(LazyPool { claim, loaded, linger, ..Default::default() })
+    Ok(LazyPool { claim, loaded, linger, parked_claim, stageable })
 }
 
 /// (task, queue, payload, content_type, max_retries, parents, trace_ctx)
@@ -357,16 +377,71 @@ impl Worker {
         self.inner.pool_lookahead_loaded(name);
     }
 
-    /// Lazy pools: a pool name means the ledger already counts one more instance of it as loading; build it
-    /// and call `lookahead_done`. None when there is nothing to load ahead.
-    fn lookahead_begin(&self) -> Option<String> {
-        // Plan 15 Task 2 passes the kind on; without parking every grant is a build.
-        self.inner.lookahead_begin().map(|(_, name)| name)
+    /// Lazy pools: `(kind, pool)` means the ledger already counts one more instance of the pool as loading;
+    /// build it (kind "build") or move the parked one back (kind "unpark") and call `lookahead_done`. None when
+    /// there is nothing to load ahead.
+    fn lookahead_begin(&self) -> Option<(&'static str, String)> {
+        self.inner.lookahead_begin().map(|(kind, name)| (kind.as_str(), name))
     }
 
     /// Lazy pools: the instance from `lookahead_begin` is built (`ok`) or its build failed.
     fn lookahead_done(&self, name: &str, ok: bool) -> PyResult<()> {
         self.inner.lookahead_done(name, ok).map_err(core_err)
+    }
+
+    /// Lazy pools: a pool name means the ledger already counts a new parked instance of it as staging; build it
+    /// straight into the parked state and call `stage_done`. None when no stage is due.
+    fn stage_begin(&self) -> Option<String> {
+        self.inner.stage_begin()
+    }
+
+    /// Lazy pools: the instance from `stage_begin` is built and parked (`ok`) or its build failed.
+    fn stage_done(&self, name: &str, ok: bool) -> PyResult<()> {
+        self.inner.stage_done(name, ok).map_err(core_err)
+    }
+
+    /// Lazy pools: the park hook of an instance a task was told to park raised; the instance is closed instead.
+    fn park_failed(&self, name: &str) -> PyResult<()> {
+        self.inner.park_failed(name).map_err(core_err)
+    }
+
+    /// Lazy pools: the unpark hook of an instance a task was told to unpark raised; the instance is closed and
+    /// the task builds a fresh one.
+    fn unpark_failed(&self, name: &str) -> PyResult<()> {
+        self.inner.unpark_failed(name).map_err(core_err)
+    }
+
+    /// Lazy pools: how long a "build", "stage", "park" or "unpark" of an instance took, in seconds.
+    fn pool_timing(&self, name: &str, kind: &str, secs: f64) -> PyResult<()> {
+        let kind = MoveKind::parse(kind).ok_or_else(|| {
+            PyValueError::new_err(format!("pool timing kind must be build, stage, park or unpark, got {kind:?}"))
+        })?;
+        self.inner.pool_timing(name, kind, secs).map_err(core_err)
+    }
+
+    /// Lazy pools: an instance was moved to host RAM.
+    fn pool_parked(&self, name: &str) {
+        self.inner.pool_parked(name);
+    }
+
+    /// Lazy pools: an instance was moved back from host RAM.
+    fn pool_unparked(&self, name: &str) {
+        self.inner.pool_unparked(name);
+    }
+
+    /// Lazy pools: a parked instance was closed to make room.
+    fn pool_dropped(&self, name: &str) {
+        self.inner.pool_dropped(name);
+    }
+
+    /// Lazy pools: an instance was built straight into host RAM.
+    fn pool_staged(&self, name: &str) {
+        self.inner.pool_staged(name);
+    }
+
+    /// (pool, instances parked or being staged) for each lazy pool.
+    fn parked_usage(&self) -> Vec<(String, u32)> {
+        self.inner.parked_usage()
     }
 
     /// Due tasks that need `resource` and don't fit now.

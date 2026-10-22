@@ -1212,7 +1212,6 @@ impl ReadyQueue {
     }
 
     /// See `Dispatcher::set_needs`; wakes waiters like `set_demand`.
-    #[allow(dead_code)] // Plan 15 Task 2 calls it from the runtime
     pub(crate) fn set_needs(&self, needs: &[(String, u32, Option<f64>)]) {
         if self.inner.lock().unwrap().set_needs(needs) {
             self.cv.notify_all();
@@ -1224,7 +1223,6 @@ impl ReadyQueue {
     }
 
     /// See `Dispatcher::set_move_times`.
-    #[allow(dead_code)] // Plan 15 Task 2 calls it from the runtime
     pub(crate) fn set_move_times(&self, pool: &str, stage: Option<f64>, unpark: Option<f64>) -> Result<()> {
         self.inner.lock().unwrap().set_move_times(pool, stage, unpark)
     }
@@ -1242,13 +1240,11 @@ impl ReadyQueue {
     }
 
     /// See `Dispatcher::stage_begin`.
-    #[allow(dead_code)] // Plan 15 Task 2 calls it from the runtime
     pub(crate) fn stage_begin(&self) -> Option<String> {
         self.inner.lock().unwrap().stage_begin(Instant::now())
     }
 
     /// See `Dispatcher::stage_done`. The instance may be what a waiter unparks, or its room is free again.
-    #[allow(dead_code)] // Plan 15 Task 2 calls it from the runtime
     pub(crate) fn stage_done(&self, pool: &str, ok: bool) -> Result<()> {
         self.inner.lock().unwrap().stage_done(pool, ok, Instant::now())?;
         self.cv.notify_all();
@@ -1256,7 +1252,6 @@ impl ReadyQueue {
     }
 
     /// See `Dispatcher::park_failed`. The closed instance's room is free again.
-    #[allow(dead_code)] // Plan 15 Task 2 calls it from the runtime
     pub(crate) fn park_failed(&self, pool: &str) -> Result<()> {
         self.inner.lock().unwrap().park_failed(pool)?;
         self.cv.notify_all();
@@ -1264,7 +1259,6 @@ impl ReadyQueue {
     }
 
     /// See `Dispatcher::unpark_failed`.
-    #[allow(dead_code)] // Plan 15 Task 2 calls it from the runtime
     pub(crate) fn unpark_failed(&self, pool: &str) -> Result<()> {
         self.inner.lock().unwrap().unpark_failed(pool)
     }
@@ -1278,7 +1272,6 @@ impl ReadyQueue {
         self.inner.lock().unwrap().lazy_usage()
     }
 
-    #[allow(dead_code)] // Plan 15 Task 2 calls it from the runtime
     pub(crate) fn parked_usage(&self) -> Vec<(String, u32)> {
         self.inner.lock().unwrap().parked_usage()
     }

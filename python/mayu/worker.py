@@ -665,14 +665,20 @@ class WorkerRunner:
         """Builds the models the dispatcher grants ahead of the tasks that will need them."""
         while not self._lookahead_stop.is_set():
             try:
-                name = self.native.lookahead_begin()
+                grant = self.native.lookahead_begin()
             except Exception:
                 log.exception("asking for a model to load ahead failed")
-                name = None
-            if name is None:
+                grant = None
+            if grant is None:
                 self._lookahead_stop.wait(LOOKAHEAD_POLL)
-            else:
-                self._lookahead_load(name)
+                continue
+            kind, name = grant
+            if kind != "build":  # only pools that can park get unparks, and none can until the pool API exists
+                log.error("lookahead granted a %r of pool %r, which this worker cannot do; this is a mayu bug",
+                          kind, name, extra={"pool": name})
+                self._lookahead_done(name, False)
+                continue
+            self._lookahead_load(name)
 
     def _lookahead_load(self, name: str) -> None:
         state = self._states[name]

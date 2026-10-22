@@ -115,6 +115,8 @@ pub struct NodeInfo {
     pub task: String,
     pub queue: String,
     pub state: NodeState,
+    /// Indexes of the node's parents. Empty for roots, and for hashes written before `up` was read back.
+    pub parents: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

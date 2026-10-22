@@ -383,3 +383,152 @@ fn lookahead_passthroughs_follow_the_ledger() {
     assert_eq!(value(&scrape(&rt), r#"mayu_pool_lookahead_loads_total{pool="tts"}"#), Some(1.0));
     rt.shutdown(Duration::from_secs(1));
 }
+
+/// One lazy pool `tts` (the `voice` task) that parks 6.6 GB of host RAM and can be staged.
+fn parked_cfg() -> RuntimeConfig {
+    use mayu_core::dispatch::LazyPool;
+    RuntimeConfig {
+        resources: Resources {
+            capacity: [
+                ("vram_gb".to_string(), 7.5), ("ram_gb".to_string(), 16.0), ("pool:tts".to_string(), 1.0),
+            ].into(),
+            requests: [("voice".to_string(), [("pool:tts".to_string(), 1.0)].into())].into(),
+            lazy: [(
+                "tts".to_string(),
+                LazyPool {
+                    claim: [("vram_gb".to_string(), 7.2)].into(),
+                    parked_claim: [("ram_gb".to_string(), 6.6)].into(),
+                    stageable: true,
+                    ..Default::default()
+                },
+            )].into(),
+        },
+        schedule: Schedule::Throughput,
+        lookahead: true,
+        ..cfg(4, 2)
+    }
+}
+
+const NEW_FAMILIES: [&str; 7] = [
+    "mayu_pool_parked", "mayu_pool_parks_total", "mayu_pool_unparks_total", "mayu_pool_drops_total",
+    "mayu_pool_stages_total", "mayu_pool_move_seconds", "mayu_pool_next_need_seconds",
+];
+
+fn next_need(rt: &Runtime<MemoryBroker>) -> Option<f64> {
+    value(&scrape(rt), r#"mayu_pool_next_need_seconds{pool="tts"}"#)
+}
+
+/// encode1/2/3 -> voice, all three encodes running and `voice` waiting; their means are 40, 20 and 10 s.
+fn start_encodes(cfg: RuntimeConfig) -> (MemoryBroker, Runtime<MemoryBroker>, Vec<mayu_core::ReadyTask>) {
+    let mem = MemoryBroker::default();
+    let wf = WorkflowSpec::new("w", 3600, vec![
+        wf_node("e1", &[]), wf_node("e2", &[]), wf_node("e3", &[]), wf_node("voice", &[0, 1, 2]),
+    ]);
+    submit(&mem, &wf);
+    let rt = start(&mem, cfg);
+    for (task, secs) in [("e1", 40.0), ("e2", 20.0), ("e3", 10.0)] {
+        rt.seed_task_secs(task, secs);
+    }
+    let mut running: Vec<_> = (0..3).map(|_| rt.recv_timeout(RECV).expect("an encode")).collect();
+    running.sort_by(|a, b| a.task.cmp(&b.task));
+    (mem, rt, running)
+}
+
+fn succeed(rt: &Runtime<MemoryBroker>, t: &mayu_core::ReadyTask) {
+    rt.complete(t.token, Outcome::Success { result: None, links: vec![] });
+}
+
+#[test]
+fn next_need_falls_as_encodes_finish_and_a_stage_is_granted_inside_its_lead_while_a_task_runs() {
+    let (_mem, rt, e) = start_encodes(parked_cfg());
+    wait_until(|| next_need(&rt).is_some_and(|s| s > 35.0 && s <= 40.0));
+    assert_eq!(rt.stage_begin(), None, "voice is needed in ~40 s, the lead is 15 s");
+    succeed(&rt, &e[0]);
+    wait_until(|| next_need(&rt).is_some_and(|s| s > 15.0 && s <= 20.0));
+    assert_eq!(rt.stage_begin(), None, "~20 s away is still outside the lead");
+    succeed(&rt, &e[1]);
+    wait_until(|| next_need(&rt).is_some_and(|s| s > 5.0 && s <= 10.0));
+    // e3 is still running: unlike a lookahead load, a stage uses no GPU resource and goes ahead.
+    assert_eq!(rt.inflight(), 1);
+    assert_eq!(rt.stage_begin().as_deref(), Some("tts"));
+    assert_eq!(rt.stage_begin(), None, "one at a time");
+    assert_eq!(rt.parked_usage(), vec![("tts".to_string(), 1)]);
+    let body = scrape(&rt);
+    assert_eq!(value(&body, r#"mayu_pool_parked{pool="tts"}"#), Some(1.0));
+    assert_eq!(value(&body, r#"mayu_resource_in_use{resource="ram_gb"}"#), Some(6.6));
+    rt.stage_done("tts", true).unwrap();
+    rt.pool_staged("tts");
+    assert_eq!(value(&scrape(&rt), r#"mayu_pool_stages_total{pool="tts"}"#), Some(1.0));
+    assert!(matches!(rt.stage_done("tts", true), Err(Error::Config(_))), "nothing is staging");
+    succeed(&rt, &e[2]);
+    // voice is queued now, so tts is needed right away.
+    wait_until(|| next_need(&rt) == Some(0.0));
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn the_stage_lead_follows_the_reported_stage_and_unpark_times() {
+    let (_mem, rt, e) = start_encodes(parked_cfg());
+    rt.pool_timing("tts", mayu_core::MoveKind::Stage, 2.0).unwrap();
+    rt.pool_timing("tts", mayu_core::MoveKind::Unpark, 1.0).unwrap();
+    succeed(&rt, &e[0]);
+    succeed(&rt, &e[1]);
+    wait_until(|| next_need(&rt).is_some_and(|s| s > 5.0 && s <= 10.0));
+    assert_eq!(rt.stage_begin(), None, "lead is 2 + 1 + 5 = 8 s, voice is ~10 s away");
+    succeed(&rt, &e[2]);
+    wait_until(|| next_need(&rt) == Some(0.0));
+    assert_eq!(rt.stage_begin().as_deref(), Some("tts"));
+    let body = scrape(&rt);
+    assert_eq!(value(&body, r#"mayu_pool_move_seconds_sum{pool="tts",kind="stage"}"#), Some(2.0));
+    assert_eq!(value(&body, r#"mayu_pool_move_seconds_count{pool="tts",kind="unpark"}"#), Some(1.0));
+    assert!(matches!(rt.pool_timing("nope", mayu_core::MoveKind::Stage, 1.0), Err(Error::Config(_))));
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn completions_teach_the_estimate() {
+    let mem = MemoryBroker::default();
+    let first = WorkflowSpec::new("w1", 3600, vec![wf_node("e1", &[])]);
+    submit(&mem, &first);
+    let rt = start(&mem, parked_cfg());
+    let e = rt.recv_timeout(RECV).unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    succeed(&rt, &e);
+    wait_until(|| workflow_state(&mem, &first.id) == "done");
+    // A second workflow with the same task, not yet started: voice is a run of e1 away.
+    submit(&mem, &WorkflowSpec::new("w2", 3600, vec![wf_node("e1", &[]), wf_node("voice", &[0])]));
+    wait_until(|| next_need(&rt).is_some_and(|s| s > 0.3 && s < 1.5));
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn a_parkable_worker_without_lookahead_reports_no_needs() {
+    let (_mem, rt, _e) = start_encodes(RuntimeConfig { lookahead: false, ..parked_cfg() });
+    let body = scrape(&rt);
+    assert_eq!(value(&body, r#"mayu_pool_parked{pool="tts"}"#), Some(0.0), "the parkable pool reports its gauge");
+    assert!(!body.contains("mayu_pool_next_need_seconds"), "{body}");
+    assert_eq!(rt.stage_begin(), None, "nothing is due without needs");
+    rt.shutdown(Duration::from_secs(1));
+}
+
+#[test]
+fn a_lookahead_worker_without_parkable_pools_exposes_no_new_families() {
+    let mem = MemoryBroker::default();
+    let wf = WorkflowSpec::new("w", 3600, vec![wf_node("a", &[]), wf_node("t", &[0])]);
+    submit(&mem, &wf);
+    let rt = start(&mem, RuntimeConfig { lookahead: true, ..lazy_cfg() });
+    let a = rt.recv_timeout(RECV).expect("node a");
+    wait_until(|| value(&scrape(&rt), r#"mayu_pool_demand{pool="tts"}"#) == Some(1.0));
+    rt.pool_loaded("tts");
+    rt.pool_timing("tts", mayu_core::MoveKind::Build, 1.5).unwrap(); // a pool that can't park reports nothing
+    assert!(matches!(rt.pool_timing("nope", mayu_core::MoveKind::Build, 1.5), Err(Error::Config(_))));
+    succeed(&rt, &a);
+    wait_until(|| value(&scrape(&rt), r#"mayu_tasks_settled_total{queue="q",task="a",outcome="success"}"#) == Some(1.0));
+    let body = scrape(&rt);
+    for name in NEW_FAMILIES {
+        assert!(!body.contains(name), "{name} appears in:\n{body}");
+    }
+    let families: Vec<&str> = body.lines().filter_map(|l| l.strip_prefix("# TYPE ")?.split(' ').next()).collect();
+    assert!(families.contains(&"mayu_pool_demand") && families.contains(&"mayu_pool_loads_total"), "{families:?}");
+    rt.shutdown(Duration::from_secs(1));
+}
