@@ -528,6 +528,21 @@ impl PyReadyTask {
     fn evicts(&self) -> Vec<String> {
         self.0.evicts.clone()
     }
+    /// Lazy pools to move an idle instance of to host RAM, after `evicts`, one entry per instance.
+    #[getter]
+    fn parks(&self) -> Vec<String> {
+        self.0.parks.clone()
+    }
+    /// Lazy pools to move a parked instance of back instead of building one, after `parks`.
+    #[getter]
+    fn unparks(&self) -> Vec<String> {
+        self.0.unparks.clone()
+    }
+    /// Lazy pools to close a parked instance of before anything else, one entry per instance.
+    #[getter]
+    fn drops(&self) -> Vec<String> {
+        self.0.drops.clone()
+    }
     fn __repr__(&self) -> String {
         format!("ReadyTask(id={:?}, task={:?}, attempt={})", self.0.id, self.0.task, self.0.attempt)
     }

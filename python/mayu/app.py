@@ -90,18 +90,27 @@ class App:
             raise TypeError(f"unknown task option(s) {sorted(unknown)}; valid options: {sorted(_TASK_OPTIONS)}")
         return register(fn) if fn is not None else register
 
-    def pool(self, name: str, /, *, discard_on=(), linger: float | None = None, **resources):
+    def pool(self, name: str, /, *, discard_on=(), linger: float | None = None, parked: dict | None = None,
+             **resources):
         """Decorator registering ``fn(ctx)`` as the factory of a pool; resources are per instance.
 
         ``linger`` (lazy mode only) keeps an idle instance for that many seconds while a running workflow still
-        has a node waiting for it."""
+        has a node waiting for it. ``parked`` (lazy mode only) is what one parked instance holds, like
+        ``{"ram_gb": 6.6}``: instead of closing an idle instance to make room, the worker moves it there with the
+        pool's ``@park`` hook and moves it back with ``@unpark``; ``@stage`` can build one straight into that state.
+        Eager mode ignores ``linger`` and ``parked``."""
         check_pool_name(name)
         linger = check_linger(linger)
+        if parked is not None:
+            parked = check_resources(f"parked of pool {name!r}", parked)
+            if not parked:
+                raise ValueError(f"parked of pool {name!r} names no resource; give what a parked instance holds, "
+                                 f"like parked={{'ram_gb': 6.6}}, or leave it out")
         resources = check_resources(f"resources of pool {name!r}", resources)
         discard_on = check_discard_on(discard_on)
 
         def register(factory):
-            pool = Pool(self, name, factory, resources, discard_on, linger)
+            pool = Pool(self, name, factory, resources, discard_on, linger, parked)
             with self._registry_lock:
                 if name in self.pools:
                     raise ValueError(f"pool {name!r} is already registered")

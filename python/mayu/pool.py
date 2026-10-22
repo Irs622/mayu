@@ -65,10 +65,13 @@ def check_linger(linger) -> float | None:
 
 
 class Pool:
-    """A pool made with ``app.pool``; ``@pool.close`` registers the function that unloads an instance."""
+    """A pool made with ``app.pool``; ``@pool.close`` registers the function that unloads an instance.
+
+    ``@pool.park`` / ``@pool.unpark`` / ``@pool.stage`` register the hooks of a pool declared with ``parked=``
+    (lazy mode only)."""
 
     def __init__(self, app, name: str, factory, resources: dict[str, float], discard_on: tuple,
-                 linger: float | None = None):
+                 linger: float | None = None, parked: dict[str, float] | None = None):
         if not callable(factory):
             raise TypeError(f"the factory of pool {name!r} must be callable, got {factory!r}")
         self.app = app
@@ -77,18 +80,39 @@ class Pool:
         self.resources = resources
         self.discard_on = discard_on
         self.linger = linger  # lazy mode only
+        self.parked = parked  # lazy mode only: what one parked instance holds, or None if the pool cannot park
         self.closer = None
+        self.parker = None
+        self.unparker = None
+        self.stager = None
         self._lock = threading.Lock()
 
     def __repr__(self) -> str:
         return f"<Pool {self.name!r}>"
 
     def close(self, fn):
-        """Registers ``fn(instance)``, called when an instance is discarded and when the worker stops."""
+        """Registers ``fn(instance)``, called when an instance is discarded and when the worker stops.
+
+        On a pool with ``parked=`` it also gets instances in the parked state, so it must handle both."""
+        return self._register("closer", "close", fn)
+
+    def park(self, fn):
+        """Registers ``fn(instance)``, which moves an idle instance out of its scarce memory (say GPU to host RAM)."""
+        return self._register("parker", "park", fn)
+
+    def unpark(self, fn):
+        """Registers ``fn(instance)``, which moves a parked instance back, in place."""
+        return self._register("unparker", "unpark", fn)
+
+    def stage(self, fn):
+        """Registers ``fn(ctx)``, which builds an instance straight into the parked state (it must not use the GPU)."""
+        return self._register("stager", "stage", fn)
+
+    def _register(self, attr: str, what: str, fn):
         if not callable(fn):
-            raise TypeError(f"the close function of pool {self.name!r} must be callable, got {fn!r}")
+            raise TypeError(f"the {what} function of pool {self.name!r} must be callable, got {fn!r}")
         with self._lock:
-            if self.closer is not None:
-                raise ValueError(f"pool {self.name!r} already has a close function")
-            self.closer = fn
+            if getattr(self, attr) is not None:
+                raise ValueError(f"pool {self.name!r} already has a {what} function")
+            setattr(self, attr, fn)
         return fn
