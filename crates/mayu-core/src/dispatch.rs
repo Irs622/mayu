@@ -325,16 +325,13 @@ impl Lazy {
                 touched[r] |= m > 0;
             }
         }
+        // An unpark's parked claim is not credited here: parks run before unparks (they free the GPU room the
+        // unpark needs), so for a moment both are in host RAM, and a park must fit alongside it.
         for &p in &unparks {
             let pool = &self.pools[p];
             for &(r, m) in &pool.claim {
                 used[r] += m as i64 - pool.parked_m(r) as i64;
                 touched[r] |= m > pool.parked_m(r);
-            }
-            for &(r, pm) in &pool.parked_claim {
-                if pool.claim_m(r) == 0 {
-                    used[r] -= pm as i64;
-                }
             }
         }
         let over = |sim: &Sim, r: usize| touched[r] && sim.used[r] > capacity[r] as i64;
@@ -2812,6 +2809,27 @@ mod tests {
         assert_eq!(plan_of(&t), [vec![], names(&["tts"]), vec![], vec![], names(&["gemma"])]);
         assert_eq!(in_use(&d, "ram_gb"), 3.0);
         assert_eq!(parked(&d), vec![("gemma".into(), 0), ("tts".into(), 0)]);
+    }
+
+    #[test]
+    fn a_park_never_counts_on_the_ram_the_unpark_will_free() {
+        // Room for one parked model: parking gemma while tts is still parked would hold both for a moment.
+        let mut d = parking(
+            &[("vram_gb", 7.5), ("ram_gb", 8.0), ("pool:gemma", 1.0), ("pool:tts", 1.0)],
+            &[("g", &[("pool:gemma", 1.0)]), ("t", &[("pool:tts", 1.0)])],
+            &[
+                ("gemma", &[("vram_gb", 7.4)], &[("ram_gb", 6.6)]),
+                ("tts", &[("vram_gb", 7.2)], &[("ram_gb", 6.6)]),
+            ],
+        );
+        let t0 = Instant::now();
+        run(&mut d, 1, "t", t0);
+        assert_eq!(plan_of(&run(&mut d, 2, "g", t0)), [vec![], vec![], names(&["tts"]), vec![], names(&["gemma"])]);
+        d.push(task(3, "t", "q"), t0);
+        let t = d.pop(t0).unwrap();
+        assert_eq!(plan_of(&t), [vec![], names(&["gemma"]), vec![], names(&["tts"]), vec![]]);
+        assert_eq!(in_use(&d, "ram_gb"), 0.0);
+        assert_eq!(in_use(&d, "vram_gb"), 7.2);
     }
 
     /// ram_gb 9: y (parks 2.0), w and gemma (park 6.6 each), one at a time on the GPU. y is parked first, then w.
