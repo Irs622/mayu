@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use mayu_core::{Broker, MemoryBroker, RunningTask, WorkerInfo};
+use mayu_core::{Broker, MemoryBroker, PublishedTasks, RunningTask, WorkerInfo};
 
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
@@ -49,5 +49,26 @@ fn running_is_empty_once_the_heartbeat_expires_or_the_worker_leaves() {
         assert!(b.running("w").await.unwrap().is_empty(), "expired");
         b.unregister("x").await.unwrap();
         assert!(b.running("x").await.unwrap().is_empty(), "unregistered");
+    });
+}
+
+#[test]
+fn running_all_lists_live_workers_tasks_and_skips_expired_ones() {
+    rt().block_on(async {
+        let b = MemoryBroker::default();
+        assert_eq!(b.running_all().await.unwrap(), PublishedTasks::default());
+        b.heartbeat(&info("w2", vec![task("c", true)]), 60_000).await.unwrap();
+        b.heartbeat(&info("w1", vec![task("a", true), task("b", false)]), 60_000).await.unwrap();
+        b.heartbeat(&info("idle", vec![]), 60_000).await.unwrap();
+        b.heartbeat(&info("gone", vec![task("d", true)]), 40).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let all = b.running_all().await.unwrap();
+        assert_eq!(all.malformed, 0);
+        let got: Vec<(&str, &str)> = all.tasks.iter().map(|(w, t)| (w.as_str(), t.id.as_str())).collect();
+        assert_eq!(got, vec![("w1", "a"), ("w1", "b"), ("w2", "c")], "sorted by worker, expired ones skipped");
+        assert_eq!(all.tasks[0].1, task("a", true));
+        b.fail_running_all(true);
+        assert!(b.running_all().await.is_err());
+        assert_eq!(b.running_all_calls(), 3);
     });
 }

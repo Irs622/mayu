@@ -878,7 +878,13 @@ class WorkerRunner:
                       extra={"pool": name})
             self._stage_done(name, False)
             return
-        log.info("staging pool %s into host RAM", name, extra={"pool": name, "index": index})
+        need = self.native.pool_need(name)
+        if need is None:
+            log.info("staging pool %s into host RAM", name, extra={"pool": name, "index": index})
+        else:
+            secs, done, total = need
+            log.info("staging pool %s into host RAM: needed in ~%.0f s (%d/%d of its tasks done)",
+                     name, secs, done, total, extra={"pool": name, "index": index, "needed_in": round(secs, 1)})
         started = time.monotonic()
         try:
             instance = state.pool.stager(PoolContext(name, index, state.target))

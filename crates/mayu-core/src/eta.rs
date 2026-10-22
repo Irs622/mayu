@@ -96,14 +96,34 @@ pub struct NodeTimes {
     pub finish: f64,
 }
 
+/// A task already running, by task id in the map `node_times` takes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Running {
+    /// Seconds since it started, as this worker saw it. 0 for a task on another worker (not used there: it has
+    /// a `remaining` or isn't listed).
+    pub elapsed: f64,
+    /// Seconds left according to the task's own progress reports; None when it reports none or too few.
+    pub remaining: Option<f64>,
+}
+
+impl Running {
+    /// What is left of the task: its progress estimate if it has one, else what is left of the mean.
+    fn left(&self, mean: f64) -> f64 {
+        match self.remaining {
+            Some(r) if r.is_finite() => r.max(0.0),
+            _ => (mean - self.elapsed).max(0.0),
+        }
+    }
+}
+
 /// The forward pass over one workflow. Nodes are in topological order (parents precede children), so one
 /// sweep gives every node its times:
 /// - finished nodes: nothing left, both 0;
-/// - a queued node starts now, and finishes after its mean run time; if this worker runs it
-///   (`elapsed`, by task id: seconds since it started) only what is left of the mean, never negative;
+/// - a queued node starts now, and finishes after its mean run time; if it is `running` (by task id) only what
+///   is left: its own progress estimate when it has one, else what is left of the mean, never negative;
 /// - a waiting node starts when the last of its unfinished parents finishes (the longest path) and finishes
 ///   one mean run time later.
-pub fn node_times(wf: &WorkflowState, durations: &Durations, elapsed: &HashMap<String, f64>) -> Vec<NodeTimes> {
+pub fn node_times(wf: &WorkflowState, durations: &Durations, running: &HashMap<String, Running>) -> Vec<NodeTimes> {
     let mut times: Vec<NodeTimes> = Vec::with_capacity(wf.nodes.len());
     for node in &wf.nodes {
         let t = match node.state {
@@ -112,7 +132,7 @@ pub fn node_times(wf: &WorkflowState, durations: &Durations, elapsed: &HashMap<S
             }
             NodeState::Queued => {
                 let mean = durations.task_secs(&node.task);
-                let left = elapsed.get(&node.task_id).map_or(mean, |e| (mean - e).max(0.0));
+                let left = running.get(&node.task_id).map_or(mean, |r| r.left(mean));
                 NodeTimes { finished: false, start: 0.0, finish: left }
             }
             NodeState::Waiting => {
@@ -144,13 +164,13 @@ pub fn add_workflow(
     acc: &mut HashMap<String, PoolEta>,
     wf: &WorkflowState,
     durations: &Durations,
-    elapsed: &HashMap<String, f64>,
+    running: &HashMap<String, Running>,
     task_pools: &HashMap<String, Vec<String>>,
 ) {
     if !wf.nodes.iter().any(|n| task_pools.contains_key(&n.task)) {
         return;
     }
-    let times = node_times(wf, durations, elapsed);
+    let times = node_times(wf, durations, running);
     for (node, t) in wf.nodes.iter().zip(&times) {
         for pool in task_pools.get(&node.task).into_iter().flatten() {
             let e = acc.entry(pool.clone()).or_default();
@@ -197,8 +217,18 @@ mod tests {
         d
     }
 
-    fn starts(w: &WorkflowState, d: &Durations, elapsed: &HashMap<String, f64>) -> Vec<f64> {
-        node_times(w, d, elapsed).iter().map(|t| t.start).collect()
+    fn starts(w: &WorkflowState, d: &Durations, running: &HashMap<String, Running>) -> Vec<f64> {
+        node_times(w, d, running).iter().map(|t| t.start).collect()
+    }
+
+    /// Tasks running for the given seconds, with no progress estimate.
+    fn since(pairs: &[(&str, f64)]) -> HashMap<String, Running> {
+        pairs.iter().map(|(id, e)| (id.to_string(), Running { elapsed: *e, remaining: None })).collect()
+    }
+
+    /// Tasks with a progress estimate of the given seconds left (elapsed 0, as for a task on another worker).
+    fn left(pairs: &[(&str, f64)]) -> HashMap<String, Running> {
+        pairs.iter().map(|(id, r)| (id.to_string(), Running { elapsed: 0.0, remaining: Some(*r) })).collect()
     }
 
     fn pools(pairs: &[(&str, &str)]) -> HashMap<String, Vec<String>> {
@@ -257,13 +287,43 @@ mod tests {
     fn a_running_node_has_what_is_left_of_its_mean() {
         let w = wf(&[("a", Queued, &[]), ("b", Waiting, &[0])]);
         let d = durs(&[("a", 10.0)]);
-        let running: HashMap<String, f64> = [("0".to_string(), 4.0)].into();
-        assert_eq!(starts(&w, &d, &running), vec![0.0, 6.0]);
-        let overdue: HashMap<String, f64> = [("0".to_string(), 25.0)].into();
-        assert_eq!(starts(&w, &d, &overdue), vec![0.0, 0.0], "never negative");
+        assert_eq!(starts(&w, &d, &since(&[("0", 4.0)])), vec![0.0, 6.0]);
+        assert_eq!(starts(&w, &d, &since(&[("0", 25.0)])), vec![0.0, 0.0], "never negative");
         // Another node's elapsed time says nothing about this one.
-        let other: HashMap<String, f64> = [("7".to_string(), 4.0)].into();
-        assert_eq!(starts(&w, &d, &other), vec![0.0, 10.0]);
+        assert_eq!(starts(&w, &d, &since(&[("7", 4.0)])), vec![0.0, 10.0]);
+    }
+
+    #[test]
+    fn a_running_node_with_a_progress_estimate_uses_it_instead_of_the_mean() {
+        let w = wf(&[("a", Queued, &[]), ("b", Waiting, &[0])]);
+        let d = durs(&[("a", 10.0)]);
+        // 4 s in against a 10 s mean would leave 6 s; its own reports say 30 s (and, below, 1 s).
+        let slow = HashMap::from([("0".to_string(), Running { elapsed: 4.0, remaining: Some(30.0) })]);
+        assert_eq!(starts(&w, &d, &slow), vec![0.0, 30.0]);
+        let fast = HashMap::from([("0".to_string(), Running { elapsed: 4.0, remaining: Some(1.0) })]);
+        assert_eq!(starts(&w, &d, &fast), vec![0.0, 1.0]);
+        // Nothing is learned from an estimate of 0 or less, or one that isn't a number, except what it says.
+        let done = HashMap::from([("0".to_string(), Running { elapsed: 4.0, remaining: Some(0.0) })]);
+        assert_eq!(starts(&w, &d, &done), vec![0.0, 0.0]);
+        let junk = HashMap::from([("0".to_string(), Running { elapsed: 4.0, remaining: Some(f64::NAN) })]);
+        assert_eq!(starts(&w, &d, &junk), vec![0.0, 6.0], "falls back to the mean");
+    }
+
+    #[test]
+    fn without_an_estimate_the_mean_rule_is_unchanged() {
+        let w = wf(&[("a", Queued, &[]), ("b", Waiting, &[0])]);
+        let d = durs(&[("a", 10.0)]);
+        let none = HashMap::from([("0".to_string(), Running { elapsed: 4.0, remaining: None })]);
+        assert_eq!(starts(&w, &d, &none), starts(&w, &d, &since(&[("0", 4.0)])));
+        assert_eq!(starts(&w, &d, &none), vec![0.0, 6.0]);
+    }
+
+    #[test]
+    fn a_node_running_on_another_worker_uses_its_estimate_and_a_longer_chain_adds_up() {
+        let w = wf(&[("a", Queued, &[]), ("b", Waiting, &[0]), ("c", Waiting, &[1])]);
+        let d = durs(&[("a", 10.0), ("b", 5.0), ("c", 2.0)]);
+        let t = node_times(&w, &d, &left(&[("0", 3.0)]));
+        assert_eq!(t.iter().map(|t| t.start).collect::<Vec<_>>(), vec![0.0, 3.0, 8.0]);
     }
 
     #[test]
@@ -306,7 +366,7 @@ mod tests {
             ("encode", Done, &[]), ("encode", Queued, &[]), ("encode", Queued, &[]), ("voice", Waiting, &[0, 1, 2]),
         ]);
         let d = durs(&[("encode", 10.0), ("voice", 4.0)]);
-        let running: HashMap<String, f64> = [("1".to_string(), 3.0)].into();
+        let running = since(&[("1", 3.0)]);
         let tp = pools(&[("voice", "tts"), ("encode", "gemma")]);
         let mut acc = HashMap::new();
         add_workflow(&mut acc, &w, &d, &running, &tp);

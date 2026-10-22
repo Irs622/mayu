@@ -564,3 +564,36 @@ async fn malformed_tasks_field_reads_as_empty_without_an_error() {
     b.heartbeat(&worker(&id, vec![running_task("a", false)]), 60_000).await.unwrap();
     assert_eq!(b.running(&id).await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn running_all_lists_every_live_workers_tasks_and_survives_a_malformed_field() {
+    let (b, _q) = setup().await;
+    let (w1, w2, bad, idle) = (uniq("w1"), uniq("w2"), uniq("bad"), uniq("idle"));
+    let (t1, t2) = (vec![running_task("a", true), running_task("b", false)], vec![running_task("c", true)]);
+    b.heartbeat(&worker(&w1, t1.clone()), 60_000).await.unwrap();
+    b.heartbeat(&worker(&w2, t2.clone()), 60_000).await.unwrap();
+    b.heartbeat(&worker(&idle, vec![]), 60_000).await.unwrap();
+    b.heartbeat(&worker(&bad, vec![]), 60_000).await.unwrap();
+    let ours = |all: &mayu_core::PublishedTasks, w: &str| -> Vec<mayu_core::RunningTask> {
+        all.tasks.iter().filter(|(id, _)| id == w).map(|(_, t)| t.clone()).collect()
+    };
+
+    let all = b.running_all().await.unwrap();
+    assert_eq!(ours(&all, &w1), t1);
+    assert_eq!(ours(&all, &w2), t2);
+    assert!(ours(&all, &idle).is_empty() && ours(&all, &bad).is_empty());
+
+    // One worker writes garbage: it is counted, and the others still read. (Workers other tests left behind
+    // may add to the count.)
+    let _: i64 = redis::cmd("HSET").arg(worker_key(&bad)).arg("tasks").arg("not hex at all")
+        .query_async(&mut raw().await).await.unwrap();
+    let again = b.running_all().await.unwrap();
+    assert!(again.malformed > all.malformed, "{} vs {}", again.malformed, all.malformed);
+    assert_eq!(ours(&again, &w1), t1);
+    assert_eq!(ours(&again, &w2), t2);
+    assert!(ours(&again, &bad).is_empty());
+
+    // A worker that leaves, or whose beat lapses, is not listed.
+    b.unregister(&w1).await.unwrap();
+    assert!(ours(&b.running_all().await.unwrap(), &w1).is_empty());
+}

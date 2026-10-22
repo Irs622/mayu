@@ -427,6 +427,12 @@ impl Worker {
         self.inner.stage_begin()
     }
 
+    /// Lazy pools: `(seconds until it is next needed, workflow nodes using it that are done, all of them)` as the
+    /// lookahead loop last estimated, for a log line. None when `--lookahead` isn't estimating or nothing needs it.
+    fn pool_need(&self, name: &str) -> Option<(f64, u32, u32)> {
+        self.inner.pool_need(name)
+    }
+
     /// Lazy pools: the instance from `stage_begin` is built and parked (`ok`) or its build failed.
     fn stage_done(&self, name: &str, ok: bool) -> PyResult<()> {
         self.inner.stage_done(name, ok).map_err(core_err)

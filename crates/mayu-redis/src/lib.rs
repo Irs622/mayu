@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use mayu_core::{
-    Broker, Delivery, Error, Header, NodeInfo, NodeState, QueueStats, Reclaimed, Result, RunningTask, StoredResult,
+    Broker, Delivery, Error, Header, NodeInfo, NodeState, PublishedTasks, QueueStats, Reclaimed, Result, RunningTask, StoredResult,
     WorkerInfo, WorkflowSpec, WorkflowState, decode_header, decode_running, encode_delayed_member, encode_header,
     encode_running, now_ms,
 };
@@ -61,11 +61,13 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
 }
 
+fn decode_tasks(raw: &str) -> std::result::Result<Vec<RunningTask>, String> {
+    from_hex(raw).ok_or_else(|| "not hex".to_string()).and_then(|b| decode_running(&b).map_err(|e| e.to_string()))
+}
+
 /// A worker's `tasks` field; a malformed one reads as empty so a bad writer can't break `workers()` or inspect.
 fn parse_tasks(worker_id: &str, raw: &str) -> Vec<RunningTask> {
-    let decoded = from_hex(raw).ok_or_else(|| "not hex".to_string())
-        .and_then(|b| decode_running(&b).map_err(|e| e.to_string()));
-    decoded.unwrap_or_else(|e| {
+    decode_tasks(raw).unwrap_or_else(|e| {
         tracing::warn!(worker = %worker_id, error = %e, "ignoring a malformed tasks field in a worker heartbeat");
         Vec::new()
     })
@@ -754,6 +756,24 @@ impl Broker for RedisBroker {
         let raw: Option<String> = redis::cmd("HGET").arg(worker_key(worker_id)).arg("tasks")
             .query_async(&mut self.conn.clone()).await.map_err(be)?;
         Ok(raw.map(|t| parse_tasks(worker_id, &t)).unwrap_or_default())
+    }
+
+    async fn running_all(&self) -> Result<PublishedTasks> {
+        let mut out = PublishedTasks::default();
+        for key in self.scan_keys(&format!("{WORKER_KEY_PREFIX}*")).await? {
+            let id = key.strip_prefix(WORKER_KEY_PREFIX).unwrap_or(&key);
+            let raw: Option<String> = redis::cmd("HGET").arg(&key).arg("tasks")
+                .query_async(&mut self.conn.clone()).await.map_err(be)?;
+            let Some(raw) = raw else { continue }; // idle, expired since the scan, or an older version
+            match decode_tasks(&raw) {
+                Ok(tasks) => out.tasks.extend(tasks.into_iter().map(|t| (id.to_string(), t))),
+                Err(e) => {
+                    tracing::warn!(worker = %id, error = %e, "ignoring a malformed tasks field in a worker heartbeat");
+                    out.malformed += 1;
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn unregister(&self, worker_id: &str) -> Result<()> {

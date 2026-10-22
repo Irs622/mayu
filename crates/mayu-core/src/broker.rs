@@ -52,6 +52,15 @@ pub struct WorkerInfo {
     pub tasks: Vec<RunningTask>,
 }
 
+/// What live workers published as running, from `Broker::running_all`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PublishedTasks {
+    /// (worker id, task) for every task a live worker published.
+    pub tasks: Vec<(String, RunningTask)>,
+    /// Workers whose `tasks` field couldn't be read. The broker skips them (and logs); the caller counts them.
+    pub malformed: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Reclaimed {
     pub next_cursor: String,
@@ -93,6 +102,9 @@ pub trait Broker: Send + Sync + 'static {
     fn heartbeat(&self, info: &WorkerInfo, ttl_ms: u64) -> impl Future<Output = Result<()>> + Send;
     /// The tasks `worker_id` published in its last live heartbeat; empty if it is unknown, expired or published none.
     fn running(&self, worker_id: &str) -> impl Future<Output = Result<Vec<RunningTask>>> + Send;
+    /// The tasks every live worker published in its last heartbeat. A worker with a malformed field adds to
+    /// `malformed` and nothing else; the call fails only when the broker does.
+    fn running_all(&self) -> impl Future<Output = Result<PublishedTasks>> + Send;
     fn unregister(&self, worker_id: &str) -> impl Future<Output = Result<()>> + Send;
     /// Removes consumers with no pending entries, idle at least `min_idle_ms`, and no heartbeat.
     fn prune_consumers(&self, queue: &str, min_idle_ms: u64) -> impl Future<Output = Result<usize>> + Send;
