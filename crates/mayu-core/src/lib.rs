@@ -12,7 +12,8 @@ pub mod workflow;
 
 pub use broker::{Broker, Delivery, QueueStats, Reclaimed, StoredResult, WorkerInfo};
 pub use dispatch::{
-    Admit, Dispatcher, HOLD_HORIZON, LOOKAHEAD_BACKOFF, LazyPool, OLDEST_BONUS, RESERVE_AFTER, Resources, Schedule, THROUGHPUT_BONUS,
+    Admit, DEFAULT_STAGE_LEAD, Dispatcher, HOLD_HORIZON, LOOKAHEAD_BACKOFF, LazyPool, LookaheadKind, OLDEST_BONUS,
+    PARKED_BONUS_RATIO, RESERVE_AFTER, Resources, STAGE_MARGIN, Schedule, THROUGHPUT_BONUS,
 };
 pub use envelope::{
     Header, decode_delayed_member, decode_header, encode_delayed_member, encode_header, now_ms,

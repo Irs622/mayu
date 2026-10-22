@@ -37,7 +37,7 @@ fn lazy_pool(name: &str, (claim, loaded, linger): (HashMap<String, f64>, u32, Op
             ))),
         })
         .transpose()?;
-    Ok(LazyPool { claim, loaded, linger })
+    Ok(LazyPool { claim, loaded, linger, ..Default::default() })
 }
 
 /// (task, queue, payload, content_type, max_retries, parents, trace_ctx)
@@ -360,7 +360,8 @@ impl Worker {
     /// Lazy pools: a pool name means the ledger already counts one more instance of it as loading; build it
     /// and call `lookahead_done`. None when there is nothing to load ahead.
     fn lookahead_begin(&self) -> Option<String> {
-        self.inner.lookahead_begin()
+        // Plan 15 Task 2 passes the kind on; without parking every grant is a build.
+        self.inner.lookahead_begin().map(|(_, name)| name)
     }
 
     /// Lazy pools: the instance from `lookahead_begin` is built (`ok`) or its build failed.

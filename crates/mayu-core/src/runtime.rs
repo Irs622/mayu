@@ -97,6 +97,12 @@ pub struct ReadyTask {
     pub loads: Vec<String>,
     /// Lazy pools only: model pools to close an idle instance of first (before `loads`), one entry per instance.
     pub evicts: Vec<String>,
+    /// Lazy pools only: model pools to park an idle instance of (move to host RAM), after `evicts`, one entry per instance.
+    pub parks: Vec<String>,
+    /// Lazy pools only: model pools to unpark an instance of, after `parks`, instead of building one.
+    pub unparks: Vec<String>,
+    /// Lazy pools only: model pools to close a parked instance of, first of all, one entry per instance.
+    pub drops: Vec<String>,
     /// Unix ms the task's workflow started, from its ULID id; None outside workflows or for other id formats.
     pub workflow_started_ms: Option<u64>,
 }
@@ -115,6 +121,9 @@ impl ReadyTask {
             trace_ctx: d.header.trace_ctx.clone(),
             loads: Vec::new(),
             evicts: Vec::new(),
+            parks: Vec::new(),
+            unparks: Vec::new(),
+            drops: Vec::new(),
             workflow_started_ms: d.header.workflow_id.as_deref()
                 .and_then(|id| ulid::Ulid::from_string(id).ok())
                 .map(|u| u.timestamp_ms()),
@@ -398,7 +407,7 @@ impl<B: Broker> Runtime<B> {
     }
 
     /// See `Dispatcher::lookahead_begin`.
-    pub fn lookahead_begin(&self) -> Option<String> {
+    pub fn lookahead_begin(&self) -> Option<(crate::dispatch::LookaheadKind, String)> {
         self.ready.lookahead_begin()
     }
 
