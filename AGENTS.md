@@ -29,6 +29,10 @@ falling back to process mode on GIL builds. Delivery is **at-least-once**.
   by workers running other versions during a rolling deploy. Changes must stay
   backwards-compatible or be called out as breaking in `CHANGELOG.md`.
 - **Reserved option names** (`countdown`, `eta`, `queue`, `link`) can't become task parameters.
+- **New features are opt-in.** A worker started with existing flags and code behaves exactly as before:
+  same scheduling, eviction, defaults, CLI output and metrics. Anything that would change existing behaviour
+  (even "better" behaviour behind an existing flag) needs the maintainer's explicit OK before it is planned or
+  built. Gate it behind the new option instead, and list any visible additive change in the plan.
 
 ## Code quality
 
