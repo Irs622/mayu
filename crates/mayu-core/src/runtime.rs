@@ -15,6 +15,7 @@ use crate::error::{Error, Result};
 use crate::eta::{self, Durations, MoveKind, PoolEta};
 use crate::metrics::{Gauges, GpuStat, Metrics, Settled};
 use crate::policy::{Action, Outcome, RetryPolicy, decide, full_jitter};
+use crate::progress::{MAX_PUBLISHED, Progress, RunningTask};
 use crate::result::ResultRecord;
 use crate::workflow::NodeState;
 
@@ -140,6 +141,8 @@ struct InFlight {
     lost: bool,
     /// When a Python thread took it; None while it waits in the dispatcher.
     started: Option<Instant>,
+    /// What the running code last reported through `Runtime::progress`.
+    progress: Option<Progress>,
 }
 
 type Inflight = Arc<Mutex<HashMap<u64, InFlight>>>;
@@ -393,6 +396,28 @@ impl<B: Broker> Runtime<B> {
             f.started = Some(Instant::now());
         }
         Some(task)
+    }
+
+    /// Records a running task's progress. False if the token is no longer in flight or the numbers are unusable.
+    pub fn progress(&self, token: u64, done: f64, total: Option<f64>) -> bool {
+        let now = Instant::now();
+        let mut m = self.inflight.lock().unwrap();
+        let Some(f) = m.get_mut(&token) else { return false };
+        match &mut f.progress {
+            Some(p) => p.report(now, done, total),
+            none => match Progress::new(now, done, total) {
+                Some(p) => {
+                    *none = Some(p);
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+
+    /// Tasks running now, oldest first, at most `MAX_PUBLISHED`.
+    pub fn running(&self) -> Vec<RunningTask> {
+        running_snapshot(&self.inflight, Instant::now(), now_ms())
     }
 
     pub fn complete(&self, token: u64, outcome: Outcome) {
@@ -705,7 +730,7 @@ async fn fetch_batches<B: Broker>(c: &mut FetchCtx<B>, skips: &mut JoinSet<()>) 
             let token = next_token;
             next_token += 1;
             let task = ReadyTask::from_delivery(token, &d);
-            c.inflight.lock().unwrap().insert(token, InFlight { delivery: d, last_claim: Instant::now(), lost: false, started: None });
+            c.inflight.lock().unwrap().insert(token, InFlight { delivery: d, last_claim: Instant::now(), lost: false, started: None, progress: None });
             if let Admit::Defer { task, delay } = c.ready.push(task, Instant::now()) {
                 defer(c, *task, delay).await;
             }
@@ -1188,6 +1213,34 @@ struct PoolView {
     eta: Option<Arc<EtaState>>,
 }
 
+/// Started tasks, oldest first (ties by claim order), capped; clones only the ones it returns.
+fn running_snapshot(inflight: &Inflight, now: Instant, wall_ms: u64) -> Vec<RunningTask> {
+    let m = inflight.lock().unwrap();
+    let mut started: Vec<(Instant, u64, &InFlight)> =
+        m.iter().filter_map(|(token, f)| f.started.map(|s| (s, *token, f))).collect();
+    started.sort_unstable_by_key(|(s, token, _)| (*s, *token));
+    started.truncate(MAX_PUBLISHED);
+    started
+        .into_iter()
+        .map(|(s, _, f)| {
+            let h = &f.delivery.header;
+            let p = f.progress.as_ref();
+            RunningTask {
+                id: h.id.clone(),
+                task: h.task.clone(),
+                queue: f.delivery.queue.clone(),
+                workflow_id: h.workflow_id.clone(),
+                node: h.node.clone(),
+                started_ms: wall_ms.saturating_sub(now.saturating_duration_since(s).as_millis() as u64),
+                done: p.map(|p| p.done),
+                total: p.and_then(|p| p.total),
+                fraction: p.map(|p| p.fraction),
+                remaining_s: p.and_then(|p| p.remaining_s(s, now)),
+            }
+        })
+        .collect()
+}
+
 /// One `/metrics` body: counters, process gauges, and queue depths if the broker answers in time.
 #[allow(clippy::too_many_arguments)]
 async fn scrape<B: Broker>(
@@ -1248,6 +1301,44 @@ mod tests {
         let ms = 1_700_000_000_123;
         let id = ulid::Ulid::from_parts(ms, 42).to_string();
         assert_eq!(ReadyTask::from_delivery(1, &delivery(Some(&id))).workflow_started_ms, Some(ms));
+    }
+
+    fn inflight_with(entries: Vec<(u64, Option<Instant>, Option<Progress>)>) -> Inflight {
+        let m = entries
+            .into_iter()
+            .map(|(token, started, progress)| {
+                let mut d = delivery(None);
+                d.header.id = format!("id{token}");
+                (token, InFlight { delivery: d, last_claim: Instant::now(), lost: false, started, progress })
+            })
+            .collect();
+        Arc::new(Mutex::new(m))
+    }
+
+    #[test]
+    fn snapshot_lists_started_tasks_oldest_first() {
+        let now = Instant::now();
+        let ago = |s| Some(now - Duration::from_secs(s));
+        let p = Progress::new(now, 5.0, Some(10.0));
+        let inflight = inflight_with(vec![(1, ago(10), None), (2, ago(30), p), (3, None, None), (4, ago(20), None)]);
+        let snap = running_snapshot(&inflight, now, 1_000_000);
+        let ids: Vec<_> = snap.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["id2", "id4", "id1"]);
+        assert_eq!(snap[0].started_ms, 970_000);
+        assert_eq!((snap[0].done, snap[0].total, snap[0].fraction), (Some(5.0), Some(10.0), Some(0.5)));
+        assert_eq!(snap[0].remaining_s, Some(30.0 * 0.5 / 0.5));
+        assert_eq!((snap[1].done, snap[1].fraction, snap[1].remaining_s), (None, None, None));
+        assert_eq!((snap[1].task.as_str(), snap[1].queue.as_str()), ("t", "q"));
+    }
+
+    #[test]
+    fn snapshot_is_capped() {
+        let now = Instant::now();
+        let entries = (0..MAX_PUBLISHED as u64 + 10).map(|i| (i, Some(now - Duration::from_millis(1000 - i)), None));
+        let snap = running_snapshot(&inflight_with(entries.collect()), now, 10_000);
+        assert_eq!(snap.len(), MAX_PUBLISHED);
+        assert_eq!(snap[0].id, "id0");
+        assert_eq!(snap[MAX_PUBLISHED - 1].id, format!("id{}", MAX_PUBLISHED - 1));
     }
 
     #[test]

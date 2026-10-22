@@ -569,3 +569,23 @@ fn tasks_without_a_request_run_while_the_resource_is_taken() {
     assert!(rt.recv_timeout(Duration::from_millis(200)).is_none());
     rt.shutdown(Duration::from_secs(1));
 }
+
+#[test]
+fn progress_is_recorded_for_a_running_task_and_ignored_after() {
+    let mem = MemoryBroker::default();
+    mem.push(&Header::new("t", "q", 0, "ct"), b"");
+    let rt = start(&mem, cfg(1, 1));
+    assert!(!rt.progress(999, 1.0, None), "unknown token");
+    let t = rt.recv_timeout(RECV).unwrap();
+    let running = rt.running();
+    assert_eq!(running.len(), 1);
+    assert_eq!((running[0].id.as_str(), running[0].fraction), (t.id.as_str(), None));
+    assert!(rt.progress(t.token, 25.0, Some(100.0)));
+    assert!(!rt.progress(t.token, f64::NAN, None));
+    let running = rt.running();
+    assert_eq!((running[0].done, running[0].total, running[0].fraction), (Some(25.0), Some(100.0), Some(0.25)));
+    rt.complete(t.token, Outcome::Success { result: None, links: vec![] });
+    wait_until(|| mem.pending_len() == 0 && rt.running().is_empty());
+    assert!(!rt.progress(t.token, 50.0, Some(100.0)), "settled task");
+    rt.shutdown(Duration::from_secs(1));
+}
