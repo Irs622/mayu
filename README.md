@@ -271,7 +271,164 @@ the worker.
   the pool has no idle instance and is below its `--pools` size, and the worker has nothing due to
   run. Like `linger`, it knows only the workflows this worker has fetched a task of. A load that fails
   is logged and the task loads the model itself later; that pool isn't tried ahead again for 60 seconds.
-  `mayu_pool_lookahead_loads_total` counts the loads. `--lookahead` needs `--pool-mode lazy`.
+  `mayu_pool_lookahead_loads_total` counts the loads. `--lookahead` needs `--pool-mode lazy`. With parked
+  pools it also moves parked models back and stages them, see below.
+
+#### Parking models in host RAM
+
+Closing an idle model for room means loading it again from disk later. If the machine has spare RAM, a pool
+can instead *park* the idle instance there and bring it back in about a second.
+
+```python
+@app.pool("tts", vram_gb=6.9, parked={"ram_gb": 6.6})   # what one parked instance holds
+def tts(ctx):
+    return load_tts(device="cuda")
+
+@tts.park                       # GPU -> host RAM; the instance object is kept
+def _(model): ...
+
+@tts.unpark                     # host RAM -> GPU, in place
+def _(model): ...
+
+@tts.stage                      # optional: build straight into the parked state, without using the GPU
+def _(ctx): ...                 # returns an instance that is already parked
+```
+
+```bash
+mayu worker tasks:app --queues gpu --pools gemma=1,tts=1 --pool-mode lazy --schedule throughput --lookahead \
+    --resources gpu=1,vram_gb=7.5,ram_gb=16
+```
+
+- **Declaring:** `parked=` is what one parked instance holds instead of its normal resources, like
+  `{"ram_gb": 6.6}`. Every resource it names must be in `--resources`, so host RAM has an explicit budget
+  (mayu counts the amounts you declare and doesn't read host memory). The worker refuses to start if one is
+  missing or `parked=` asks for more than the worker has. `parked=` needs both `@pool.park` and `@pool.unpark`,
+  and the hooks need `parked=`; each registers once. `--pools tts=1` bounds loaded and parked instances
+  together, and `mayu_pool_loaded` counts only the loaded ones. Eager mode ignores all of it, like `linger`.
+- **Close:** `@pool.close` also gets parked instances (when one is closed for room, and at shutdown), so it
+  must handle both states.
+- **Parking and unparking:** a task whose pool has a parked instance unparks it instead of building one. When a
+  task needs the room an idle instance of a parkable pool holds, the worker parks that instance if its
+  `parked=` amount fits, and otherwise closes it as before. To make that room it may close parked instances
+  (picked in the order below), never the one the task is about to unpark. A parked instance is also closed when a task
+  needs the resources it holds. Parks and unparks happen before the task's time limits start, like loads. A
+  hook that raises is logged: a failed park closes the instance (counted in `mayu_pool_evictions_total`) and a
+  failed unpark closes it and builds a fresh one with the factory, so the task runs either way.
+- **Which goes first:** with `--lookahead` and at least one pool with `parked=`, idle instances are chosen in
+  order of when their pool is next needed (see Estimates): the one needed furthest ahead goes first, and a pool
+  no workflow needs goes before any of them, ties by least recently used. Without them it is least recently
+  used, as before. Under `--schedule`, a
+  task whose missing models are all parked counts a quarter of the loaded-model bonus (15 s under `throughput`,
+  2.5 s under `oldest`).
+- **Staging:** with `--lookahead`, a pool with `@pool.stage` is built straight into host RAM before a
+  workflow needs it, even while the worker is busy, since it uses no GPU. It happens when the pool is next
+  needed within its lead time: the stage and unpark times this worker measured plus 5 seconds, or 15 seconds
+  until it has measured a stage. The pool must have a workflow task to come, no idle, loading or parked
+  instance, room below its `--pools` size, and its `parked=` amount free without closing anything. The usual
+  `--lookahead` rule then moves it to the GPU once the worker has nothing due and it fits. A failed stage is
+  logged and the task builds the model itself; that pool isn't staged again for 60 seconds.
+- **Estimates:** when a pool is next needed comes from the workflow DAG and this worker's own average run time
+  of each task (successful runs, weighted towards recent ones). A node that is running counts what is left of
+  its average, a waiting one starts when its slowest unfinished parent ends, and a task this worker has never
+  run counts as instant, which only makes a stage earlier. Like `linger`, it knows only the workflows this
+  worker has fetched a task of, and another worker's speed is not known. `mayu_pool_next_need_seconds` shows
+  the estimate.
+- **Metrics:** `mayu_pool_parked`, `mayu_pool_parks_total`, `mayu_pool_unparks_total`,
+  `mayu_pool_drops_total`, `mayu_pool_stages_total`, `mayu_pool_move_seconds` and
+  `mayu_pool_next_need_seconds` (see [Metrics](#metrics)). They exist only for pools with `parked=`, so a
+  worker without them has the same metrics, scheduling and logs as before.
+
+**Torch recipe.** mayu doesn't know about torch; the hooks do the moving. What worked best on an RTX 3070 Ti
+laptop (6 GB models, PCIe about 12.5 GB/s): keep a host mirror of every CUDA tensor the model owns, in one
+pageable slab registered with `cudaHostRegister`. The first park takes about 1 s, later ones 0.3 s and an
+unpark 0.5 s, against 1 to 5 s to reload from a warm page cache and more from a cold disk. Closing the mirror
+returns its RAM; tensors from `pin_memory=True` stay in torch's host cache after the model is gone, and a
+pinned slab is rounded up to 8 GiB for 6 GB of weights.
+
+```python
+import gc
+import torch
+
+ALIGN = 512  # every tensor starts on an aligned offset of the slab, so a typed view of it is valid
+
+class Mirror:
+    """Host copies of the CUDA tensors a model owns, in one slab. The weights must not change while parked."""
+
+    def __init__(self, device, *modules):
+        seen, self.tensors = set(), []
+        def add(t):
+            if isinstance(t, torch.Tensor) and t.device.type == device and id(t) not in seen:
+                seen.add(id(t))
+                self.tensors.append(t)
+        for m in (m for module in modules for m in module.modules()):
+            for t in (*m._parameters.values(), *m._buffers.values()):
+                add(t)
+                qs = getattr(t, "quant_state", None)  # bitsandbytes 4-bit: its tables are tensors too
+                while qs is not None:
+                    for name in ("absmax", "code", "offset"):
+                        add(getattr(qs, name, None))
+                    qs = getattr(qs, "state2", None)
+        offsets, size = [], 0
+        for t in self.tensors:
+            offsets.append(size)
+            size += -(-t.numel() * t.element_size() // ALIGN) * ALIGN
+        self.slab = torch.zeros(size, dtype=torch.uint8)  # pageable, so release() really gives it back
+        torch.cuda.cudart().cudaHostRegister(self.slab.data_ptr(), size, 0)  # page-locked: fast async copies
+        self.host = [self.slab[o:o + t.numel() * t.element_size()].view(t.dtype).view(t.shape)
+                     for t, o in zip(self.tensors, offsets)]
+        for h, t in zip(self.host, self.tensors):
+            h.copy_(t, non_blocking=True)
+        torch.cuda.synchronize()
+
+    def park(self):
+        for t, h in zip(self.tensors, self.host):
+            t.data = h
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def unpark(self):
+        for t, h in zip(self.tensors, self.host):
+            t.data = h.to("cuda", non_blocking=True)
+        torch.cuda.synchronize()
+
+    def release(self):
+        torch.cuda.cudart().cudaHostUnregister(self.slab.data_ptr())
+        self.host = self.slab = None
+
+@app.pool("tts", vram_gb=6.9, parked={"ram_gb": 6.6})
+def tts(ctx):
+    model = load_tts(device="cuda")
+    model.mirror = None
+    return model
+
+@tts.park
+def _(model):
+    if model.mirror is None:                      # the first park pays for the copy; later ones just repoint
+        model.mirror = Mirror("cuda", model)
+    model.mirror.park()
+
+@tts.unpark
+def _(model):
+    model.mirror.unpark()
+
+@tts.stage
+def _(ctx):
+    model = load_tts(device="cpu")                # no GPU memory is used while this builds
+    model.mirror = Mirror("cpu", model)
+    model.mirror.park()                           # the CPU-built weights are dropped; one host copy remains
+    return model
+
+@tts.close
+def _(model):                                     # runs on idle, parked and discarded instances
+    if model.mirror is not None:
+        model.mirror.release()
+    model.unload()
+```
+
+- Park drops the GPU copy only if nothing else holds the weights (a CUDA graph, a cache, an output that still
+  has a `grad_fn`), so run inference under `torch.no_grad()`.
+- To stage a transformers model, build it on the CPU (`device_map={"": "cpu"}`; pre-quantized bitsandbytes
+  4-bit checkpoints load that way too) and pass `Mirror` only the submodules that will live on the GPU.
 
 ## GPU monitoring and self-tuning
 
@@ -476,6 +633,11 @@ processes listen on 9100–9103, so scrape all four. `MAYU_METRICS_PORT` sets th
 | `mayu_pool_loads_total`, `mayu_pool_evictions_total` | counter | `pool` (lazy instances built, preloads included, and closed to make room) |
 | `mayu_pool_demand` | gauge | `pool` (only in lazy mode with `--lookahead` or `linger=`; tasks still to come in workflows this worker has seen) |
 | `mayu_pool_lookahead_loads_total` | counter | `pool` (lazy instances built by `--lookahead` before their task) |
+| `mayu_pool_parked` | gauge | `pool` (only for pools with `parked=`; instances held in host RAM, ones being staged included) |
+| `mayu_pool_parks_total`, `mayu_pool_unparks_total` | counter | `pool` (instances moved to host RAM, and moved back to the GPU, ahead of a task or for it) |
+| `mayu_pool_drops_total`, `mayu_pool_stages_total` | counter | `pool` (parked instances closed to make room, and instances built straight into host RAM) |
+| `mayu_pool_move_seconds` | summary | `pool`, `kind` (`build`, `stage`, `park`, `unpark`; only for pools with `parked=`; `_sum` and `_count`) |
+| `mayu_pool_next_need_seconds` | gauge | `pool` (only with `parked=` and `--lookahead`; estimated seconds until the pool is next needed, omitted when no workflow has a task to come for it) |
 | `mayu_gpu_utilization_ratio` | gauge | `gpu`, `uuid` (0 to 1) |
 | `mayu_gpu_memory_used_bytes`, `mayu_gpu_memory_total_bytes` | gauge | `gpu`, `uuid` (used by all processes, and installed) |
 | `mayu_gpu_process_memory_bytes` | gauge | `gpu`, `uuid` (used by this worker and its children; omitted if NVML can't say) |
