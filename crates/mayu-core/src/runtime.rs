@@ -747,6 +747,12 @@ async fn fetch_batches<B: Broker>(c: &mut FetchCtx<B>, skips: &mut JoinSet<()>) 
         } else {
             got
         };
+        // Only a batch with an expiring task pays for the deadline check.
+        let got = if got.iter().any(|d| d.header.expires.is_some()) {
+            skip_expired(c, skips, got)
+        } else {
+            got
+        };
         for d in got {
             c.metrics.received(&d.queue, &d.header.task);
             if let (Some(active), Some(id)) = (&c.active, &d.header.workflow_id) {
@@ -810,6 +816,34 @@ async fn skip_cancelled<B: Broker>(c: &FetchCtx<B>, skips: &mut JoinSet<()>, got
             if record_retrying(&*broker, &d, &rec, deadline, &metrics).await {
                 metrics.settled(&d.queue, &d.header.task, Settled::Cancelled, None);
                 tracing::info!(task_id = %d.header.id, task = %d.header.task, "skipped a task of a cancelled workflow");
+            }
+            sem.add_permits(1);
+        });
+    }
+    run
+}
+
+/// Splits off deliveries whose `expires` deadline has already passed and acks them without running
+/// them, settled as `expired`. Like `skip_cancelled`, a skipped delivery keeps its prefetch permit
+/// until its ack is written, so the permit is returned by the spawned task, not the caller.
+fn skip_expired<B: Broker>(c: &FetchCtx<B>, skips: &mut JoinSet<()>, got: Vec<Delivery>) -> Vec<Delivery> {
+    let now = now_ms();
+    let (skip, run): (Vec<_>, Vec<_>) =
+        got.into_iter().partition(|d| d.header.expires.is_some_and(|e| now >= e));
+    for d in skip {
+        c.metrics.received(&d.queue, &d.header.task);
+        let stored = c.result_ttl.map(|ttl_secs| StoredResult {
+            id: d.header.id.clone(),
+            record: ResultRecord::failure("task expired", "", &d.header.content_type).encode(),
+            ttl_secs,
+        });
+        let (broker, metrics, sem) = (c.broker.clone(), c.metrics.clone(), c.sem.clone());
+        let deadline = Duration::from_millis(c.visibility_ms);
+        skips.spawn(async move {
+            let rec = Record::Ack(stored, Vec::new());
+            if record_retrying(&*broker, &d, &rec, deadline, &metrics).await {
+                metrics.settled(&d.queue, &d.header.task, Settled::Expired, None);
+                tracing::info!(task_id = %d.header.id, task = %d.header.task, "dropped an expired task");
             }
             sem.add_permits(1);
         });
