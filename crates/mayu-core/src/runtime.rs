@@ -803,22 +803,7 @@ async fn skip_cancelled<B: Broker>(c: &FetchCtx<B>, skips: &mut JoinSet<()>, got
     let (skip, run): (Vec<_>, Vec<_>) =
         got.into_iter().partition(|d| d.header.workflow_id.as_ref().is_some_and(|id| cancelled.contains(id)));
     for d in skip {
-        c.metrics.received(&d.queue, &d.header.task);
-        let stored = c.result_ttl.map(|ttl_secs| StoredResult {
-            id: d.header.id.clone(),
-            record: ResultRecord::failure("workflow cancelled", "", &d.header.content_type).encode(),
-            ttl_secs,
-        });
-        let (broker, metrics, sem) = (c.broker.clone(), c.metrics.clone(), c.sem.clone());
-        let deadline = Duration::from_millis(c.visibility_ms);
-        skips.spawn(async move {
-            let rec = Record::Ack(stored, Vec::new());
-            if record_retrying(&*broker, &d, &rec, deadline, &metrics).await {
-                metrics.settled(&d.queue, &d.header.task, Settled::Cancelled, None);
-                tracing::info!(task_id = %d.header.id, task = %d.header.task, "skipped a task of a cancelled workflow");
-            }
-            sem.add_permits(1);
-        });
+        ack_skipped(c, skips, d, "workflow cancelled", Settled::Cancelled, "skipped a task of a cancelled workflow");
     }
     run
 }
@@ -831,24 +816,31 @@ fn skip_expired<B: Broker>(c: &FetchCtx<B>, skips: &mut JoinSet<()>, got: Vec<De
     let (skip, run): (Vec<_>, Vec<_>) =
         got.into_iter().partition(|d| d.header.expires.is_some_and(|e| now >= e));
     for d in skip {
-        c.metrics.received(&d.queue, &d.header.task);
-        let stored = c.result_ttl.map(|ttl_secs| StoredResult {
-            id: d.header.id.clone(),
-            record: ResultRecord::failure("task expired", "", &d.header.content_type).encode(),
-            ttl_secs,
-        });
-        let (broker, metrics, sem) = (c.broker.clone(), c.metrics.clone(), c.sem.clone());
-        let deadline = Duration::from_millis(c.visibility_ms);
-        skips.spawn(async move {
-            let rec = Record::Ack(stored, Vec::new());
-            if record_retrying(&*broker, &d, &rec, deadline, &metrics).await {
-                metrics.settled(&d.queue, &d.header.task, Settled::Expired, None);
-                tracing::info!(task_id = %d.header.id, task = %d.header.task, "dropped an expired task");
-            }
-            sem.add_permits(1);
-        });
+        ack_skipped(c, skips, d, "task expired", Settled::Expired, "dropped an expired task");
     }
     run
+}
+
+/// Acks a claimed delivery without running it, on `skips` so it keeps its prefetch permit until the
+/// ack is written (the spawned task returns the permit). Shared by every claim-time skip reason.
+fn ack_skipped<B: Broker>(c: &FetchCtx<B>, skips: &mut JoinSet<()>, d: Delivery, error: &'static str,
+                          how: Settled, log: &'static str) {
+    c.metrics.received(&d.queue, &d.header.task);
+    let stored = c.result_ttl.map(|ttl_secs| StoredResult {
+        id: d.header.id.clone(),
+        record: ResultRecord::failure(error, "", &d.header.content_type).encode(),
+        ttl_secs,
+    });
+    let (broker, metrics, sem) = (c.broker.clone(), c.metrics.clone(), c.sem.clone());
+    let deadline = Duration::from_millis(c.visibility_ms);
+    skips.spawn(async move {
+        let rec = Record::Ack(stored, Vec::new());
+        if record_retrying(&*broker, &d, &rec, deadline, &metrics).await {
+            metrics.settled(&d.queue, &d.header.task, how, None);
+            tracing::info!(task_id = %d.header.id, task = %d.header.task, "{}", log);
+        }
+        sem.add_permits(1);
+    });
 }
 
 /// Returns a throttled task to the broker's delayed set (attempt unchanged), freeing its slot.

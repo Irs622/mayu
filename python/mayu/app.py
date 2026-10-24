@@ -124,7 +124,7 @@ class App:
         return Use(name)
 
     def send(self, name: str, /, *args, countdown: float | None = None, eta: dt.datetime | None = None,
-             queue: str | None = None, link=None, expires: "float | dt.datetime | None" = None,
+             queue: str | None = None, link=None, expires: float | dt.datetime | None = None,
              **kwargs) -> TaskHandle:
         """Enqueue a task by name; if it is registered here its arguments are validated, otherwise they are not."""
         task = self.registry.get(name)

@@ -98,6 +98,13 @@ so a task already claimed into a worker's prefetch buffer still runs. The deadli
 seconds from when it is sent, or an absolute timezone-aware `datetime`. The deadline travels in an
 optional envelope field that older workers ignore, so upgrade workers before relying on it.
 
+- **The deadline is absolute and spans retries.** A retry (or a rate-limit deferral) keeps the
+  original `expires`, so a task whose backoff or `countdown` lands after the deadline is dropped as
+  expired on its next claim, and that "task expired" result replaces the error that caused the
+  retry.
+- **Clock skew.** `expires` is set from the sender's clock and checked against the worker's, so
+  keep their clocks in sync (NTP); a worker running behind the sender enforces the deadline late.
+
 ## Time limits
 
 ```python

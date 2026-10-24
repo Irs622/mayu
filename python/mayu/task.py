@@ -132,9 +132,11 @@ def _expires_ms(expires) -> int | None:
     if isinstance(expires, dt.datetime):
         if expires.tzinfo is None:
             raise ValueError("expires must be a timezone-aware datetime")
-        return int(expires.timestamp() * 1000)
+        return max(0, int(expires.timestamp() * 1000))  # a pre-1970 deadline is already past
     if isinstance(expires, bool) or not isinstance(expires, (int, float)):
         raise TypeError(f"expires must be a number of seconds or a datetime, got {type(expires).__name__}")
+    if not math.isfinite(expires):
+        raise ValueError(f"expires must be a finite number of seconds, got {expires!r}")
     return int(time.time() * 1000) + max(0, int(expires * 1000))
 
 
@@ -173,7 +175,8 @@ def _find_pools(name: str, sig: inspect.Signature, is_async: bool) -> dict[str, 
     return pools
 
 
-def _enqueue(app, name: str, queue: str, max_retries: int, args, kwargs, countdown, eta, link, expires=None) -> TaskHandle:
+def _enqueue(app, name: str, queue: str, max_retries: int, args, kwargs, countdown, eta, link,
+             expires=None) -> TaskHandle:
     links = _as_links(link)
     eta_ms = _eta_ms(countdown, eta)
     expires_ms = _expires_ms(expires)
@@ -259,7 +262,7 @@ class Task:
         return self
 
     def send(self, *args, countdown: float | None = None, eta: dt.datetime | None = None,
-             queue: str | None = None, link=None, expires: "float | dt.datetime | None" = None,
+             queue: str | None = None, link=None, expires: float | dt.datetime | None = None,
              **kwargs) -> TaskHandle:
         bound = self.signature.bind(*args, **kwargs)
         if self.pools:

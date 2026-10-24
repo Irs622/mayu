@@ -27,11 +27,20 @@ def test_expires_ms_rejects_naive_datetime():
         _expires_ms(dt.datetime(2030, 1, 1))
 
 
-@pytest.mark.parametrize("bad", [object(), "soon", True, None.__class__])
+def test_expires_ms_clamps_datetime_before_epoch():
+    old = dt.datetime(1969, 1, 1, tzinfo=dt.timezone.utc)
+    assert _expires_ms(old) == 0  # already past, not a negative deadline
+
+
+@pytest.mark.parametrize("bad", [object(), "soon", True, dt.timedelta(seconds=5)])
 def test_expires_ms_rejects_non_numbers(bad):
-    if bad is None:  # None is the "no expiry" sentinel, handled above
-        return
     with pytest.raises(TypeError):
+        _expires_ms(bad)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_expires_ms_rejects_non_finite(bad):
+    with pytest.raises(ValueError, match="finite"):
         _expires_ms(bad)
 
 
